@@ -22,3 +22,8 @@ tokio = { version = "1.38", features = ["full"] }
 uuid = { version = "1.10", features = ["v4"] }
 parking_lot = "0.12"
 dirs = "5.0"
+# 系统钥匙串：Windows 凭据管理器 / macOS Keychain / Linux Secret Service
+keyring = { version = "4", default-features = false, features = ["v1"] }
+# 主机密钥指纹（SHA256 base64），用于 known_hosts 校验展示
+sha2 = "0.10"
+base64 = "0.22"

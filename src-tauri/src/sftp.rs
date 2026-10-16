@@ -239,14 +239,43 @@ pub fn sftp_remove_file(
 ) -> Result<(), String> {
     let sess = session_arc.lock();
     let sftp = sess.sftp().map_err(|e| e.to_string())?;
-    let path = Path::new(remote_path);
-    // 先按文件删除，失败再按目录删除
-    if sftp.unlink(path).is_ok() {
-        Ok(())
-    } else {
-        sftp.rmdir(path)
-            .map_err(|e| format!("删除文件或目录失败: {}", e))
+    remove_path_recursive(&sftp, Path::new(remote_path))
+}
+
+/// 递归删除：目录会先清空子项再删除自身。
+/// 使用 lstat 而非 stat，避免把指向目录的软链接当成目录递归下去。
+fn remove_path_recursive(sftp: &ssh2::Sftp, path: &Path) -> Result<(), String> {
+    let stat = match sftp.lstat(path) {
+        Ok(stat) => stat,
+        // 已不存在（并发删除）视作成功
+        Err(_) => return Ok(()),
+    };
+
+    if !stat.is_dir() {
+        return sftp.unlink(path).map_err(|e| format!("删除失败: {}", e));
     }
+
+    let entries = sftp
+        .readdir(path)
+        .map_err(|e| format!("读取待删目录失败: {}", e))?;
+    for (child, _) in entries {
+        match child.file_name() {
+            Some(name) if name == "." || name == ".." => continue,
+            Some(_) => remove_path_recursive(sftp, &child)?,
+            None => continue,
+        }
+    }
+    sftp.rmdir(path).map_err(|e| format!("删除目录失败: {}", e))
+}
+
+/// 远端登录用户的家目录，用作用户进入 SFTP 视图时的默认位置
+pub fn sftp_home_dir(session_arc: Arc<Mutex<ssh2::Session>>) -> Result<String, String> {
+    let sess = session_arc.lock();
+    let sftp = sess.sftp().map_err(|e| e.to_string())?;
+    let home = sftp
+        .realpath(Path::new("."))
+        .map_err(|e| format!("获取远端家目录失败: {}", e))?;
+    Ok(home.to_string_lossy().to_string())
 }
 
 pub fn sftp_upload_file(

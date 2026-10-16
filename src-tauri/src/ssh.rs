@@ -1,5 +1,8 @@
+use base64::Engine as _;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use ssh2::{CheckResult, KnownHostFileKind};
 use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
@@ -32,8 +35,49 @@ pub struct SshConnectConfig {
     pub private_key: Option<String>,
     #[serde(default)]
     pub passphrase: Option<String>,
+    /// 是否信任首次见到的主机密钥（TOFU）。为 false 时未知密钥会拒绝连接，
+    /// 由前端确认指纹后再带 true 重试。
+    #[serde(default)]
+    pub trust_host_key: bool,
     pub cols: u32,
     pub rows: u32,
+}
+
+/// 主机密钥校验结果，随连接/测试结果返回给前端展示。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HostKeyInfo {
+    /// SHA256 base64 指纹，形如 SHA256:xxxx
+    pub fingerprint: String,
+    /// matched（与 known_hosts 一致）/ trusted（本次新信任并写入）/ mismatch
+    pub status: String,
+}
+
+/// 连通性测试结果
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConnectionTestResult {
+    #[serde(rename = "latencyMs")]
+    pub latency_ms: u64,
+    #[serde(rename = "hostKeyFingerprint")]
+    pub host_key_fingerprint: String,
+    #[serde(rename = "hostKeyStatus")]
+    pub host_key_status: String,
+}
+
+/// 远端主机实时指标采集结果
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HostProbeResult {
+    #[serde(default)]
+    pub os: Option<String>,
+    #[serde(default, rename = "osName")]
+    pub os_name: Option<String>,
+    #[serde(default)]
+    pub cpu: Option<u32>,
+    #[serde(default)]
+    pub mem: Option<u32>,
+    #[serde(default)]
+    pub disk: Option<u32>,
+    #[serde(default, rename = "pingMs")]
+    pub ping_ms: Option<u64>,
 }
 
 pub struct ActiveSession {
@@ -65,7 +109,8 @@ impl SshManager {
         config: SshConnectConfig,
         app_handle: AppHandle,
     ) -> Result<String, String> {
-        let sess = connect_and_auth(&config)?;
+        let sess =
+            connect_and_auth(&config).map(|(session, _host_key)| session)?;
 
         // 关键：切非阻塞后再申请 PTY/Shell，这样 read/write 都只做短暂持锁，
         // 不会出现"读线程持锁阻塞、写线程永远拿不到锁"的死锁。
@@ -167,8 +212,7 @@ impl SshManager {
         if data.is_empty() {
             return Ok(());
         }
-        let active = self.get_active(session_id)?;
-        if !active.is_alive.load(Ordering::Relaxed) {
+        let active = self.get_active(session_id)?;        if !active.is_alive.load(Ordering::Relaxed) {
             return Err("会话已断开".into());
         }
 
@@ -227,8 +271,7 @@ impl SshManager {
     }
 
     /// 获取（必要时懒加载）该会话专属的 SFTP 连接，与终端 Shell 互不干扰
-    pub fn get_sftp_session(&self, session_id: &str) -> Result<Arc<Mutex<ssh2::Session>>, String> {
-        let active = self.get_active(session_id)?;
+    pub fn get_sftp_session(&self, session_id: &str) -> Result<Arc<Mutex<ssh2::Session>>, String> {        let active = self.get_active(session_id)?;
 
         // 快路径：已建立则直接复用
         if let Some(existing) = active.sftp_session.lock().as_ref() {
@@ -237,7 +280,7 @@ impl SshManager {
 
         // 建连期间不持有会话表锁，避免阻塞其他会话操作
         let config = active.config.clone();
-        let sess = connect_and_auth(&config)?;
+        let sess = connect_and_auth(&config).map(|(session, _host_key)| session)?;
         sess.set_timeout(SFTP_IO_TIMEOUT_MS);
         let created = Arc::new(Mutex::new(sess));
 
@@ -249,10 +292,16 @@ impl SshManager {
         *slot = Some(Arc::clone(&created));
         Ok(created)
     }
+
+    /// 供探测命令读取会话对应的连接配置（用于一次性建连采集主机指标）
+    pub fn get_config(&self, session_id: &str) -> Result<SshConnectConfig, String> {
+        Ok(self.get_active(session_id)?.config.clone())
+    }
 }
 
-/// 建立 TCP 连接、完成握手与认证（此阶段保持阻塞模式，语义简单且带超时）
-fn connect_and_auth(config: &SshConnectConfig) -> Result<ssh2::Session, String> {
+/// 建立 TCP 连接、完成握手、校验主机密钥并认证。
+/// 主机密钥在认证之前校验，避免把凭证发送给中间人。
+fn connect_and_auth(config: &SshConnectConfig) -> Result<(ssh2::Session, HostKeyInfo), String> {
     let addr = resolve_addr(&config.host, config.port)?;
     let stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)
         .map_err(|e| format!("TCP 连接超时/失败: {}", e))?;
@@ -261,14 +310,418 @@ fn connect_and_auth(config: &SshConnectConfig) -> Result<ssh2::Session, String> 
 
     let mut sess = ssh2::Session::new().map_err(|e| e.to_string())?;
     sess.set_tcp_stream(stream);
+    // 必须在 handshake 之前设置主机密钥算法优先级
+    prefer_openssh_host_key_order(&sess);
     sess.handshake().map_err(|e| format!("SSH 握手失败: {}", e))?;
+
+    let host_key = verify_host_key(&sess, config)?;
 
     authenticate(&sess, config)?;
 
     if !sess.authenticated() {
         return Err("身份认证未通过，请检查账号密码或密钥".into());
     }
-    Ok(sess)
+    Ok((sess, host_key))
+}
+
+/// 与 OpenSSH 客户端的 HostKeyAlgorithms 默认顺序保持一致。
+///
+/// libssh2 默认把 ECDSA 排在 ed25519 之前，而 OpenSSH 优先 ed25519；
+/// 若服务器同时提供两种密钥，`ssh` 会把 ed25519 写进 known_hosts，
+/// 而 libssh2 却协商到 ECDSA，主机名匹配、密钥不同，就会被误报为
+/// “主机密钥不一致”而无法登录。统一优先级后两者协商结果一致。
+fn prefer_openssh_host_key_order(sess: &ssh2::Session) {
+    // 未编译进 libssh2 的算法会被自动忽略
+    let prefs = [
+        "ssh-ed25519",
+        "ssh-ed25519-cert-v01@openssh.com",
+        "ecdsa-sha2-nistp256",
+        "ecdsa-sha2-nistp384",
+        "ecdsa-sha2-nistp521",
+        "ecdsa-sha2-nistp256-cert-v01@openssh.com",
+        "ecdsa-sha2-nistp384-cert-v01@openssh.com",
+        "ecdsa-sha2-nistp521-cert-v01@openssh.com",
+        "rsa-sha2-512",
+        "rsa-sha2-256",
+        "ssh-rsa",
+        "ssh-dss",
+    ]
+    .join(",");
+    let _ = sess.method_pref(ssh2::MethodType::HostKey, &prefs);
+}
+
+fn known_hosts_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".ssh")
+        .join("known_hosts")
+}
+
+/// 计算 OpenSSH 风格的 SHA256 指纹
+fn fingerprint_sha256(key: &[u8]) -> String {
+    let digest = Sha256::digest(key);
+    format!(
+        "SHA256:{}",
+        base64::engine::general_purpose::STANDARD_NO_PAD.encode(digest)
+    )
+}
+
+/// known_hosts 里存的是 base64 密钥，解码后算指纹用于向用户展示
+fn fingerprint_from_base64(key_b64: &str) -> Option<String> {
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(key_b64.trim())
+        .ok()?;
+    Some(fingerprint_sha256(&raw))
+}
+
+/// 判断 known_hosts 条目名是否指向当前主机（支持逗号分隔的多个别名）。
+/// 语义对齐 OpenSSH：非默认端口的记录写作 `[host]:port`，
+/// 因此裸主机名只在 22 端口下才视为同一主机。
+fn name_covers_host(name: &str, config: &SshConnectConfig) -> bool {
+    let port_entry = format!("[{}]:{}", config.host, config.port);
+    name.split(',').map(str::trim).any(|part| {
+        if part == port_entry {
+            return true;
+        }
+        config.port == 22 && part == config.host
+    })
+}
+
+/// 某主机在 known_hosts 中已记录的密钥指纹（去重，限量避免异常文件产生巨量输出）
+fn existing_host_fingerprints(known_hosts: &ssh2::KnownHosts, config: &SshConnectConfig) -> Vec<String> {
+    let mut result: Vec<String> = Vec::new();
+    if let Ok(hosts) = known_hosts.hosts() {
+        for host in hosts {
+            let Some(name) = host.name() else { continue };
+            if !name_covers_host(name, config) {
+                continue;
+            }
+            if let Some(fp) = fingerprint_from_base64(host.key()) {
+                if !result.contains(&fp) {
+                    result.push(fp);
+                }
+            }
+            if result.len() >= 8 {
+                break;
+            }
+        }
+    }
+    result
+}
+
+/// 校验远端主机密钥：对比 ~/.ssh/known_hosts。
+/// - 一致：放行
+/// - 未知：仅在用户已确认（trust_host_key）时写入 known_hosts 后放行，
+///   否则返回 HOST_KEY_UNKNOWN|<指纹>，由前端弹窗确认
+/// - 不一致：默认阻断并返回 HOST_KEY_MISMATCH|<新指纹>|<旧指纹...>；
+///   用户在界面上确认替换后会传入 trust_host_key=true，此时移除同名旧条目
+///   并写入新密钥（等价于 ssh-keygen -R + 重新信任）
+fn verify_host_key(sess: &ssh2::Session, config: &SshConnectConfig) -> Result<HostKeyInfo, String> {
+    let (key, key_type) = sess
+        .host_key()
+        .ok_or_else(|| "无法获取远端主机公钥".to_string())?;
+    let fingerprint = fingerprint_sha256(key);
+
+    let mut known_hosts = sess
+        .known_hosts()
+        .map_err(|e| format!("初始化 known_hosts 失败: {}", e))?;
+    let kh_path = known_hosts_path();
+    if kh_path.exists() {
+        // 解析失败不阻断：当作无记录处理，交由指纹确认流程兜底
+        let _ = known_hosts.read_file(&kh_path, KnownHostFileKind::OpenSSH);
+    }
+
+    // 非默认端口必须写成 [host]:port 形式，否则后续 check_port 匹配不到
+    let host_entry = if config.port == 22 {
+        config.host.clone()
+    } else {
+        format!("[{}]:{}", config.host, config.port)
+    };
+
+    match known_hosts.check_port(&config.host, config.port, key) {
+        CheckResult::Match => Ok(HostKeyInfo {
+            fingerprint,
+            status: "matched".into(),
+        }),
+        CheckResult::Mismatch => {
+            let old_fingerprints = existing_host_fingerprints(&known_hosts, config);
+            if !config.trust_host_key {
+                return Err(format!(
+                    "HOST_KEY_MISMATCH|{}|{}",
+                    fingerprint,
+                    old_fingerprints.join(";")
+                ));
+            }
+            // 用户已确认替换：先移除同名旧条目，再写入新密钥
+            if let Ok(hosts) = known_hosts.hosts() {
+                for host in hosts {
+                    if let Some(name) = host.name() {
+                        if name_covers_host(name, config) {
+                            let _ = known_hosts.remove(&host);
+                        }
+                    }
+                }
+            }
+            write_host_key(&mut known_hosts, &kh_path, &host_entry, key, key_type)?;
+
+            // 复核：若仍不一致（例如同名条目被哈希化存储，无法按名移除），
+            // 明确告知用户手动清理，避免“看似已信任却仍连不上”
+            match known_hosts.check_port(&config.host, config.port, key) {
+                CheckResult::Match => Ok(HostKeyInfo {
+                    fingerprint,
+                    status: "replaced".into(),
+                }),
+                _ => Err(format!(
+                    "主机密钥已尝试更新，但 ~/.ssh/known_hosts 中仍存在冲突记录（可能为哈希存储）。\n新指纹：{}\n请手动执行 ssh-keygen -R {} 后重试",
+                    fingerprint, config.host
+                )),
+            }
+        }
+        CheckResult::NotFound => {
+            if !config.trust_host_key {
+                return Err(format!("HOST_KEY_UNKNOWN|{}", fingerprint));
+            }
+            write_host_key(&mut known_hosts, &kh_path, &host_entry, key, key_type)?;
+            Ok(HostKeyInfo {
+                fingerprint,
+                status: "trusted".into(),
+            })
+        }
+        CheckResult::Failure => Err("主机密钥校验失败（known_hosts 不可用）".into()),
+    }
+}
+
+/// 把主机公钥写入 known_hosts 文件
+fn write_host_key(
+    known_hosts: &mut ssh2::KnownHosts,
+    kh_path: &Path,
+    host_entry: &str,
+    key: &[u8],
+    key_type: ssh2::HostKeyType,
+) -> Result<(), String> {
+    if let Some(parent) = kh_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("创建 ~/.ssh 目录失败: {}", e))?;
+    }
+    known_hosts
+        .add(host_entry, key, host_entry, key_type.into())
+        .map_err(|e| format!("写入 known_hosts 失败: {}", e))?;
+    known_hosts
+        .write_file(kh_path, KnownHostFileKind::OpenSSH)
+        .map_err(|e| format!("保存 known_hosts 失败: {}", e))
+}
+
+/// 真实连通性测试：TCP 建连 + SSH 握手 + 主机密钥校验 + 身份认证，返回真实耗时。
+pub fn test_connection(config: &SshConnectConfig) -> Result<ConnectionTestResult, String> {
+    let start = Instant::now();
+    let (_sess, host_key) = connect_and_auth(config)?;
+    let latency_ms = start.elapsed().as_millis() as u64;
+    Ok(ConnectionTestResult {
+        latency_ms,
+        host_key_fingerprint: host_key.fingerprint,
+        host_key_status: host_key.status,
+    })
+}
+
+/// 采集远端真实指标（发行版 / CPU / 内存 / 磁盘 / 延迟）。
+/// 使用一次性连接执行探测脚本，不占用终端与 SFTP 会话。
+const PROBE_SCRIPT: &str = r#"if [ -r /etc/os-release ]; then
+  . /etc/os-release
+  echo "OS_ID=${ID:-}"
+  echo "OS_NAME=${PRETTY_NAME:-${NAME:-}}"
+else
+  echo "OS_ID="
+  echo "OS_NAME=$(uname -s 2>/dev/null)"
+fi
+free -m 2>/dev/null | awk '/^Mem:/{print "MEM=" $2 " " $3}'
+df -P / 2>/dev/null | awk 'NR==2{print "DISK=" $2 " " $3}'
+echo "C1 $(grep '^cpu ' /proc/stat 2>/dev/null)"
+sleep 0.4
+echo "C2 $(grep '^cpu ' /proc/stat 2>/dev/null)"
+"#;
+
+pub fn probe_host_info(config: &SshConnectConfig) -> Result<HostProbeResult, String> {
+    let start = Instant::now();
+    let (sess, _host_key) = connect_and_auth(config)?;
+    let ping_ms = start.elapsed().as_millis() as u64;
+
+    // 探测阶段走阻塞模式并设置超时，避免远端不响应时线程永久挂起
+    sess.set_timeout(SFTP_IO_TIMEOUT_MS);
+    let mut channel = sess
+        .channel_session()
+        .map_err(|e| format!("打开探测通道失败: {}", e))?;
+    channel
+        .exec(PROBE_SCRIPT)
+        .map_err(|e| format!("执行探测脚本失败: {}", e))?;
+
+    let mut output = String::new();
+    channel
+        .read_to_string(&mut output)
+        .map_err(|e| format!("读取探测结果失败: {}", e))?;
+    let _ = channel.wait_close();
+
+    Ok(parse_probe_output(&output, ping_ms))
+}
+
+fn parse_probe_output(output: &str, ping_ms: u64) -> HostProbeResult {
+    let mut result = HostProbeResult {
+        ping_ms: Some(ping_ms),
+        ..Default::default()
+    };
+    let mut cpu_before: Option<Vec<u64>> = None;
+    let mut cpu_after: Option<Vec<u64>> = None;
+
+    for line in output.lines() {
+        let line = line.trim();
+        if let Some(v) = line.strip_prefix("OS_ID=") {
+            if !v.is_empty() {
+                result.os = Some(v.to_string());
+            }
+        } else if let Some(v) = line.strip_prefix("OS_NAME=") {
+            if !v.is_empty() {
+                result.os_name = Some(v.to_string());
+            }
+        } else if let Some(v) = line.strip_prefix("MEM=") {
+            result.mem = parse_usage_percent(v);
+        } else if let Some(v) = line.strip_prefix("DISK=") {
+            result.disk = parse_usage_percent(v);
+        } else if let Some(v) = line.strip_prefix("C1 ") {
+            cpu_before = Some(parse_cpu_fields(v));
+        } else if let Some(v) = line.strip_prefix("C2 ") {
+            cpu_after = Some(parse_cpu_fields(v));
+        }
+    }
+
+    if let (Some(before), Some(after)) = (cpu_before, cpu_after) {
+        result.cpu = cpu_usage_percent(&before, &after);
+    }
+    result
+}
+
+/// 解析 "总量 已用" 形式的两个数值，返回已用百分比
+fn parse_usage_percent(raw: &str) -> Option<u32> {
+    let mut parts = raw.split_whitespace();
+    let total: f64 = parts.next()?.parse().ok()?;
+    let used: f64 = parts.next()?.parse().ok()?;
+    if total <= 0.0 {
+        return None;
+    }
+    Some(((used / total) * 100.0).round().clamp(0.0, 100.0) as u32)
+}
+
+/// 解析 /proc/stat 中 cpu 行的数值部分（跳过 "cpu" 标识）
+fn parse_cpu_fields(raw: &str) -> Vec<u64> {
+    raw.split_whitespace()
+        .filter_map(|v| v.parse::<u64>().ok())
+        .collect()
+}
+
+/// 依据两次 /proc/stat 采样计算 CPU 使用率百分比
+fn cpu_usage_percent(before: &[u64], after: &[u64]) -> Option<u32> {
+    let len = before.len().min(after.len());
+    if len < 4 {
+        return None;
+    }
+    let total_before: u64 = before[..len].iter().sum();
+    let total_after: u64 = after[..len].iter().sum();
+    // 下标 3=idle、4=iowait（若有），二者之和视为空闲
+    let idle_before = before[3] + before.get(4).copied().unwrap_or(0);
+    let idle_after = after[3] + after.get(4).copied().unwrap_or(0);
+
+    let total_delta = total_after.saturating_sub(total_before);
+    if total_delta == 0 {
+        return None;
+    }
+    let idle_delta = idle_after.saturating_sub(idle_before);
+    let usage = 100.0 - (idle_delta as f64 / total_delta as f64) * 100.0;
+    Some(usage.round().clamp(0.0, 100.0) as u32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fingerprint_matches_openssh_format_for_empty_input() {
+        // SHA256("") 的 base64（无填充）是固定值，可用于校验指纹格式
+        assert_eq!(
+            fingerprint_sha256(b""),
+            "SHA256:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU"
+        );
+    }
+
+    #[test]
+    fn parse_usage_percent_computes_ratio() {
+        assert_eq!(parse_usage_percent("1024 512"), Some(50));
+        assert_eq!(parse_usage_percent("8192 2048"), Some(25));
+        assert_eq!(parse_usage_percent("0 0"), None);
+        assert_eq!(parse_usage_percent("garbage"), None);
+    }
+
+    #[test]
+    fn cpu_usage_percent_uses_idle_delta() {
+        // idle 从 100 增至 200，总量从 200 增至 400 => 50% 使用率
+        let before = vec![10, 0, 10, 100, 80];
+        let after = vec![60, 0, 60, 200, 80];
+        assert_eq!(cpu_usage_percent(&before, &after), Some(50));
+        // 无时间推进时无法计算
+        assert_eq!(cpu_usage_percent(&before, &before), None);
+        assert_eq!(cpu_usage_percent(&[1, 2], &[3, 4]), None);
+    }
+
+    #[test]
+    fn parse_probe_output_extracts_all_metrics() {
+        let sample = concat!(
+            "OS_ID=ubuntu\n",
+            "OS_NAME=Ubuntu 22.04.4 LTS\n",
+            "MEM=16384 8192\n",
+            "DISK=102400 25600\n",
+            "C1 cpu  100 0 100 1000 50 0 0 0 0 0\n",
+            "C2 cpu  200 0 200 1200 50 0 0 0 0 0\n"
+        );
+        let result = parse_probe_output(sample, 37);
+        assert_eq!(result.os.as_deref(), Some("ubuntu"));
+        assert_eq!(result.os_name.as_deref(), Some("Ubuntu 22.04.4 LTS"));
+        assert_eq!(result.mem, Some(50));
+        assert_eq!(result.disk, Some(25));
+        assert_eq!(result.ping_ms, Some(37));
+        // 总量 +400，idle+iowait +200 => 50%
+        assert_eq!(result.cpu, Some(50));
+    }
+
+    #[test]
+    fn name_covers_host_matches_plain_and_ported_entries() {
+        let base = SshConnectConfig {
+            host: "example.com".into(),
+            port: 22,
+            username: "root".into(),
+            auth_type: "password".into(),
+            password: None,
+            private_key: None,
+            passphrase: None,
+            trust_host_key: false,
+            cols: 80,
+            rows: 24,
+        };
+        assert!(name_covers_host("example.com", &base));
+        assert!(name_covers_host("example.com,10.0.0.1", &base));
+        assert!(!name_covers_host("example.org", &base));
+
+        let custom = SshConnectConfig {
+            port: 2222,
+            ..base
+        };
+        assert!(name_covers_host("[example.com]:2222", &custom));
+        assert!(!name_covers_host("example.com", &custom));
+    }
+
+    #[test]
+    fn parse_probe_output_tolerates_missing_fields() {
+        let result = parse_probe_output("OS_ID=\nOS_NAME=FreeBSD\n", 5);
+        assert_eq!(result.os, None);
+        assert_eq!(result.os_name.as_deref(), Some("FreeBSD"));
+        assert_eq!(result.cpu, None);
+        assert_eq!(result.mem, None);
+    }
 }
 
 fn authenticate(sess: &ssh2::Session, config: &SshConnectConfig) -> Result<(), String> {

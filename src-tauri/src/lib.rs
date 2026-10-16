@@ -4,7 +4,7 @@ mod storage;
 
 use serde::{Deserialize, Serialize};
 use sftp::SftpFileItem;
-use ssh::{SshConnectConfig, SshManager};
+use ssh::{ConnectionTestResult, HostProbeResult, SshConnectConfig, SshManager};
 use storage::HostItem;
 use tauri::{AppHandle, State};
 
@@ -93,8 +93,42 @@ async fn close_ssh_session(
 }
 
 // ==========================================
+// SSH 连通性测试与主机探测命令
+// ==========================================
+#[tauri::command]
+async fn test_ssh_connection(config: SshConnectConfig) -> Result<ConnectionTestResult, String> {
+    run_blocking(move || ssh::test_connection(&config)).await
+}
+
+#[tauri::command]
+async fn probe_host_info(
+    session_id: String,
+    ssh_manager: State<'_, SshManager>,
+) -> Result<HostProbeResult, String> {
+    let manager = ssh_manager.inner().clone();
+    run_blocking(move || {
+        let config = manager.get_config(&session_id)?;
+        ssh::probe_host_info(&config)
+    })
+    .await
+}
+
+// ==========================================
 // SFTP 远程文件管理命令
 // ==========================================
+#[tauri::command]
+async fn sftp_home_dir(
+    session_id: String,
+    ssh_manager: State<'_, SshManager>,
+) -> Result<String, String> {
+    let manager = ssh_manager.inner().clone();
+    run_blocking(move || {
+        let session = manager.get_sftp_session(&session_id)?;
+        sftp::sftp_home_dir(session)
+    })
+    .await
+}
+
 #[tauri::command]
 async fn sftp_read_dir(
     session_id: String,
@@ -213,6 +247,9 @@ pub fn run() {
             write_ssh_session,
             resize_ssh_session,
             close_ssh_session,
+            test_ssh_connection,
+            probe_host_info,
+            sftp_home_dir,
             sftp_read_dir,
             sftp_read_file,
             sftp_write_file,
