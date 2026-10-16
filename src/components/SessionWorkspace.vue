@@ -16,8 +16,11 @@
         :session-id="session.sftpSessionId || session.id"
         :refresh-signal="refreshSignal"
         :auto-follow="session.autoFollowTerminal || false"
+        :remote-monitor-open="session.remoteMonitorOpen || false"
         :terminal-cwd="currentActiveTabCwd"
         @update:auto-follow="(val) => session.autoFollowTerminal = val"
+        @update:remote-monitor-open="(val) => session.remoteMonitorOpen = val"
+        @toggle-remote-monitor="handleToggleRemoteMonitor"
         @manual-sync="handleManualSync"
         @toggle-collapse="toggleCollapse"
         @open-in-terminal="handleOpenInTerminal"
@@ -60,6 +63,15 @@
         @terminal-cwd-change="handleTerminalCwdChange"
         @terminal-enter="handleTerminalEnter"
       />
+
+      <!-- 4. 底部远程监控信息栏 (对标 MobaXterm 底部服务器资源监控) -->
+      <RemoteMonitorBar
+        v-if="session.remoteMonitorOpen"
+        :metrics="remoteMetrics"
+        :loading="metricsLoading"
+        :default-hostname="session.host.host"
+        @close="handleCloseRemoteMonitor"
+      />
     </main>
   </div>
 </template>
@@ -68,7 +80,9 @@
 import { ref, computed, watch, onBeforeUnmount, nextTick } from 'vue'
 import FileTree from '@/components/FileTree.vue'
 import TerminalView from '@/components/TerminalView.vue'
-import type { HostSession, SftpFileItem } from '@/types'
+import RemoteMonitorBar from '@/components/RemoteMonitorBar.vue'
+import type { HostSession, RemoteSystemMetrics, SftpFileItem } from '@/types'
+import { getRemoteMetricsApi } from '@/api/tauri'
 
 const props = defineProps<{
   session: HostSession
@@ -95,6 +109,11 @@ const emit = defineEmits<{
 
 const terminalRef = ref<InstanceType<typeof TerminalView> | null>(null)
 const fileTreeRef = ref<InstanceType<typeof FileTree> | null>(null)
+
+// 远端监控状态与数据
+const remoteMetrics = ref<RemoteSystemMetrics | null>(null)
+const metricsLoading = ref(false)
+let monitorTimer: any = null
 
 const isCollapsed = ref(props.session.sidebarCollapsed || false)
 const sidebarWidth = ref(props.session.sidebarWidth || 280)
@@ -214,6 +233,77 @@ const resetWidth = () => {
   })
 }
 
+// 远程监控定时轮询与控制
+const fetchRemoteMetrics = async () => {
+  const activeTab = props.session.terminalTabs[props.session.activeTerminalIndex]
+  const sessionId = activeTab?.id || props.session.sftpSessionId || props.session.id
+  if (!sessionId) return
+
+  try {
+    metricsLoading.value = true
+    const res = await getRemoteMetricsApi(sessionId)
+    if (res) {
+      remoteMetrics.value = res
+    }
+  } catch (e) {
+    console.warn('获取远程监控指标失败:', e)
+  } finally {
+    metricsLoading.value = false
+  }
+}
+
+const startMonitoring = () => {
+  stopMonitoring()
+  fetchRemoteMetrics()
+  monitorTimer = setInterval(() => {
+    if (props.isActive && props.session.remoteMonitorOpen) {
+      fetchRemoteMetrics()
+    }
+  }, 2500)
+}
+
+const stopMonitoring = () => {
+  if (monitorTimer) {
+    clearInterval(monitorTimer)
+    monitorTimer = null
+  }
+}
+
+const handleToggleRemoteMonitor = () => {
+  props.session.remoteMonitorOpen = !props.session.remoteMonitorOpen
+  if (props.session.remoteMonitorOpen) {
+    startMonitoring()
+  } else {
+    stopMonitoring()
+  }
+  nextTick(() => {
+    terminalRef.value?.fit()
+  })
+}
+
+const handleCloseRemoteMonitor = () => {
+  props.session.remoteMonitorOpen = false
+  stopMonitoring()
+  nextTick(() => {
+    terminalRef.value?.fit()
+  })
+}
+
+watch(
+  () => [props.isActive, props.session.remoteMonitorOpen],
+  ([active, open]) => {
+    if (active && open) {
+      startMonitoring()
+    } else {
+      stopMonitoring()
+    }
+    nextTick(() => {
+      terminalRef.value?.fit()
+    })
+  },
+  { immediate: true }
+)
+
 // 拖拽调整宽度逻辑
 let isResizing = false
 let startX = 0
@@ -250,6 +340,7 @@ const startResize = (e: MouseEvent) => {
 }
 
 onBeforeUnmount(() => {
+  stopMonitoring()
   clearTimeout(enterDebounceTimer)
   window.removeEventListener('mousemove', onMouseMove)
   window.removeEventListener('mouseup', onMouseUp)

@@ -251,6 +251,21 @@
           <Locate class="w-3 h-3 text-cyan-400" :class="{ 'animate-spin': syncing }" />
           <span>同步</span>
         </button>
+
+        <!-- 远程监控按钮 (对标 MobaXterm 底部远程监控) -->
+        <button
+          @click="toggleRemoteMonitor"
+          :class="remoteMonitorOpen ? 'bg-brand-500/15 text-emerald-400 border-brand-500/40 hover:bg-brand-500/25' : 'bg-surface-card text-slate-300 hover:text-white hover:bg-surface-elevated border-surface-border'"
+          class="flex items-center gap-1 px-2 py-1 rounded-md border text-[11px] font-mono transition-all group shrink-0"
+          :title="remoteMonitorOpen ? '远程监控：开启中（点击收起监控栏）' : '远程监控：已关闭（点击展开服务器资源监控）'"
+        >
+          <span
+            class="w-1.5 h-1.5 rounded-full transition-all"
+            :class="remoteMonitorOpen ? 'bg-emerald-400 shadow-glow-emerald animate-pulse' : 'bg-slate-600'"
+          ></span>
+          <Activity class="w-3 h-3 text-emerald-400" />
+          <span>监控</span>
+        </button>
       </div>
 
       <!-- 右侧当前终端路径预览提示 -->
@@ -311,7 +326,8 @@ import {
   Trash2,
   FilePlus,
   Compass,
-  Locate
+  Locate,
+  Activity
 } from 'lucide-vue-next'
 import ContextMenu from '@/components/ContextMenu.vue'
 import FileTreeNodeItem from '@/components/FileTreeNodeItem.vue'
@@ -331,10 +347,12 @@ const props = withDefaults(
     refreshSignal?: number
     terminalCwd?: string
     autoFollow?: boolean
+    remoteMonitorOpen?: boolean
   }>(),
   {
     terminalCwd: '',
-    autoFollow: false
+    autoFollow: false,
+    remoteMonitorOpen: false
   }
 )
 
@@ -346,8 +364,15 @@ const emit = defineEmits<{
   (e: 'upload-trigger', remoteDir: string): void
   (e: 'toast', msg: string, type: 'info' | 'success' | 'warning' | 'error'): void
   (e: 'update:autoFollow', val: boolean): void
+  (e: 'update:remoteMonitorOpen', val: boolean): void
+  (e: 'toggle-remote-monitor'): void
   (e: 'manual-sync'): void
 }>()
+
+const toggleRemoteMonitor = () => {
+  emit('update:remoteMonitorOpen', !props.remoteMonitorOpen)
+  emit('toggle-remote-monitor')
+}
 
 const viewMode = ref<'tree' | 'list'>('tree')
 const currentPath = ref('/')

@@ -4,7 +4,7 @@ mod storage;
 
 use serde::{Deserialize, Serialize};
 use sftp::SftpFileItem;
-use ssh::{ConnectionTestResult, HostProbeResult, SshConnectConfig, SshManager};
+use ssh::{ConnectionTestResult, HostProbeResult, RemoteSystemMetrics, SshConnectConfig, SshManager};
 use storage::HostItem;
 use tauri::{AppHandle, Manager, State};
 
@@ -120,6 +120,15 @@ async fn get_ssh_session_cwd(
 ) -> Result<String, String> {
     let manager = ssh_manager.inner().clone();
     run_blocking(move || manager.get_session_cwd(&session_id)).await
+}
+
+#[tauri::command]
+async fn get_remote_metrics(
+    session_id: String,
+    ssh_manager: State<'_, SshManager>,
+) -> Result<RemoteSystemMetrics, String> {
+    let manager = ssh_manager.inner().clone();
+    run_blocking(move || manager.get_remote_metrics(&session_id)).await
 }
 
 // ==========================================
@@ -284,6 +293,7 @@ pub fn run() {
             test_ssh_connection,
             probe_host_info,
             get_ssh_session_cwd,
+            get_remote_metrics,
             sftp_home_dir,
             sftp_read_dir,
             sftp_read_file,

@@ -396,7 +396,8 @@ const handleConnectSsh = async (host: HostItem) => {
     sidebarCollapsed: false,
     sidebarWidth: 280,
     viewMode: 'tree',
-    autoFollowTerminal: false
+    autoFollowTerminal: false,
+    remoteMonitorOpen: false
   }
 
   sessions.value.push(newSession)
