@@ -35,7 +35,7 @@
         </button>
       </div>
 
-      <!-- 终端操作按钮组：展开文件树、清屏 -->
+      <!-- 终端操作按钮组：展开文件树、查找、清屏 -->
       <div class="flex items-center gap-1 text-xs">
         <button
           v-if="sidebarCollapsed"
@@ -45,6 +45,27 @@
         >
           <FolderGit2 class="w-3.5 h-3.5" />
           <span class="hidden sm:inline">文件工作区</span>
+        </button>
+
+        <span class="w-px h-4 bg-surface-border shrink-0"></span>
+
+        <button
+          @click="toggleHighlight"
+          :title="highlightEnabled ? '关闭关键字高亮' : '开启关键字高亮（ERROR/WARN/成功）'"
+          class="p-1.5 rounded hover:bg-surface-elevated transition-colors"
+          :class="highlightEnabled ? 'text-amber-300 bg-amber-500/10' : 'text-surface-subtle hover:text-white'"
+        >
+          <Highlighter class="w-3.5 h-3.5" />
+        </button>
+
+        <button
+          @click="toggleSearch"
+          :disabled="!currentTab"
+          class="p-1.5 rounded hover:bg-surface-elevated text-surface-subtle hover:text-white transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+          :class="searchOpen ? 'text-brand-300 bg-brand-500/10' : ''"
+          title="在终端中查找 (Ctrl+F)"
+        >
+          <Search class="w-3.5 h-3.5" />
         </button>
 
         <button
@@ -65,6 +86,16 @@
       :items="tabMenuItems"
       @select="handleTabMenuSelect"
       @close="tabMenu.open = false"
+    />
+
+    <!-- 终端内右键菜单：复制 / 粘贴 / 全选 / 查找 / 清除屏幕 -->
+    <ContextMenu
+      :open="termMenu.open"
+      :x="termMenu.x"
+      :y="termMenu.y"
+      :items="termMenuItems"
+      @select="handleTermMenuSelect"
+      @close="termMenu.open = false"
     />
 
     <!-- 常用指令代码片段工具栏 -->
@@ -93,6 +124,74 @@
 
     <!-- 真实 xterm.js 容器：每个标签页一个独立实例，切换不丢回显 -->
     <div class="flex-1 w-full h-full relative overflow-hidden bg-[#0c0e14] p-2">
+      <!-- 终端内搜索条 (Ctrl+F)：贴在容器右上角，不抢占终端焦点 -->
+      <div
+        v-if="searchOpen"
+        class="absolute top-3 right-4 z-30 flex items-center gap-1 bg-surface-sidebar/95 backdrop-blur-xl border border-surface-border rounded-lg shadow-2xl pl-2 pr-1 py-1"
+      >
+        <Search class="w-3.5 h-3.5 text-slate-500 shrink-0" />
+        <input
+          ref="searchInputRef"
+          v-model="searchQuery"
+          type="text"
+          spellcheck="false"
+          placeholder="在终端中查找"
+          class="w-40 bg-transparent text-xs font-mono text-slate-200 placeholder:text-slate-600 outline-none"
+          @keydown.enter.prevent="onSearchEnter"
+          @keydown.esc.prevent.stop="closeSearch"
+        />
+        <span class="text-[10px] font-mono text-slate-500 min-w-[42px] text-center shrink-0">{{ searchResultText }}</span>
+        <button
+          @click="runSearch('prev')"
+          :disabled="!searchQuery"
+          class="p-1 rounded hover:bg-surface-elevated text-slate-400 hover:text-white transition-colors disabled:opacity-35 disabled:cursor-not-allowed"
+          title="上一个 (Shift+Enter)"
+        >
+          <ChevronUp class="w-3.5 h-3.5" />
+        </button>
+        <button
+          @click="runSearch('next')"
+          :disabled="!searchQuery"
+          class="p-1 rounded hover:bg-surface-elevated text-slate-400 hover:text-white transition-colors disabled:opacity-35 disabled:cursor-not-allowed"
+          title="下一个 (Enter)"
+        >
+          <ChevronDown class="w-3.5 h-3.5" />
+        </button>
+        <span class="w-px h-4 bg-surface-border shrink-0"></span>
+        <button
+          @click="searchCaseSensitive = !searchCaseSensitive"
+          class="p-1 rounded transition-colors"
+          :class="searchCaseSensitive ? 'bg-brand-500/20 text-brand-300' : 'text-slate-400 hover:text-white hover:bg-surface-elevated'"
+          title="区分大小写"
+        >
+          <CaseSensitive class="w-3.5 h-3.5" />
+        </button>
+        <button
+          @click="searchWholeWord = !searchWholeWord"
+          class="p-1 rounded transition-colors"
+          :class="searchWholeWord ? 'bg-brand-500/20 text-brand-300' : 'text-slate-400 hover:text-white hover:bg-surface-elevated'"
+          title="全字匹配"
+        >
+          <WholeWord class="w-3.5 h-3.5" />
+        </button>
+        <button
+          @click="searchRegex = !searchRegex"
+          class="p-1 rounded transition-colors"
+          :class="searchRegex ? 'bg-brand-500/20 text-brand-300' : 'text-slate-400 hover:text-white hover:bg-surface-elevated'"
+          title="正则表达式"
+        >
+          <Regex class="w-3.5 h-3.5" />
+        </button>
+        <span class="w-px h-4 bg-surface-border shrink-0"></span>
+        <button
+          @click="closeSearch"
+          class="p-1 rounded hover:bg-surface-elevated text-slate-400 hover:text-white transition-colors"
+          title="关闭 (Esc)"
+        >
+          <X class="w-3.5 h-3.5" />
+        </button>
+      </div>
+
       <div
         v-if="tabs.length === 0"
         class="w-full h-full flex flex-col items-center justify-center gap-3 text-center"
@@ -108,6 +207,7 @@
         :ref="el => setContainer(tab.id, el)"
         class="w-full h-full"
         :style="{ display: tab.id === currentTabId ? 'block' : 'none' }"
+        @contextmenu.prevent="openTermMenu($event)"
       ></div>
     </div>
 
@@ -132,11 +232,17 @@ import { ref, computed, watch, nextTick, onMounted, onBeforeUnmount } from 'vue'
 import { Terminal as Xterm } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import { WebLinksAddon } from '@xterm/addon-web-links'
+import { SearchAddon } from '@xterm/addon-search'
+import { Unicode11Addon } from '@xterm/addon-unicode11'
 import {
   X, Plus, FolderGit2, Eraser, Zap, Terminal as TerminalIcon,
-  CopyPlus, Globe, User, Terminal, PenLine, RefreshCw, XCircle, ChevronsRight
+  CopyPlus, Globe, User, Terminal, PenLine, RefreshCw, XCircle, ChevronsRight,
+  Search, ChevronUp, ChevronDown, CaseSensitive, WholeWord, Regex,
+  Copy, ClipboardPaste, TextSelect, Highlighter
 } from 'lucide-vue-next'
 import ContextMenu from '@/components/ContextMenu.vue'
+import { dialogState } from '@/composables/useDialog'
+import { useTerminalHighlight, HIGHLIGHT_STORAGE_KEY, type TerminalHighlight } from '@/composables/useTerminalHighlight'
 import type { ContextMenuItem, TerminalTab } from '@/types'
 import {
   writeSshSessionApi,
@@ -153,9 +259,12 @@ const props = withDefaults(
     tabs: TerminalTab[]
     activeTabIndex: number
     sidebarCollapsed?: boolean
+    /** 该终端所属的会话工作区是否为当前活动工作区（用于全局快捷键只在一个实例上生效） */
+    active?: boolean
   }>(),
   {
-    sidebarCollapsed: false
+    sidebarCollapsed: false,
+    active: false
   }
 )
 
@@ -175,15 +284,20 @@ const emit = defineEmits<{
   (e: 'session-closed', tabId: string, reason: string): void
   (e: 'terminal-cwd-change', tabId: string, cwd: string): void
   (e: 'terminal-enter', tabId: string): void
+  (e: 'toast', msg: string, type: 'info' | 'success' | 'warning' | 'error'): void
 }>()
 
 interface TerminalSession {
   term: Xterm
   fit: FitAddon
+  search: SearchAddon
+  highlight: TerminalHighlight
   container: HTMLDivElement
   inputBuffer: string
   unlisten: Array<() => void>
   writeFailed: boolean
+  /** 右键按下瞬间的选区快照（右键可能清空选区，需提前捕获） */
+  rightClickSelection: string
 }
 
 const snippets = [
@@ -214,6 +328,16 @@ const containerMap = new Map<string, HTMLDivElement>()
 const sessions = new Map<string, TerminalSession>()
 const termSize = ref<{ cols: number; rows: number }>({ cols: 80, rows: 24 })
 
+// 关键字高亮开关（默认开，存 localStorage）
+const readHighlightEnabled = (): boolean => {
+  try {
+    return localStorage.getItem(HIGHLIGHT_STORAGE_KEY) !== '0'
+  } catch {
+    return true
+  }
+}
+const highlightEnabled = ref(readHighlightEnabled())
+
 const currentTabId = computed(() => props.tabs[props.activeTabIndex]?.id ?? '')
 const currentTab = computed(() => props.tabs[props.activeTabIndex])
 const currentSession = computed(() => sessions.get(currentTabId.value))
@@ -238,12 +362,32 @@ const createSession = (tab: TerminalTab, container: HTMLDivElement): TerminalSes
   })
 
   const fit = new FitAddon()
+  const search = new SearchAddon()
   term.loadAddon(fit)
+  term.loadAddon(search)
+  // 中日韩宽字符宽度修正（中文环境收益明显）
+  term.loadAddon(new Unicode11Addon())
+  term.unicode.activeVersion = '11'
   term.loadAddon(new WebLinksAddon())
 
-  const session: TerminalSession = { term, fit, container, inputBuffer: '', unlisten: [], writeFailed: false }
+  const session: TerminalSession = {
+    term, fit, search,
+    highlight: useTerminalHighlight(term, { onToast: (msg, type) => emit('toast', msg, type ?? 'info') }),
+    container, inputBuffer: '', unlisten: [], writeFailed: false, rightClickSelection: ''
+  }
 
   term.open(container)
+  session.highlight.setEnabled(highlightEnabled.value)
+
+  // 搜索结果计数（仅在开启 search decorations 时触发）
+  search.onDidChangeResults((result) => {
+    if (tab.id === currentTabId.value) searchResult.value = { resultIndex: result.resultIndex, resultCount: result.resultCount }
+  })
+
+  // 右键会先触发 mousedown，此处用捕获阶段提前保存选区
+  container.addEventListener('mousedown', (e) => {
+    if (e.button === 2) session.rightClickSelection = term.getSelection()
+  }, true)
 
   // 监听 OSC 7 (标准终端当前目录转义序列)
   term.parser.registerOscHandler(7, (data) => {
@@ -270,15 +414,34 @@ const createSession = (tab: TerminalTab, container: HTMLDivElement): TerminalSes
     if (data.includes('\r')) {
       emit('terminal-enter', tab.id)
     }
-    if (isTauri()) {
-      writeSshSessionApi(tab.id, data).catch((err: any) => {
-        if (session.writeFailed) return
-        session.writeFailed = true
-        term.write(`\r\n\x1b[31m[写入失败] ${err?.message || err}\x1b[0m\r\n`)
-      })
-    } else {
-      handleMockTerminalInput(tab, session, data)
+    writeToSession(tab.id, data)
+  })
+
+  // 接管终端内快捷键：剪贴板与查找（返回 false 阻止 xterm 继续处理）
+  term.attachCustomKeyEventHandler((e) => {
+    if (e.type !== 'keydown') return true
+    const mod = e.ctrlKey || e.metaKey
+    const key = e.key
+
+    // 复制：Ctrl+Shift+C / Ctrl+Insert
+    if (mod && ((e.shiftKey && key.toLowerCase() === 'c') || key === 'Insert')) {
+      e.preventDefault()
+      copySelection(tab.id)
+      return false
     }
+    // 粘贴：Ctrl+Shift+V / Shift+Insert
+    if ((mod && e.shiftKey && key.toLowerCase() === 'v') || (e.shiftKey && key === 'Insert')) {
+      e.preventDefault()
+      pasteToTerminal(tab.id)
+      return false
+    }
+    // 终端内查找：Ctrl+F
+    if (mod && !e.shiftKey && key.toLowerCase() === 'f') {
+      e.preventDefault()
+      if (tab.id === currentTabId.value) openSearch()
+      return false
+    }
+    return true
   })
 
   // 窗口尺寸变化时同步给远端 PTY
@@ -317,6 +480,7 @@ const syncSessions = async () => {
   for (const [tabId, session] of sessions) {
     if (props.tabs.some(t => t.id === tabId)) continue
     session.unlisten.forEach(fn => fn())
+    session.highlight.dispose()
     session.term.dispose()
     sessions.delete(tabId)
   }
@@ -362,6 +526,192 @@ const clearTerminal = (tabId: string) => {
     writeSshSessionApi(tabId, '\x0c').catch(() => {})
   } else {
     session.term.clear()
+  }
+}
+
+// ==========================================
+// 终端内搜索 / 剪贴板 / 右键菜单
+// ==========================================
+const searchOpen = ref(false)
+const searchQuery = ref('')
+const searchCaseSensitive = ref(false)
+const searchWholeWord = ref(false)
+const searchRegex = ref(false)
+const searchResult = ref<{ resultIndex: number; resultCount: number }>({ resultIndex: -1, resultCount: 0 })
+const searchInputRef = ref<HTMLInputElement | null>(null)
+
+const emitToast = (msg: string, type: 'info' | 'success' | 'warning' | 'error' = 'info') => emit('toast', msg, type)
+
+const searchResultText = computed(() => {
+  if (!searchQuery.value) return ''
+  const { resultIndex, resultCount } = searchResult.value
+  if (resultCount <= 0) return '无结果'
+  return `${resultIndex + 1}/${resultCount}`
+})
+
+const buildSearchOptions = () => ({
+  regex: searchRegex.value,
+  wholeWord: searchWholeWord.value,
+  caseSensitive: searchCaseSensitive.value,
+  incremental: true,
+  decorations: {
+    matchBackground: '#14532d',
+    matchOverviewRuler: '#22c55e',
+    activeMatchBackground: '#b45309',
+    activeMatchColorOverviewRuler: '#fbbf24'
+  }
+})
+
+const runSearch = (direction: 'next' | 'prev') => {
+  const session = currentSession.value
+  if (!session) return
+  const q = searchQuery.value
+  if (!q) {
+    session.search.clearDecorations()
+    searchResult.value = { resultIndex: -1, resultCount: 0 }
+    return
+  }
+  const options = buildSearchOptions()
+  if (direction === 'next') session.search.findNext(q, options)
+  else session.search.findPrevious(q, options)
+}
+
+const onSearchEnter = (e: KeyboardEvent) => {
+  runSearch(e.shiftKey ? 'prev' : 'next')
+}
+
+const openSearch = () => {
+  const session = currentSession.value
+  if (!session) return
+  searchOpen.value = true
+  nextTick(() => {
+    // 搜索输入框独立于 xterm，不抢终端按键
+    session.term.blur()
+    searchInputRef.value?.focus()
+    searchInputRef.value?.select()
+    if (searchQuery.value) runSearch('next')
+  })
+}
+
+const closeSearch = () => {
+  if (!searchOpen.value) return
+  searchOpen.value = false
+  currentSession.value?.search.clearDecorations()
+  searchResult.value = { resultIndex: -1, resultCount: 0 }
+  nextTick(() => focusActive())
+}
+
+const toggleSearch = () => (searchOpen.value ? closeSearch() : openSearch())
+
+/** 关键字高亮开关：作用于所有已创建的终端实例 */
+const toggleHighlight = () => {
+  highlightEnabled.value = !highlightEnabled.value
+  try {
+    localStorage.setItem(HIGHLIGHT_STORAGE_KEY, highlightEnabled.value ? '1' : '0')
+  } catch {
+    // localStorage 不可用时仅本次会话生效
+  }
+  for (const session of sessions.values()) session.highlight.setEnabled(highlightEnabled.value)
+  emitToast(highlightEnabled.value ? '关键字高亮已开启' : '关键字高亮已关闭', 'info')
+}
+
+watch([searchQuery, searchCaseSensitive, searchWholeWord, searchRegex], () => {
+  if (searchOpen.value) runSearch('next')
+})
+
+/** 统一的会话写入入口（真实 SSH 与预览降级共用） */
+const writeToSession = (tabId: string, data: string) => {
+  const session = sessions.get(tabId)
+  if (!session) return
+  if (isTauri()) {
+    writeSshSessionApi(tabId, data).catch((err: any) => {
+      if (session.writeFailed) return
+      session.writeFailed = true
+      session.term.write(`\r\n\x1b[31m[写入失败] ${err?.message || err}\x1b[0m\r\n`)
+    })
+  } else {
+    const tab = props.tabs.find(t => t.id === tabId)
+    if (tab) handleMockTerminalInput(tab, session, data)
+  }
+}
+
+const copySelection = async (tabId: string) => {
+  const session = sessions.get(tabId)
+  if (!session) return
+  const text = session.term.getSelection()
+  if (!text) {
+    emitToast('当前没有选中的文本', 'warning')
+    return
+  }
+  try {
+    await navigator.clipboard.writeText(text)
+    emitToast('已复制选中内容', 'success')
+  } catch (e: any) {
+    emitToast(`复制失败: ${e?.message || e}`, 'error')
+  }
+}
+
+const pasteToTerminal = async (tabId: string) => {
+  try {
+    const text = await navigator.clipboard.readText()
+    if (!text) {
+      emitToast('剪贴板为空', 'warning')
+      return
+    }
+    writeToSession(tabId, text)
+  } catch {
+    emitToast('无法读取剪贴板，请使用 Ctrl+V 粘贴', 'warning')
+  }
+}
+
+const selectAllInTerminal = (tabId: string) => {
+  const session = sessions.get(tabId)
+  if (!session) return
+  session.term.selectAll()
+  emitToast('已全选终端内容', 'info')
+}
+
+const termMenu = ref({ open: false, x: 0, y: 0, tabId: '', hasSelection: false })
+
+const openTermMenu = (event: MouseEvent) => {
+  const session = currentSession.value
+  if (!session) return
+  const selection = session.term.getSelection() || session.rightClickSelection
+  termMenu.value = { open: true, x: event.clientX, y: event.clientY, tabId: currentTabId.value, hasSelection: !!selection }
+}
+
+const termMenuItems = computed<ContextMenuItem[]>(() => [
+  { key: 'copy', label: '复制', icon: Copy, hint: 'Ctrl+Shift+C', disabled: !termMenu.value.hasSelection },
+  { key: 'paste', label: '粘贴', icon: ClipboardPaste, hint: 'Ctrl+Shift+V' },
+  { key: 'select-all', label: '全选', icon: TextSelect },
+  { divider: true },
+  { key: 'find', label: '查找', icon: Search, hint: 'Ctrl+F' },
+  { key: 'clear', label: '清除屏幕', icon: Eraser }
+])
+
+const handleTermMenuSelect = (item: ContextMenuItem) => {
+  const tabId = termMenu.value.tabId
+  if (!tabId) return
+  switch (item.key) {
+    case 'copy': {
+      const session = sessions.get(tabId)
+      const text = session?.term.getSelection() || session?.rightClickSelection || ''
+      if (!text) {
+        emitToast('当前没有选中的文本', 'warning')
+        break
+      }
+      navigator.clipboard.writeText(text)
+        .then(() => emitToast('已复制选中内容', 'success'))
+        .catch((e: any) => emitToast(`复制失败: ${e?.message || e}`, 'error'))
+      break
+    }
+    case 'paste': pasteToTerminal(tabId); break
+    case 'select-all': selectAllInTerminal(tabId); break
+    case 'find':
+      if (tabId === currentTabId.value) openSearch()
+      else emitToast('请先切换到该终端再查找', 'info')
+      break
+    case 'clear': clearTerminal(tabId); break
   }
 }
 
@@ -531,23 +881,39 @@ const handleMockTerminalInput = (tab: TerminalTab, session: TerminalSession, dat
 
 const handleWindowResize = () => fitActive()
 
+/** 全局 Ctrl+F：仅在当前活动工作区生效，终端聚焦时交给 xterm 自定义处理器 */
+const handleGlobalKeydown = (e: KeyboardEvent) => {
+  if (!props.active || dialogState.open) return
+  const mod = e.ctrlKey || e.metaKey
+  if (!mod || e.shiftKey || e.key.toLowerCase() !== 'f') return
+  const el = e.target as HTMLElement | null
+  if (el && typeof el.closest === 'function' && el.closest('.xterm')) return
+  if (!currentSession.value) return
+  e.preventDefault()
+  openSearch()
+}
+
 // 标签页增删 -> 创建/销毁终端实例
 watch(() => props.tabs.map(t => t.id).join('|'), () => { syncSessions() })
-// 切换标签页 -> 重新计算尺寸（隐藏时无法 fit）
+// 切换标签页 -> 重新计算尺寸（隐藏时无法 fit），并关闭搜索条避免作用域错乱
 watch(() => props.activeTabIndex, async () => {
+  if (searchOpen.value) closeSearch()
   await nextTick()
   fitActive()
 })
 
 onMounted(async () => {
   window.addEventListener('resize', handleWindowResize)
+  window.addEventListener('keydown', handleGlobalKeydown)
   await syncSessions()
 })
 
 onBeforeUnmount(() => {
   window.removeEventListener('resize', handleWindowResize)
+  window.removeEventListener('keydown', handleGlobalKeydown)
   for (const session of sessions.values()) {
     session.unlisten.forEach(fn => fn())
+    session.highlight.dispose()
     session.term.dispose()
   }
   sessions.clear()

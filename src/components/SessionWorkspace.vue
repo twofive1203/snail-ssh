@@ -48,6 +48,7 @@
         :tabs="session.terminalTabs"
         :active-tab-index="session.activeTerminalIndex"
         :sidebar-collapsed="isCollapsed"
+        :active="!!isActive"
         @switch-tab="(idx) => emit('switch-terminal-tab', idx)"
         @close-tab="(idx) => emit('close-terminal-tab', idx)"
         @add-tab="emit('add-terminal-tab')"
@@ -61,6 +62,7 @@
         @session-closed="(tabId, reason) => emit('session-closed', tabId, reason)"
         @terminal-cwd-change="handleTerminalCwdChange"
         @terminal-enter="handleTerminalEnter"
+        @toast="(msg, type) => emit('toast', msg, type)"
       />
 
       <!-- 4. 底部远程监控信息栏 (对标 MobaXterm 底部服务器资源监控) -->
