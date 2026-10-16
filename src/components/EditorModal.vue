@@ -55,7 +55,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, watch } from 'vue'
+import { ref, computed, watch, onMounted, onBeforeUnmount } from 'vue'
 import { FileCode, Save, X } from 'lucide-vue-next'
 import { sftpReadFileApi, sftpWriteFileApi } from '@/api/tauri'
 
@@ -107,4 +107,16 @@ const handleSave = async () => {
     saving.value = false
   }
 }
+
+// 底部提示的 Ctrl+S 快捷键：仅在编辑器打开时接管
+const onKeydown = (e: KeyboardEvent) => {
+  if (!props.open) return
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
+    e.preventDefault()
+    if (!saving.value) handleSave()
+  }
+}
+
+onMounted(() => window.addEventListener('keydown', onKeydown))
+onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
 </script>

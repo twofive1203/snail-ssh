@@ -40,7 +40,6 @@
           <FolderGit2 class="w-4 h-4 text-cyan-400" />
           <span>SFTP 文件传输</span>
         </div>
-        <span class="text-[10px] font-mono px-1.5 py-0.2 rounded bg-cyan-500/10 text-cyan-400 border border-cyan-500/20">双栏浏览</span>
       </button>
     </div>
 
@@ -113,28 +112,25 @@
               <KeyRound class="w-3.5 h-3.5 text-amber-400" />
               <span>SSH 密钥保险箱</span>
             </span>
-            <span class="font-mono text-[10px] text-slate-500">4 组密钥</span>
           </button>
           <button @click="$emit('open-snippets')" class="w-full flex items-center justify-between px-2.5 py-1.5 rounded-md text-surface-subtle hover:text-slate-200 hover:bg-surface-card transition-colors">
             <span class="flex items-center gap-2">
               <Code2 class="w-3.5 h-3.5 text-purple-400" />
               <span>常用指令代码库</span>
             </span>
-            <span class="font-mono text-[10px] text-slate-500">12 条</span>
           </button>
           <button @click="$emit('open-tunnels')" class="w-full flex items-center justify-between px-2.5 py-1.5 rounded-md text-surface-subtle hover:text-slate-200 hover:bg-surface-card transition-colors">
             <span class="flex items-center gap-2">
               <Network class="w-3.5 h-3.5 text-cyan-400" />
               <span>端口转发 & 隧道</span>
             </span>
-            <span class="font-mono text-[10px] text-slate-500">1 活跃</span>
           </button>
         </div>
       </div>
 
-      <!-- 快速直连历史 (Recent) -->
+      <!-- 快捷入口 -->
       <div>
-        <div class="text-[11px] font-semibold text-slate-500 tracking-wider uppercase px-2 mb-2 font-mono">快速直连历史</div>
+        <div class="text-[11px] font-semibold text-slate-500 tracking-wider uppercase px-2 mb-2 font-mono">快捷入口</div>
         <div class="space-y-1">
           <div
             v-for="item in recentHosts"
@@ -152,13 +148,15 @@
       </div>
     </div>
 
-    <!-- 侧边栏底部：运行环境与网络状态 -->
+    <!-- 侧边栏底部：会话状态 -->
     <div class="p-3 border-t border-surface-border bg-surface-card/30 flex items-center justify-between text-xs text-surface-subtle">
       <div class="flex items-center gap-2">
-        <div class="w-2 h-2 rounded-full bg-emerald-500"></div>
-        <span class="font-mono text-[11px]">SSH 引擎: 就绪</span>
+        <div class="w-2 h-2 rounded-full" :class="activeSessionsCount > 0 ? 'bg-emerald-500' : 'bg-slate-600'"></div>
+        <span class="font-mono text-[11px]">
+          {{ activeSessionsCount > 0 ? `${activeSessionsCount} 个活动会话` : '当前无活动会话' }}
+        </span>
       </div>
-      <span class="font-mono text-[11px] text-slate-500">Ping: 18ms</span>
+      <span class="font-mono text-[11px] text-slate-500">SSH 引擎: 就绪</span>
     </div>
   </aside>
 </template>

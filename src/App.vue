@@ -7,7 +7,7 @@
       @open-palette="paletteOpen = true"
       @toggle-transfers="transfersOpen = !transfersOpen"
       @open-new-host="openNewHostModal"
-      @open-settings="triggerToast('设置中心：支持终端主题 (Catppuccin, Tokyo Night) 与字体定制', 'info')"
+      @open-settings="triggerToast('设置中心尚未实现', 'info')"
     />
 
     <!-- 2. 主体工作区 -->
@@ -23,10 +23,10 @@
         @switch-view="switchView"
         @filter-group="val => selectedGroup = val"
         @connect-host="handleConnectSsh"
-        @add-group="triggerToast('可自定义新增分组与环境标签', 'info')"
-        @open-vault="triggerToast('SSH 密钥保险箱：支持 RSA / Ed25519 密钥对生成与导入', 'info')"
-        @open-snippets="triggerToast('常用命令片段库：支持团队快捷运维脚本共享', 'info')"
-        @open-tunnels="triggerToast('端口转发隧道管理器：支持 Local/Remote/Dynamic 转发', 'info')"
+        @add-group="triggerToast('自定义分组尚未实现', 'info')"
+        @open-vault="triggerToast('SSH 密钥保险箱尚未实现', 'info')"
+        @open-snippets="triggerToast('命令片段库尚未实现', 'info')"
+        @open-tunnels="triggerToast('端口转发隧道尚未实现', 'info')"
       />
 
       <!-- 主视图容器 -->
@@ -41,7 +41,7 @@
           @edit-host="handleEditHost"
           @delete-host="handleDeleteHost"
           @open-new-host="openNewHostModal"
-          @import-export="triggerToast('支持从 SSH Config、FinalShell、Termius 导入主机', 'info')"
+          @import-export="triggerToast('主机导入/导出尚未实现', 'info')"
         />
 
         <!-- 视图 2: SSH 终端 -->
@@ -65,6 +65,7 @@
           @select-host="handleConnectSftp"
           @edit-file="handleOpenEditor"
           @download-file="handleDownloadFile"
+          @download-files="handleDownloadFiles"
           @upload-trigger="handleUploadTrigger"
           @open-in-terminal="handleOpenInTerminal"
           @toast="triggerToast"
@@ -124,8 +125,23 @@ import CommandPalette from '@/components/CommandPalette.vue'
 import HostModal from '@/components/HostModal.vue'
 import EditorModal from '@/components/EditorModal.vue'
 import Toast from '@/components/Toast.vue'
-import type { HostItem, TerminalTab, TransferTask, ToastMessage } from '@/types'
-import { getHostsApi, saveHostApi, deleteHostApi, createSshSessionApi, closeSshSessionApi, sftpUploadFileApi, sftpDownloadFileApi, onSftpProgress, pickLocalFile, pickSavePath, isTauri } from '@/api/tauri'
+import type { HostItem, RemoteFileRef, TerminalTab, TransferTask, ToastMessage } from '@/types'
+import {
+  getHostsApi,
+  saveHostApi,
+  deleteHostApi,
+  createSshSessionApi,
+  closeSshSessionApi,
+  writeSshSessionApi,
+  probeHostInfoApi,
+  sftpUploadFileApi,
+  sftpDownloadFileApi,
+  onSftpProgress,
+  pickLocalFile,
+  pickSavePath,
+  pickDirectory,
+  isTauri
+} from '@/api/tauri'
 
 // 核心视图状态
 const activeView = ref<'hosts' | 'terminal' | 'sftp'>('hosts')
@@ -157,37 +173,9 @@ const currentSftpHost = ref<HostItem | undefined>(undefined)
 const sessionByHost = new Map<string, string>()
 const currentSftpSessionId = ref<string>('')
 
-// 传输队列状态
+// 传输队列只承载真实任务，启动时为空（避免展示无法对应真实连接的假进度）
 const transfersOpen = ref(false)
-const transferTasks = ref<TransferTask[]>([
-  {
-    id: 't-1',
-    name: 'frontend-dist-v2.1.tar.gz',
-    type: 'upload',
-    progress: 78,
-    speed: '14.2 MB/s · 剩余 6秒',
-    size: '312 MB / 400 MB',
-    status: 'running'
-  },
-  {
-    id: 't-2',
-    name: 'nginx-access-20250220.log',
-    type: 'download',
-    progress: 45,
-    speed: '4.2 MB/s · 剩余 13秒',
-    size: '45 MB / 100 MB',
-    status: 'running'
-  },
-  {
-    id: 't-3',
-    name: 'app-config-production.yaml',
-    type: 'upload',
-    progress: 100,
-    speed: '已完成',
-    size: '24 KB',
-    status: 'completed'
-  }
-])
+const transferTasks = ref<TransferTask[]>([])
 
 // 弹窗状态
 const paletteOpen = ref(false)
@@ -249,19 +237,96 @@ const loadHosts = async () => {
 // ==========================================
 // SSH / SFTP 会话建立（同一主机复用同一连接）
 // ==========================================
+const probingHosts = new Set<string>()
+
+// 把后端返回的 HOST_KEY_UNKNOWN|指纹 转成用户可确认的信任流程
+const openSession = async (host: HostItem, cols = 80, rows = 24): Promise<string | null> => {
+  try {
+    const res = await createSshSessionApi(host, cols, rows, false)
+    return res.sessionId
+  } catch (e: any) {
+    const msg = String(e?.message || e)
+    if (msg.startsWith('HOST_KEY_MISMATCH|')) {
+      const parts = msg.split('|')
+      const newFp = parts[1] || '未知'
+      const oldFps = (parts[2] || '').split(';').filter(Boolean)
+      const proceed = confirm(
+        `警告：${host.name}（${host.host}:${host.port}）的主机密钥与 ~/.ssh/known_hosts 记录不一致！\n\n` +
+          `本次服务器提供的指纹：\n${newFp}\n\n` +
+          `已知记录：\n${oldFps.join('\n') || '（无法读取）'}\n\n` +
+          `这可能是服务器重装/更换了密钥，也可能是中间人攻击。\n` +
+          `仅在确认服务器确实变更过密钥时确认，将替换 known_hosts 中的旧记录并继续连接。`
+      )
+      if (!proceed) {
+        triggerToast('已取消连接：主机密钥不一致', 'warning')
+        return null
+      }
+      try {
+        const res = await createSshSessionApi(host, cols, rows, true)
+        return res.sessionId
+      } catch (e2: any) {
+        triggerToast(`SSH 连接失败: ${e2?.message || e2}`, 'error')
+        return null
+      }
+    }
+    const unknown = msg.match(/HOST_KEY_UNKNOWN\|(.+)/)
+    if (unknown) {
+      const trust = confirm(
+        `首次连接 ${host.name}（${host.host}:${host.port}）。\n\n主机密钥指纹：\n${unknown[1]}\n\n是否信任并写入 ~/.ssh/known_hosts？`
+      )
+      if (!trust) {
+        triggerToast('已取消连接：未信任主机密钥', 'warning')
+        return null
+      }
+      try {
+        const res = await createSshSessionApi(host, cols, rows, true)
+        return res.sessionId
+      } catch (e2: any) {
+        triggerToast(`SSH 连接失败: ${e2?.message || e2}`, 'error')
+        return null
+      }
+    }
+    triggerToast(`SSH 连接失败: ${msg}`, 'error')
+    return null
+  }
+}
+
 const ensureSession = async (host: HostItem): Promise<string | null> => {
   if (!isTauri()) return `mock-${host.id}`
 
   const existing = sessionByHost.get(host.id)
   if (existing && terminalTabs.value.some(t => t.id === existing)) return existing
 
+  const sessionId = await openSession(host)
+  if (sessionId) sessionByHost.set(host.id, sessionId)
+  return sessionId
+}
+
+// 连接成功后异步采集真实指标（发行版 / CPU / 内存 / 磁盘 / 延迟）
+const refreshHostMetrics = async (host: HostItem, sessionId: string) => {
+  if (!isTauri() || probingHosts.has(host.id)) return
+  probingHosts.add(host.id)
   try {
-    const res = await createSshSessionApi(host, 80, 24)
-    sessionByHost.set(host.id, res.sessionId)
-    return res.sessionId
-  } catch (e: any) {
-    triggerToast(`SSH 连接失败: ${e?.message || e}`, 'error')
-    return null
+    const info = await probeHostInfoApi(sessionId)
+    const updated: HostItem = {
+      ...host,
+      os: info.os || host.os,
+      osName: info.osName || host.osName,
+      cpu: info.cpu ?? host.cpu,
+      mem: info.mem ?? host.mem,
+      disk: info.disk ?? host.disk,
+      ping: info.pingMs != null ? `${info.pingMs}ms` : host.ping,
+      status: 'online',
+      updatedAt: '刚刚'
+    }
+    const idx = hosts.value.findIndex(h => h.id === host.id)
+    if (idx >= 0) hosts.value[idx] = updated
+    if (currentSftpHost.value?.id === host.id) currentSftpHost.value = updated
+    await saveHostApi(updated)
+  } catch (e) {
+    console.warn('probe_host_info failed:', e)
+  } finally {
+    probingHosts.delete(host.id)
   }
 }
 
@@ -291,6 +356,7 @@ const handleConnectSsh = async (host: HostItem) => {
   }
 
   triggerToast(`已连通 ${host.name} (SSH-2.0)`, 'success')
+  refreshHostMetrics(host, sessionId)
 }
 
 // SFTP 直连：复用该主机已有的 SSH 会话
@@ -303,6 +369,7 @@ const handleConnectSftp = async (host: HostItem) => {
   currentSftpSessionId.value = sessionId
   activeView.value = 'sftp'
   triggerToast(`已连接 ${host.name} 的 SFTP 文件系统`, 'success')
+  refreshHostMetrics(host, sessionId)
 }
 
 // 远端主动断开（Shell 退出 / 链路中断）
@@ -514,7 +581,47 @@ const handleUploadTrigger = async (remoteDir: string) => {
 
 const handleOpenInTerminal = (path: string) => {
   activeView.value = 'terminal'
-  triggerToast(`已在终端切至 ${path}`, 'info')
+  const tab = terminalTabs.value[activeTabIndex.value]
+  if (isTauri() && tab?.connected) {
+    // 真实会话：把 cd 命令送入当前 Shell
+    writeSshSessionApi(tab.id, `cd ${shellQuote(path)}\n`).catch(() => {})
+    triggerToast(`已在终端切换至 ${path}`, 'info')
+  } else {
+    triggerToast('当前没有活动终端会话，无法切换目录', 'warning')
+  }
+}
+
+// 远端路径可能含空格/特殊字符，统一单引号包裹
+const shellQuote = (value: string) => `'${value.replace(/'/g, `'\\''`)}'`
+
+// 批量下载：选一次目标目录，逐个文件复用同一套传输任务与进度事件
+const handleDownloadFiles = async (refs: RemoteFileRef[]) => {
+  if (refs.length === 0) return
+  const sessionId = currentSftpSessionId.value
+  if (isTauri() && !sessionId) {
+    triggerToast('请先连接该主机的 SSH/SFTP 会话', 'warning')
+    return
+  }
+
+  let targetDir = ''
+  if (isTauri()) {
+    const picked = await pickDirectory()
+    if (!picked) return
+    targetDir = picked
+  }
+
+  for (const ref of refs) {
+    const task = createTransferTask(`下载: ${ref.file.name}`, 'download', ref.file.size)
+    if (!isTauri()) {
+      runMockTransfer(task)
+      continue
+    }
+    const sep = targetDir.includes('\\') ? '\\' : '/'
+    const localPath = `${targetDir}${targetDir.endsWith(sep) ? '' : sep}${ref.file.name}`
+    await runTransfer(task, (taskId) =>
+      sftpDownloadFileApi(sessionId, ref.remotePath, localPath, taskId)
+    )
+  }
 }
 
 const handleClearCompletedTasks = () => {

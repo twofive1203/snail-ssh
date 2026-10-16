@@ -74,13 +74,27 @@
         <div class="w-14 h-14 rounded-2xl bg-surface-card border border-surface-border flex items-center justify-center text-slate-500 mb-3">
           <ServerOff class="w-7 h-7" />
         </div>
-        <div class="text-sm font-semibold text-slate-300">未找到匹配的服务器</div>
-        <div class="text-xs text-slate-500 mt-1">请尝试更换搜索关键字或清除筛选条件</div>
+        <div class="text-sm font-semibold text-slate-300">
+          {{ hosts.length === 0 ? '还没有任何服务器' : '未找到匹配的服务器' }}
+        </div>
+        <div class="text-xs text-slate-500 mt-1">
+          {{ hosts.length === 0
+            ? '点击「新建服务器」添加第一台主机，密码与私钥会存入系统钥匙串'
+            : '请尝试更换搜索关键字或清除筛选条件' }}
+        </div>
         <button
+          v-if="hosts.length > 0"
           @click="searchQuery = ''"
           class="mt-4 px-3.5 py-1.5 rounded-lg bg-surface-card hover:bg-surface-elevated border border-surface-border text-xs text-brand-400"
         >
           重置搜索
+        </button>
+        <button
+          v-else
+          @click="$emit('open-new-host')"
+          class="mt-4 px-3.5 py-1.5 rounded-lg bg-brand-500 hover:bg-brand-600 text-slate-950 font-semibold text-xs"
+        >
+          新建服务器
         </button>
       </div>
 
@@ -101,7 +115,7 @@
                 <div>
                   <div class="text-xs font-bold text-white flex items-center gap-1.5 font-mono">
                     <span>{{ host.name }}</span>
-                    <span class="w-2 h-2 rounded-full bg-emerald-400" :title="`在线 (${host.ping || '20ms'})`"></span>
+                    <span class="w-2 h-2 rounded-full" :class="statusDotClass(host)" :title="statusTitle(host)"></span>
                   </div>
                   <div class="text-[11px] font-mono text-surface-subtle flex items-center gap-1 mt-0.5">
                     <span>{{ host.username }}@{{ host.host }}:{{ host.port }}</span>
@@ -134,9 +148,9 @@
                 <span class="text-slate-500 text-[10px]">CPU</span>
                 <div class="flex items-center gap-1.5 mt-0.5">
                   <div class="w-full bg-surface-highlight h-1.5 rounded-full overflow-hidden">
-                    <div class="bg-brand-500 h-full rounded-full" :style="{ width: `${host.cpu || 20}%` }"></div>
+                    <div class="bg-brand-500 h-full rounded-full" :style="{ width: `${host.cpu ?? 0}%` }"></div>
                   </div>
-                  <span class="text-slate-300 font-semibold text-[10px]">{{ host.cpu || 20 }}%</span>
+                  <span class="text-slate-300 font-semibold text-[10px]">{{ host.cpu != null ? host.cpu + '%' : '—' }}</span>
                 </div>
               </div>
 
@@ -144,16 +158,16 @@
                 <span class="text-slate-500 text-[10px]">MEM</span>
                 <div class="flex items-center gap-1.5 mt-0.5">
                   <div class="w-full bg-surface-highlight h-1.5 rounded-full overflow-hidden">
-                    <div class="bg-cyan-500 h-full rounded-full" :style="{ width: `${host.mem || 45}%` }"></div>
+                    <div class="bg-cyan-500 h-full rounded-full" :style="{ width: `${host.mem ?? 0}%` }"></div>
                   </div>
-                  <span class="text-slate-300 font-semibold text-[10px]">{{ host.mem || 45 }}%</span>
+                  <span class="text-slate-300 font-semibold text-[10px]">{{ host.mem != null ? host.mem + '%' : '—' }}</span>
                 </div>
               </div>
 
               <div class="flex flex-col">
                 <span class="text-slate-500 text-[10px]">延迟 (Ping)</span>
                 <div class="flex items-center gap-1 mt-0.5">
-                  <span class="text-emerald-400 font-semibold text-[11px]">{{ host.ping || '24ms' }}</span>
+                  <span class="text-emerald-400 font-semibold text-[11px]">{{ host.ping || '—' }}</span>
                 </div>
               </div>
             </div>
@@ -161,7 +175,7 @@
             <!-- 标签列表 -->
             <div class="flex flex-wrap gap-1.5 mb-4">
               <span class="text-[10px] font-mono px-2 py-0.5 rounded bg-surface-highlight text-slate-300 border border-surface-border/60">
-                {{ host.osName || 'Linux' }}
+                {{ host.osName || '未知系统' }}
               </span>
               <span
                 v-for="tag in host.tags"
@@ -213,13 +227,13 @@
           <tbody class="divide-y divide-surface-border/40">
             <tr v-for="host in filteredHosts" :key="host.id" class="hover:bg-surface-card/50 transition-colors">
               <td class="py-3 px-4 font-medium text-white flex items-center gap-2">
-                <span class="w-2 h-2 rounded-full bg-emerald-400"></span>
+                <span class="w-2 h-2 rounded-full" :class="statusDotClass(host)" :title="statusTitle(host)"></span>
                 <span class="font-bold">{{ host.name }}</span>
               </td>
-              <td class="py-3 px-4 text-slate-300 text-[11px]">{{ host.osName || 'Linux' }}</td>
+              <td class="py-3 px-4 text-slate-300 text-[11px]">{{ host.osName || '未知系统' }}</td>
               <td class="py-3 px-4 text-slate-400">{{ host.username }}@{{ host.host }}:{{ host.port }}</td>
               <td class="py-3 px-4 text-slate-400 uppercase">{{ host.authType }}</td>
-              <td class="py-3 px-4 text-center text-emerald-400 font-semibold">{{ host.ping || '24ms' }}</td>
+              <td class="py-3 px-4 text-center text-emerald-400 font-semibold">{{ host.ping || '—' }}</td>
               <td class="py-3 px-4">
                 <div class="flex gap-1 flex-wrap">
                   <span
@@ -315,9 +329,23 @@ const getOsIcon = (os?: string) => {
     case 'alpine':
       return HardDrive
     case 'apple':
+    case 'darwin':
       return Command
     default:
       return Server
   }
+}
+
+// 状态点只反映真实状态：连接成功后会标记 online，未探测过则为未知
+const statusDotClass = (host: HostItem) => {
+  if (host.status === 'online') return 'bg-emerald-400'
+  if (host.status === 'offline') return 'bg-rose-500'
+  return 'bg-slate-500'
+}
+
+const statusTitle = (host: HostItem) => {
+  if (host.status === 'online') return `在线${host.ping ? ` (${host.ping})` : ''}`
+  if (host.status === 'offline') return '离线'
+  return '尚未探测连接状态'
 }
 </script>

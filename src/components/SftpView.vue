@@ -105,6 +105,36 @@
       </div>
     </div>
 
+    <!-- 多选操作栏 -->
+    <div
+      v-if="selectedFileNames.size > 0"
+      class="h-9 px-4 flex items-center justify-between bg-brand-500/10 border-b border-brand-500/20 text-xs shrink-0"
+    >
+      <span class="text-brand-300 font-medium">已选中 {{ selectedFileNames.size }} 项</span>
+      <div class="flex items-center gap-2">
+        <button
+          @click="downloadSelected"
+          class="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-surface-card hover:bg-surface-elevated border border-surface-border text-cyan-400 transition-colors"
+        >
+          <Download class="w-3.5 h-3.5" />
+          <span>下载选中</span>
+        </button>
+        <button
+          @click="deleteSelected"
+          class="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-surface-card hover:bg-surface-elevated border border-surface-border text-rose-400 transition-colors"
+        >
+          <Trash2 class="w-3.5 h-3.5" />
+          <span>删除选中</span>
+        </button>
+        <button
+          @click="selectedFileNames.clear()"
+          class="px-2.5 py-1 rounded-md text-surface-subtle hover:text-white transition-colors"
+        >
+          取消选择
+        </button>
+      </div>
+    </div>
+
     <!-- SFTP 表格区域 -->
     <div class="flex-1 overflow-y-auto custom-scrollbar select-none">
       <table class="w-full text-left text-xs border-collapse">
@@ -157,7 +187,7 @@
               <div class="flex items-center justify-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
                 <button
                   v-if="file.editable"
-                  @click="$emit('edit-file', currentPath + '/' + file.name)"
+                  @click="$emit('edit-file', joinPath(currentPath, file.name))"
                   class="p-1 rounded hover:bg-surface-elevated text-brand-400 hover:text-brand-300"
                   title="在线实时编辑"
                 >
@@ -206,8 +236,8 @@
 
 <script setup lang="ts">
 import { ref, computed, onMounted, watch } from 'vue'
-import type { HostItem, SftpFileItem } from '@/types'
-import { sftpReadDirApi, sftpMkdirApi, sftpRemoveFileApi } from '@/api/tauri'
+import type { HostItem, RemoteFileRef, SftpFileItem } from '@/types'
+import { sftpReadDirApi, sftpMkdirApi, sftpRemoveFileApi, sftpHomeDirApi } from '@/api/tauri'
 import {
   Folder,
   ChevronDown,
@@ -238,17 +268,21 @@ const emit = defineEmits<{
   (e: 'select-host', host: HostItem): void
   (e: 'edit-file', fullPath: string): void
   (e: 'download-file', file: SftpFileItem, remotePath: string): void
+  (e: 'download-files', refs: RemoteFileRef[]): void
   (e: 'upload-trigger', remoteDir: string): void
   (e: 'open-in-terminal', path: string): void
   (e: 'toast', msg: string, type: 'info' | 'success' | 'warning' | 'error'): void
 }>()
 
 const showHostDropdown = ref(false)
-const currentPath = ref('/etc/nginx')
+// 进入视图后由 sftp_home_dir 解析为远端家目录
+const currentPath = ref('/')
 const files = ref<SftpFileItem[]>([])
 const loading = ref(false)
 const showHidden = ref(false)
 const selectedFileNames = ref<Set<string>>(new Set())
+
+const joinPath = (dir: string, name: string) => (dir === '/' ? `/${name}` : `${dir}/${name}`)
 
 const pathSegments = computed(() => {
   return currentPath.value.split('/').filter(Boolean)
@@ -257,6 +291,22 @@ const pathSegments = computed(() => {
 const visibleFiles = computed(() => {
   return files.value.filter(f => showHidden.value || !f.isHidden)
 })
+
+// 当前选中的非 ".." 项
+const selectedFiles = computed(() =>
+  visibleFiles.value.filter(f => f.name !== '..' && selectedFileNames.value.has(f.name))
+)
+
+// 远端家目录（失败时保留当前路径）
+const resolveHome = async () => {
+  if (!props.activeSessionId) return
+  try {
+    const home = await sftpHomeDirApi(props.activeSessionId)
+    if (home) currentPath.value = home
+  } catch (err) {
+    console.warn('sftp_home_dir failed:', err)
+  }
+}
 
 const isAllSelected = computed(() => {
   const selectable = visibleFiles.value.filter(f => f.name !== '..')
@@ -299,11 +349,10 @@ const handleFileClick = (file: SftpFileItem) => {
       const segs = pathSegments.value.slice(0, -1)
       navigateTo('/' + segs.join('/'))
     } else {
-      const nextPath = currentPath.value === '/' ? `/${file.name}` : `${currentPath.value}/${file.name}`
-      navigateTo(nextPath)
+      navigateTo(joinPath(currentPath.value, file.name))
     }
   } else if (file.editable) {
-    emit('edit-file', `${currentPath.value}/${file.name}`)
+    emit('edit-file', joinPath(currentPath.value, file.name))
   }
 }
 
@@ -334,7 +383,7 @@ const openNewFolderPrompt = async () => {
   const name = prompt('请输入新建文件夹名称:', 'new_folder')
   if (name) {
     try {
-      await sftpMkdirApi(props.activeSessionId, `${currentPath.value}/${name}`)
+      await sftpMkdirApi(props.activeSessionId, joinPath(currentPath.value, name))
       emit('toast', `已新建文件夹: ${name}`, 'success')
       loadFiles()
     } catch (e: any) {
@@ -344,7 +393,45 @@ const openNewFolderPrompt = async () => {
 }
 
 const handleDownload = (file: SftpFileItem) => {
-  emit('download-file', file, `${currentPath.value}/${file.name}`)
+  emit('download-file', file, joinPath(currentPath.value, file.name))
+}
+
+// 批量下载：目录暂不支持，仅收集文件项
+const downloadSelected = () => {
+  const refs = selectedFiles.value
+    .filter(f => !f.isDir)
+    .map(f => ({ file: f, remotePath: joinPath(currentPath.value, f.name) }))
+  if (refs.length === 0) {
+    emit('toast', '请选择要下载的文件（目录暂不支持批量下载）', 'warning')
+    return
+  }
+  emit('download-files', refs)
+}
+
+// 批量删除：后端递归删除目录
+const deleteSelected = async () => {
+  if (!props.activeSessionId) {
+    emit('toast', '尚未建立 SSH 会话，无法删除', 'warning')
+    return
+  }
+  const targets = selectedFiles.value
+  if (targets.length === 0) return
+  const label = targets.length === 1 ? targets[0].name : `${targets.length} 项`
+  if (!confirm(`确定要删除 ${label} 吗？目录会被递归删除。`)) return
+
+  const sessionId = props.activeSessionId
+  let failed = 0
+  for (const file of targets) {
+    try {
+      await sftpRemoveFileApi(sessionId, joinPath(currentPath.value, file.name))
+    } catch (e: any) {
+      failed++
+      emit('toast', `删除 ${file.name} 失败: ${e?.message || e}`, 'error')
+    }
+  }
+  selectedFileNames.value.clear()
+  loadFiles()
+  if (failed === 0) emit('toast', `已删除 ${label}`, 'warning')
 }
 
 const handleDelete = async (file: SftpFileItem) => {
@@ -352,9 +439,9 @@ const handleDelete = async (file: SftpFileItem) => {
     emit('toast', '尚未建立 SSH 会话，无法删除', 'warning')
     return
   }
-  if (confirm(`确定要删除 ${file.name} 吗？`)) {
+  if (confirm(`确定要删除 ${file.name} 吗？目录会被递归删除。`)) {
     try {
-      await sftpRemoveFileApi(props.activeSessionId, `${currentPath.value}/${file.name}`)
+      await sftpRemoveFileApi(props.activeSessionId, joinPath(currentPath.value, file.name))
       emit('toast', `已删除 ${file.name}`, 'warning')
       loadFiles()
     } catch (e: any) {
@@ -401,15 +488,17 @@ const getFileIconColor = (file: SftpFileItem) => {
   return 'text-slate-400'
 }
 
-onMounted(() => {
+onMounted(async () => {
+  if (props.activeSessionId) await resolveHome()
   loadFiles()
 })
 
-// 主机/会话切换后重新加载当前目录
+// 主机/会话切换后重新解析家目录并加载
 watch(
   () => [props.activeSessionId, props.currentHost?.id].join('|'),
-  () => {
+  async () => {
     currentPath.value = '/'
+    if (props.activeSessionId) await resolveHome()
     loadFiles()
   }
 )

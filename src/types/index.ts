@@ -62,6 +62,29 @@ export interface TransferTask {
   status: 'running' | 'completed' | 'failed'
 }
 
+/** 后端真实连通性测试结果 */
+export interface ConnectionTestResult {
+  latencyMs: number
+  hostKeyFingerprint: string
+  hostKeyStatus: 'matched' | 'trusted' | string
+}
+
+/** 远端主机实时指标探测结果 */
+export interface HostProbeResult {
+  os?: string
+  osName?: string
+  cpu?: number
+  mem?: number
+  disk?: number
+  pingMs?: number
+}
+
+/** 批量传输时引用的远端文件 */
+export interface RemoteFileRef {
+  file: SftpFileItem
+  remotePath: string
+}
+
 export interface ToastMessage {
   id: string
   text: string

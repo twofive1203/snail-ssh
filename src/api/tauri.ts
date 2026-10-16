@@ -1,7 +1,13 @@
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { open as openDialog, save as saveDialog } from '@tauri-apps/plugin-dialog'
-import type { HostItem, SftpFileItem, SftpProgressPayload } from '@/types'
+import type {
+  ConnectionTestResult,
+  HostItem,
+  HostProbeResult,
+  SftpFileItem,
+  SftpProgressPayload
+} from '@/types'
 
 // 检测是否处于 Tauri 环境
 export const isTauri = (): boolean => {
@@ -180,7 +186,12 @@ export async function deleteHostApi(id: string): Promise<void> {
 // ==========================================
 // SSH 终端真实连接与通道 API
 // ==========================================
-export async function createSshSessionApi(host: HostItem, cols: number, rows: number): Promise<{ sessionId: string }> {
+export async function createSshSessionApi(
+  host: HostItem,
+  cols: number,
+  rows: number,
+  trustHostKey = false
+): Promise<{ sessionId: string }> {
   if (isTauri()) {
     return await invoke<{ sessionId: string }>('create_ssh_session', {
       config: {
@@ -191,12 +202,45 @@ export async function createSshSessionApi(host: HostItem, cols: number, rows: nu
         password: host.password || null,
         private_key: host.privateKey || null,
         passphrase: host.passphrase || null,
+        trust_host_key: trustHostKey,
         cols,
         rows,
       }
     })
   }
   return { sessionId: 'mock-session-' + Date.now() }
+}
+
+// 真实连通性测试：TCP + 握手 + 主机密钥校验 + 认证，返回真实耗时（仅 Tauri 环境可用）
+export async function testSshConnectionApi(
+  host: HostItem,
+  trustHostKey = false
+): Promise<ConnectionTestResult> {
+  if (!isTauri()) {
+    throw new Error('浏览器预览模式无法测试真实连接，请使用 Tauri 桌面客户端')
+  }
+  return await invoke<ConnectionTestResult>('test_ssh_connection', {
+    config: {
+      host: host.host,
+      port: host.port,
+      username: host.username,
+      auth_type: host.authType,
+      password: host.password || null,
+      private_key: host.privateKey || null,
+      passphrase: host.passphrase || null,
+      trust_host_key: trustHostKey,
+      cols: 80,
+      rows: 24,
+    }
+  })
+}
+
+// 采集远端真实指标（发行版 / CPU / 内存 / 磁盘 / 延迟）
+export async function probeHostInfoApi(sessionId: string): Promise<HostProbeResult> {
+  if (!isTauri()) {
+    return {}
+  }
+  return await invoke<HostProbeResult>('probe_host_info', { sessionId })
 }
 
 export async function writeSshSessionApi(sessionId: string, data: string): Promise<void> {
@@ -251,9 +295,23 @@ export async function pickSavePath(defaultFileName: string): Promise<string | nu
   return selected ?? null
 }
 
+// 批量下载时选择目标目录
+export async function pickDirectory(): Promise<string | null> {
+  if (!isTauri()) return null
+  const selected = await openDialog({ multiple: false, directory: true })
+  return typeof selected === 'string' ? selected : null
+}
+
 // ==========================================
 // SFTP 远程文件系统 API
 // ==========================================
+export async function sftpHomeDirApi(sessionId: string): Promise<string> {
+  if (isTauri()) {
+    return await invoke<string>('sftp_home_dir', { sessionId })
+  }
+  return '/etc/nginx'
+}
+
 export async function sftpReadDirApi(sessionId: string, path: string): Promise<SftpFileItem[]> {
   if (isTauri()) {
     try {

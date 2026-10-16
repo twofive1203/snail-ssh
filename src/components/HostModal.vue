@@ -125,13 +125,23 @@
           </div>
 
           <div v-if="form.authType === 'key'" class="space-y-1.5">
-            <label class="text-xs font-medium text-slate-300">私钥文本 (Private Key PEM)</label>
+            <label class="text-xs font-medium text-slate-300">私钥内容或本地路径 (Private Key PEM / Path)</label>
             <textarea
               v-model="form.privateKey"
               rows="3"
-              placeholder="-----BEGIN OPENSSH PRIVATE KEY-----..."
+              placeholder="粘贴 -----BEGIN OPENSSH PRIVATE KEY-----，或直接填写本地私钥文件绝对路径"
               class="w-full bg-surface-card border border-surface-border rounded-lg px-3 py-2 text-xs text-white focus:outline-none focus:border-brand-500 transition-colors font-mono"
             ></textarea>
+          </div>
+
+          <div v-if="form.authType === 'key'" class="space-y-1.5">
+            <label class="text-xs font-medium text-slate-300">私钥口令 (Passphrase，可选)</label>
+            <input
+              v-model="form.passphrase"
+              type="password"
+              placeholder="私钥无口令时留空"
+              class="w-full bg-surface-card border border-surface-border rounded-lg px-3 py-2 text-xs text-white focus:outline-none focus:border-brand-500 transition-colors font-mono"
+            />
           </div>
         </div>
 
@@ -158,9 +168,10 @@
           <button
             type="button"
             @click="testConnect"
-            class="px-4 py-2 rounded-lg bg-surface-elevated border border-surface-border hover:border-brand-500/50 text-xs text-brand-400 transition-colors"
+            :disabled="testing"
+            class="px-4 py-2 rounded-lg bg-surface-elevated border border-surface-border hover:border-brand-500/50 text-xs text-brand-400 transition-colors disabled:opacity-50"
           >
-            测试连通性
+            {{ testing ? '测试中...' : '测试连通性' }}
           </button>
           <button
             type="submit"
@@ -178,6 +189,7 @@
 import { ref, watch } from 'vue'
 import { Server, X } from 'lucide-vue-next'
 import type { HostItem, AuthType } from '@/types'
+import { testSshConnectionApi, isTauri } from '@/api/tauri'
 
 const props = defineProps<{
   open: boolean
@@ -192,6 +204,7 @@ const emit = defineEmits<{
 
 const isEditing = ref(false)
 const tagInput = ref('')
+const testing = ref(false)
 
 const form = ref<{
   id: string
@@ -202,6 +215,7 @@ const form = ref<{
   authType: AuthType
   password?: string
   privateKey?: string
+  passphrase?: string
   group: string
 }>({
   id: '',
@@ -212,6 +226,7 @@ const form = ref<{
   authType: 'password',
   password: '',
   privateKey: '',
+  passphrase: '',
   group: 'production'
 })
 
@@ -232,6 +247,7 @@ watch(() => props.open, (val) => {
         authType: 'password',
         password: '',
         privateKey: '',
+        passphrase: '',
         group: 'production'
       }
       tagInput.value = 'Ubuntu, prod'
@@ -239,26 +255,94 @@ watch(() => props.open, (val) => {
   }
 })
 
-const testConnect = () => {
-  emit('toast', `正在测试连接 ${form.value.host}:${form.value.port}...`, 'info')
-  setTimeout(() => {
-    emit('toast', '连接测试成功！网络延迟 22ms', 'success')
-  }, 500)
+// 构造后端测试所需的连接配置
+const buildConfig = (): HostItem => ({
+  ...form.value,
+  tags: []
+})
+
+const errorText = (e: unknown): string => String((e as any)?.message || e)
+
+const testConnect = async () => {
+  if (!form.value.host.trim()) {
+    emit('toast', '请先填写主机地址', 'warning')
+    return
+  }
+  if (!isTauri()) {
+    emit('toast', '浏览器预览模式无法测试真实连接，请使用 Tauri 桌面客户端', 'info')
+    return
+  }
+
+  testing.value = true
+  try {
+    const res = await testSshConnectionApi(buildConfig(), false)
+    emit(
+      'toast',
+      `连接成功：TCP+握手+认证共 ${res.latencyMs} ms，主机密钥 ${res.hostKeyFingerprint}`,
+      'success'
+    )
+  } catch (e) {
+    const msg = errorText(e)
+    if (msg.startsWith('HOST_KEY_MISMATCH|')) {
+      const parts = msg.split('|')
+      const newFp = parts[1] || '未知'
+      const oldFps = (parts[2] || '').split(';').filter(Boolean)
+      const proceed = confirm(
+        `警告：${form.value.host}:${form.value.port} 的主机密钥与 ~/.ssh/known_hosts 不一致！\n\n` +
+          `本次指纹：\n${newFp}\n\n` +
+          `已知记录：\n${oldFps.join('\n') || '（无法读取）'}\n\n` +
+          `仅在确认服务器确实更换过密钥时确认，将替换旧记录后重试。`
+      )
+      if (proceed) {
+        try {
+          const res = await testSshConnectionApi(buildConfig(), true)
+          emit('toast', `已更新 known_hosts，连接成功（${res.latencyMs} ms）`, 'success')
+        } catch (e2) {
+          emit('toast', `连接失败: ${errorText(e2)}`, 'error')
+        }
+      }
+      return
+    }
+    const unknown = msg.match(/HOST_KEY_UNKNOWN\|(.+)/)
+    if (unknown) {
+      const trust = confirm(
+        `该主机密钥未记录在 ~/.ssh/known_hosts。\n\n指纹：\n${unknown[1]}\n\n是否信任并写入后再测试？`
+      )
+      if (trust) {
+        try {
+          const res = await testSshConnectionApi(buildConfig(), true)
+          emit('toast', `已信任主机密钥，连接成功（${res.latencyMs} ms）`, 'success')
+        } catch (e2) {
+          emit('toast', `连接失败: ${errorText(e2)}`, 'error')
+        }
+      }
+    } else {
+      emit('toast', `连接失败: ${msg}`, 'error')
+    }
+  } finally {
+    testing.value = false
+  }
 }
 
 const handleSubmit = () => {
   const tags = tagInput.value.split(',').map(s => s.trim()).filter(Boolean)
+  // 不再随保存伪造指标：监控数据仅来自真实探测结果，编辑时沿用已有值
+  const metrics = props.hostData
+    ? {
+        os: props.hostData.os,
+        osName: props.hostData.osName,
+        status: props.hostData.status,
+        ping: props.hostData.ping,
+        cpu: props.hostData.cpu,
+        mem: props.hostData.mem,
+        disk: props.hostData.disk,
+        updatedAt: props.hostData.updatedAt
+      }
+    : {}
   const item: HostItem = {
     ...form.value,
-    tags,
-    os: 'ubuntu',
-    osName: 'Ubuntu 22.04 LTS',
-    status: 'online',
-    ping: '22ms',
-    cpu: Math.floor(Math.random() * 30) + 10,
-    mem: Math.floor(Math.random() * 40) + 20,
-    disk: 35,
-    updatedAt: '刚刚'
+    ...metrics,
+    tags
   }
   emit('save', item)
 }
