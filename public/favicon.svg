@@ -1,0 +1,312 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <!-- Background Squircle Gradient -->
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0f172a" />
+      <stop offset="45%" stop-color="#0b1120" />
+      <stop offset="100%" stop-color="#04070e" />
+    </linearGradient>
+
+    <!-- Squircle Inset Rim -->
+    <linearGradient id="squircleRim" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#34d399" stop-opacity="0.6" />
+      <stop offset="30%" stop-color="#06b6d4" stop-opacity="0.35" />
+      <stop offset="70%" stop-color="#3b82f6" stop-opacity="0.12" />
+      <stop offset="100%" stop-color="#ffffff" stop-opacity="0.04" />
+    </linearGradient>
+
+    <!-- Ambient Radial Glow Behind Mascot -->
+    <radialGradient id="ambientGlow" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#10b981" stop-opacity="0.25" />
+      <stop offset="45%" stop-color="#06b6d4" stop-opacity="0.10" />
+      <stop offset="100%" stop-color="#000000" stop-opacity="0" />
+    </radialGradient>
+
+    <!-- Snail Body Gradient (Organic, vibrant emerald) -->
+    <linearGradient id="bodyGrad" x1="10%" y1="80%" x2="90%" y2="20%">
+      <stop offset="0%" stop-color="#047857" />
+      <stop offset="40%" stop-color="#059669" />
+      <stop offset="85%" stop-color="#10b981" />
+      <stop offset="100%" stop-color="#34d399" />
+    </linearGradient>
+
+    <!-- Snail Body Belly Highlight -->
+    <linearGradient id="bellyGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#047857" stop-opacity="0" />
+      <stop offset="50%" stop-color="#34d399" stop-opacity="0.4" />
+      <stop offset="100%" stop-color="#047857" stop-opacity="0" />
+    </linearGradient>
+
+    <!-- Snail Body Rim Highlight (Chest, head, upper curves) -->
+    <linearGradient id="bodyRim" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity="0.95" />
+      <stop offset="35%" stop-color="#a7f3d0" stop-opacity="0.7" />
+      <stop offset="100%" stop-color="#10b981" stop-opacity="0" />
+    </linearGradient>
+
+    <!-- Outer Shell Segment Gradient -->
+    <linearGradient id="shellWhorl1" x1="15%" y1="0%" x2="85%" y2="100%">
+      <stop offset="0%" stop-color="#6ee7b7" />
+      <stop offset="25%" stop-color="#10b981" />
+      <stop offset="70%" stop-color="#059669" />
+      <stop offset="100%" stop-color="#022c22" />
+    </linearGradient>
+
+    <!-- Shell Middle Plate Gradient (Cyan-Teal) -->
+    <linearGradient id="shellWhorl2" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#67e8f9" />
+      <stop offset="30%" stop-color="#06b6d4" />
+      <stop offset="75%" stop-color="#0891b2" />
+      <stop offset="100%" stop-color="#083344" />
+    </linearGradient>
+
+    <!-- Shell Inner Rim Plate Gradient -->
+    <linearGradient id="shellWhorl3" x1="20%" y1="0%" x2="80%" y2="100%">
+      <stop offset="0%" stop-color="#34d399" />
+      <stop offset="50%" stop-color="#10b981" />
+      <stop offset="100%" stop-color="#064e3b" />
+    </linearGradient>
+
+    <!-- Terminal Screen Display Gradient -->
+    <radialGradient id="terminalBg" cx="42%" cy="40%" r="65%">
+      <stop offset="0%" stop-color="#162032" />
+      <stop offset="60%" stop-color="#0b121e" />
+      <stop offset="100%" stop-color="#04070d" />
+    </radialGradient>
+
+    <!-- Terminal Screen Inner Glow -->
+    <radialGradient id="screenCenterGlow" cx="48%" cy="48%" r="50%">
+      <stop offset="0%" stop-color="#10b981" stop-opacity="0.32" />
+      <stop offset="65%" stop-color="#06b6d4" stop-opacity="0.08" />
+      <stop offset="100%" stop-color="#000000" stop-opacity="0" />
+    </radialGradient>
+
+    <!-- Terminal Prompt Chevron Gradient -->
+    <linearGradient id="promptGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#ffffff" />
+      <stop offset="45%" stop-color="#6ee7b7" />
+      <stop offset="100%" stop-color="#10b981" />
+    </linearGradient>
+
+    <!-- Terminal Cursor Gradient -->
+    <linearGradient id="cursorGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#7dd3fc" />
+      <stop offset="100%" stop-color="#06b6d4" />
+    </linearGradient>
+
+    <!-- Antenna Tip Beacons -->
+    <radialGradient id="beaconCyan" cx="30%" cy="30%" r="70%">
+      <stop offset="0%" stop-color="#ffffff" />
+      <stop offset="35%" stop-color="#38bdf8" />
+      <stop offset="100%" stop-color="#0284c7" />
+    </radialGradient>
+
+    <radialGradient id="beaconEmerald" cx="30%" cy="30%" r="70%">
+      <stop offset="0%" stop-color="#ffffff" />
+      <stop offset="35%" stop-color="#34d399" />
+      <stop offset="100%" stop-color="#059669" />
+    </radialGradient>
+
+    <!-- Soft Drop Shadow for Mascot -->
+    <filter id="mascotShadow" x="-10%" y="-10%" width="125%" height="125%">
+      <feDropShadow dx="0" dy="24" stdDeviation="28" flood-color="#000000" flood-opacity="0.65" />
+    </filter>
+
+    <!-- Neon Glow Filter -->
+    <filter id="neonGlow" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="12" result="blur" />
+      <feComposite in="SourceGraphic" in2="blur" operator="over" />
+    </filter>
+
+    <!-- Shell Cast Shadow on Foot -->
+    <filter id="shellShadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="4" dy="16" stdDeviation="16" flood-color="#021c16" flood-opacity="0.8" />
+    </filter>
+  </defs>
+
+  <!-- 1. BASE CONTAINER (Modern Dark Squircle Canvas) -->
+  <rect x="44" y="44" width="936" height="936" rx="224" ry="224" fill="url(#bgGrad)" />
+  <rect x="44" y="44" width="936" height="936" rx="224" ry="224" fill="url(#ambientGlow)" />
+  
+  <!-- Subtle High-tech Geometry (Network Rings & Grid) -->
+  <g opacity="0.12" fill="none">
+    <circle cx="430" cy="460" r="330" stroke="#10b981" stroke-width="1.5" stroke-dasharray="8 14" />
+    <circle cx="430" cy="460" r="390" stroke="#06b6d4" stroke-width="1.5" stroke-dasharray="16 20" />
+    <line x1="430" y1="100" x2="430" y2="135" stroke="#10b981" stroke-width="2" />
+    <line x1="430" y1="785" x2="430" y2="820" stroke="#10b981" stroke-width="2" />
+    <line x1="80" y1="460" x2="115" y2="460" stroke="#06b6d4" stroke-width="2" />
+    <line x1="745" y1="460" x2="780" y2="460" stroke="#06b6d4" stroke-width="2" />
+  </g>
+
+  <!-- Squircle Inset Border -->
+  <rect x="45.5" y="45.5" width="933" height="933" rx="222.5" ry="222.5" fill="none" stroke="url(#squircleRim)" stroke-width="3" />
+
+  <!-- 2. MAIN CHARACTER GROUP -->
+  <g filter="url(#mascotShadow)">
+
+    <!-- LAYER A: SNAIL FOOT & BODY (Smooth, unified, elegant streamline) -->
+    <path d="
+      M 145 690
+      C 220 702 320 716 430 722
+      C 550 726 655 718 735 685
+      C 805 650 848 595 842 505
+      C 834 415 776 370 715 385
+      C 665 405 635 450 615 500
+      C 590 560 550 605 480 635
+      C 400 662 300 676 145 690
+      Z"
+      fill="url(#bodyGrad)"
+    />
+
+    <!-- Foot Bottom Glow Strip (Gentle neon underglow along the foot) -->
+    <path d="
+      M 200 705
+      C 320 718 460 724 580 720
+      C 660 715 725 695 770 665"
+      fill="none"
+      stroke="url(#bellyGrad)"
+      stroke-width="8"
+      stroke-linecap="round"
+    />
+
+    <!-- Head & Chest Rim Specular Curve -->
+    <path d="
+      M 625 480
+      C 645 425 680 395 730 388
+      C 785 380 830 415 845 470
+      C 860 535 840 595 800 640
+      C 760 685 700 712 620 720"
+      fill="none"
+      stroke="url(#bodyRim)"
+      stroke-width="6"
+      stroke-linecap="round"
+    />
+
+    <!-- Snail Eye: Cute, Friendly, Sleek Tech Arc -->
+    <path d="M 770 445 C 785 435 805 440 812 455"
+      fill="none"
+      stroke="#064e3b"
+      stroke-width="4.5"
+      stroke-linecap="round"
+    />
+    <circle cx="798" cy="450" r="3" fill="#34d399" opacity="0.9" />
+
+    <!-- LAYER B: ANTENNAE & CONNECTIVITY SENSORS -->
+    <!-- Rear Antenna (Cyan Stalk & Beacon) -->
+    <path d="M 725 390 C 715 320 728 250 755 190"
+      fill="none"
+      stroke="#10b981"
+      stroke-width="14"
+      stroke-linecap="round"
+    />
+    <!-- Rear Beacon Node -->
+    <circle cx="755" cy="190" r="30" fill="#06b6d4" opacity="0.3" filter="url(#neonGlow)" />
+    <circle cx="755" cy="190" r="18" fill="url(#beaconCyan)" />
+
+    <!-- Foreground Antenna (Emerald Stalk & Beacon) -->
+    <path d="M 765 395 C 785 325 820 255 865 185"
+      fill="none"
+      stroke="#34d399"
+      stroke-width="16"
+      stroke-linecap="round"
+    />
+    <!-- Foreground Beacon Node -->
+    <circle cx="865" cy="185" r="34" fill="#10b981" opacity="0.4" filter="url(#neonGlow)" />
+    <circle cx="865" cy="185" r="22" fill="url(#beaconEmerald)" />
+
+    <!-- LAYER C: THE SECURE SHELL / NAUTILUS TERMINAL -->
+    <!-- Grouped with drop shadow cast directly onto snail foot -->
+    <g filter="url(#shellShadow)">
+
+      <!-- C1: Outer Armor Shell Segment (Main Logarithmic Whorl) -->
+      <path d="
+        M 430 200
+        C 585 200 690 310 690 460
+        C 690 610 575 695 415 695
+        C 255 695 150 590 150 440
+        C 150 305 250 220 375 202
+        C 400 200 418 200 430 200
+        Z"
+        fill="url(#shellWhorl1)"
+      />
+
+      <!-- Outer Shell Rim Highlight Crest -->
+      <path d="
+        M 220 270
+        C 280 215 355 202 430 200
+        C 575 200 675 295 682 440"
+        fill="none"
+        stroke="#a7f3d0"
+        stroke-width="7"
+        stroke-linecap="round"
+        opacity="0.85"
+      />
+
+      <!-- Shell Growth Seams (Logarithmic curved grooves giving authentic shell texture) -->
+      <path d="M 430 200 C 390 280 340 360 270 420" fill="none" stroke="#047857" stroke-width="4" stroke-linecap="round" opacity="0.5" />
+      <path d="M 540 225 C 510 320 460 410 370 480" fill="none" stroke="#047857" stroke-width="4" stroke-linecap="round" opacity="0.4" />
+      <path d="M 640 300 C 620 390 570 470 490 530" fill="none" stroke="#047857" stroke-width="4" stroke-linecap="round" opacity="0.4" />
+
+      <!-- C2: Middle Whorl Plate (Cyan Transition Spiral) -->
+      <path d="
+        M 435 270
+        C 555 270 635 350 635 460
+        C 635 575 545 645 425 645
+        C 305 645 220 565 220 445
+        C 220 335 300 275 405 271
+        C 420 270 430 270 435 270
+        Z"
+        fill="url(#shellWhorl2)"
+      />
+
+      <!-- Middle Whorl Specular Accent -->
+      <path d="
+        M 275 325
+        C 320 285 375 272 435 270
+        C 535 270 618 340 625 440"
+        fill="none"
+        stroke="#bae6fd"
+        stroke-width="5"
+        stroke-linecap="round"
+        opacity="0.8"
+      />
+
+      <!-- C3: Inner Spiral Rim / Protective Console Bezel -->
+      <path d="
+        M 430 330
+        C 515 330 580 390 580 465
+        C 580 545 505 605 420 605
+        C 335 605 275 545 275 465
+        C 275 385 330 335 405 331
+        C 418 330 425 330 430 330
+        Z"
+        fill="url(#shellWhorl3)"
+      />
+
+      <!-- C4: Deep Obsidian Terminal Screen Console -->
+      <circle cx="420" cy="465" r="120" fill="url(#terminalBg)" stroke="#1e293b" stroke-width="8" />
+      <circle cx="420" cy="465" r="116" fill="url(#screenCenterGlow)" />
+      
+      <!-- Terminal Bezel Cyber Ring -->
+      <circle cx="420" cy="465" r="114" fill="none" stroke="#10b981" stroke-width="2.5" stroke-opacity="0.5" stroke-dasharray="14 8 4 8" />
+
+      <!-- D. TERMINAL COMMAND PROMPT ("> _") -->
+      <!-- High contrast, bold command chevron '>' -->
+      <path d="
+        M 365 415
+        L 415 465
+        L 365 515"
+        fill="none"
+        stroke="url(#promptGrad)"
+        stroke-width="19"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+        filter="url(#neonGlow)"
+      />
+
+      <!-- Glowing Terminal Underscore Cursor '_' -->
+      <rect x="435" y="498" width="50" height="17" rx="6" ry="6" fill="url(#cursorGrad)" filter="url(#neonGlow)" />
+    </g>
+
+  </g>
+</svg>

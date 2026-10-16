@@ -27,9 +27,11 @@
 
       <!-- App Brand -->
       <div class="flex items-center gap-2">
-        <div class="w-6 h-6 rounded-lg bg-gradient-to-tr from-brand-600 to-brand-400 flex items-center justify-center shadow-glow-emerald">
-          <Terminal class="w-3.5 h-3.5 text-white stroke-[2.5]" />
-        </div>
+        <img
+          src="/logo.svg"
+          alt="SnailSSH"
+          class="w-6 h-6 rounded-md shadow-glow-emerald object-contain select-none"
+        />
         <span class="font-bold text-sm tracking-wide bg-gradient-to-r from-white via-slate-200 to-brand-300 bg-clip-text text-transparent">
           SnailSSH
         </span>
@@ -96,7 +98,7 @@
 </template>
 
 <script setup lang="ts">
-import { Terminal, Search, ArrowUpDown, Plus, Settings } from 'lucide-vue-next'
+import { Search, ArrowUpDown, Plus, Settings } from 'lucide-vue-next'
 import { isTauri } from '@/api/tauri'
 
 defineProps<{

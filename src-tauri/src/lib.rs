@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use sftp::SftpFileItem;
 use ssh::{ConnectionTestResult, HostProbeResult, SshConnectConfig, SshManager};
 use storage::HostItem;
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Manager, State};
 
 #[derive(Serialize, Deserialize)]
 pub struct CreateSessionResponse {
@@ -256,6 +256,14 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(SshManager::new())
+        .setup(|app| {
+            if let Some(icon) = app.default_window_icon() {
+                for window in app.webview_windows().values() {
+                    let _ = window.set_icon(icon.clone());
+                }
+            }
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             get_hosts,
             save_host,
