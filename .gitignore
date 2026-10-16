@@ -14,6 +14,9 @@ yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
 
+# 本地改动前的文件备份（按项目约定放在 backups/，不入库）
+backups/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
