@@ -7,9 +7,9 @@
     <div class="flex items-center gap-3">
       <div class="flex items-center gap-2 mr-1">
         <span
-          @click="minimizeWindow"
+          @click="$emit('close-window')"
           class="w-3 h-3 rounded-full bg-[#ff5f56] inline-block shadow-sm cursor-pointer hover:opacity-80 transition-opacity"
-          title="关闭/最小化"
+          title="关闭窗口"
         ></span>
         <span
           @click="minimizeWindow"
@@ -59,13 +59,17 @@
       <button
         @click="$emit('toggle-transfers')"
         class="flex items-center gap-2 px-2.5 py-1 rounded-md bg-surface-card border border-surface-border hover:border-brand-500/40 text-slate-300 hover:text-white transition-all text-xs"
+        :title="activeTransfersCount > 0 ? '查看进行中的传输任务' : '当前没有进行中的传输'"
       >
         <div class="relative flex items-center justify-center">
           <ArrowUpDown class="w-3.5 h-3.5 text-brand-400" />
           <span v-if="activeTransfersCount > 0" class="absolute -top-1 -right-1 w-2 h-2 rounded-full bg-brand-500 animate-pulse"></span>
         </div>
-        <span class="hidden md:inline font-mono text-[11px]">{{ activeTransfersCount }} 任务传输中</span>
-        <span class="text-brand-400 font-mono font-semibold text-[11px]">{{ transferSpeed }}</span>
+        <template v-if="activeTransfersCount > 0">
+          <span class="hidden md:inline font-mono text-[11px]">{{ activeTransfersCount }} 任务传输中</span>
+          <span class="text-brand-400 font-mono font-semibold text-[11px]">{{ transferSpeed }}</span>
+        </template>
+        <span v-else class="hidden md:inline font-mono text-[11px] text-surface-subtle">传输空闲</span>
       </button>
 
       <!-- 快速新建主机按钮 -->
@@ -105,6 +109,7 @@ defineEmits<{
   (e: 'toggle-transfers'): void
   (e: 'open-new-host'): void
   (e: 'open-settings'): void
+  (e: 'close-window'): void
 }>()
 
 const minimizeWindow = async () => {

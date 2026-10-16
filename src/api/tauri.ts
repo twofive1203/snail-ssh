@@ -407,6 +407,13 @@ export async function sftpDownloadFileApi(sessionId: string, remotePath: string,
   }
 }
 
+// 目录递归下载：保留远端目录结构，进度按目录内文件总字节数统计
+export async function sftpDownloadDirApi(sessionId: string, remotePath: string, localPath: string, taskId: string): Promise<void> {
+  if (isTauri()) {
+    await invoke('sftp_download_dir', { sessionId, remotePath, localPath, taskId })
+  }
+}
+
 // 监听单次传输任务的实时进度（bytes/进度/速度）
 export async function onSftpProgress(taskId: string, callback: (payload: SftpProgressPayload) => void): Promise<UnlistenFn> {
   if (isTauri()) {

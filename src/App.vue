@@ -8,6 +8,7 @@
       @toggle-transfers="transfersOpen = !transfersOpen"
       @open-new-host="openNewHostModal"
       @open-settings="triggerToast('设置中心尚未实现', 'info')"
+      @close-window="handleCloseWindow"
     />
 
     <!-- 2. 主体工作区 -->
@@ -62,6 +63,7 @@
           :hosts="hosts"
           :current-host="currentSftpHost"
           :active-session-id="currentSftpSessionId"
+          :refresh-signal="sftpRefreshSignal"
           @select-host="handleConnectSftp"
           @edit-file="handleOpenEditor"
           @download-file="handleDownloadFile"
@@ -78,6 +80,7 @@
         :tasks="transferTasks"
         @close="transfersOpen = false"
         @clear-completed="handleClearCompletedTasks"
+        @remove-task="handleRemoveTask"
       />
     </div>
 
@@ -108,13 +111,16 @@
       @action="handlePaletteAction"
     />
 
+    <!-- 弹窗 4: 应用内确认 / 文本输入（替代原生 confirm / prompt） -->
+    <DialogHost />
+
     <!-- 全局 Toast 提示组件 -->
-    <Toast :messages="toastList" />
+    <Toast :messages="toastList" @dismiss="dismissToast" />
   </div>
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted, onBeforeUnmount } from 'vue'
+import { ref, reactive, computed, onMounted, onBeforeUnmount } from 'vue'
 import TitleBar from '@/components/TitleBar.vue'
 import Sidebar from '@/components/Sidebar.vue'
 import HostManager from '@/components/HostManager.vue'
@@ -124,8 +130,10 @@ import TransferDrawer from '@/components/TransferDrawer.vue'
 import CommandPalette from '@/components/CommandPalette.vue'
 import HostModal from '@/components/HostModal.vue'
 import EditorModal from '@/components/EditorModal.vue'
+import DialogHost from '@/components/DialogHost.vue'
 import Toast from '@/components/Toast.vue'
-import type { HostItem, RemoteFileRef, TerminalTab, TransferTask, ToastMessage } from '@/types'
+import { confirmDialog, dialogState } from '@/composables/useDialog'
+import type { HostItem, RemoteFileRef, SftpFileItem, TerminalTab, TransferTask, ToastMessage } from '@/types'
 import {
   getHostsApi,
   saveHostApi,
@@ -134,8 +142,10 @@ import {
   closeSshSessionApi,
   writeSshSessionApi,
   probeHostInfoApi,
+  sftpReadDirApi,
   sftpUploadFileApi,
   sftpDownloadFileApi,
+  sftpDownloadDirApi,
   onSftpProgress,
   pickLocalFile,
   pickSavePath,
@@ -180,6 +190,8 @@ let sftpOnlySessionId = ''
 // 传输队列只承载真实任务，启动时为空（避免展示无法对应真实连接的假进度）
 const transfersOpen = ref(false)
 const transferTasks = ref<TransferTask[]>([])
+// 传输完成后自增，通知 SftpView 刷新当前目录，避免用户以为上传失败了
+const sftpRefreshSignal = ref(0)
 
 // 弹窗状态
 const paletteOpen = ref(false)
@@ -217,9 +229,14 @@ const currentSessionId = computed(() => {
 const triggerToast = (text: string, type: 'info' | 'success' | 'warning' | 'error' = 'info') => {
   const item: ToastMessage = { id: 'toast-' + Date.now() + Math.random(), text, type }
   toastList.value.push(item)
-  setTimeout(() => {
-    toastList.value = toastList.value.filter(t => t.id !== item.id)
-  }, 2800)
+  // 错误信息保留在屏幕上直到用户手动关闭，避免“报错一闪而过”无从排查
+  if (type !== 'error') {
+    setTimeout(() => dismissToast(item.id), 3200)
+  }
+}
+
+const dismissToast = (id: string) => {
+  toastList.value = toastList.value.filter(t => t.id !== id)
 }
 
 const switchView = (v: 'hosts' | 'terminal' | 'sftp') => {
@@ -254,13 +271,17 @@ const openSession = async (host: HostItem, cols = 80, rows = 24): Promise<string
       const parts = msg.split('|')
       const newFp = parts[1] || '未知'
       const oldFps = (parts[2] || '').split(';').filter(Boolean)
-      const proceed = confirm(
-        `警告：${host.name}（${host.host}:${host.port}）的主机密钥与 ~/.ssh/known_hosts 记录不一致！\n\n` +
-          `本次服务器提供的指纹：\n${newFp}\n\n` +
-          `已知记录：\n${oldFps.join('\n') || '（无法读取）'}\n\n` +
-          `这可能是服务器重装/更换了密钥，也可能是中间人攻击。\n` +
-          `仅在确认服务器确实变更过密钥时确认，将替换 known_hosts 中的旧记录并继续连接。`
-      )
+      const proceed = await confirmDialog({
+        title: '主机密钥不一致',
+        variant: 'danger',
+        message:
+          `${host.name}（${host.host}:${host.port}）的主机密钥与 ~/.ssh/known_hosts 记录不一致。\n` +
+          '这可能是服务器重装/更换了密钥，也可能是中间人攻击。',
+        detail:
+          `本次服务器提供的指纹：\n${newFp}\n\n已知记录：\n${oldFps.join('\n') || '（无法读取）'}`,
+        confirmText: '确认更换并继续',
+        cancelText: '取消连接'
+      })
       if (!proceed) {
         triggerToast('已取消连接：主机密钥不一致', 'warning')
         return null
@@ -275,9 +296,14 @@ const openSession = async (host: HostItem, cols = 80, rows = 24): Promise<string
     }
     const unknown = msg.match(/HOST_KEY_UNKNOWN\|(.+)/)
     if (unknown) {
-      const trust = confirm(
-        `首次连接 ${host.name}（${host.host}:${host.port}）。\n\n主机密钥指纹：\n${unknown[1]}\n\n是否信任并写入 ~/.ssh/known_hosts？`
-      )
+      const trust = await confirmDialog({
+        title: '首次连接该主机',
+        variant: 'warning',
+        message: `首次连接 ${host.name}（${host.host}:${host.port}）。\n是否信任该主机密钥并写入 ~/.ssh/known_hosts？`,
+        detail: `主机密钥指纹：\n${unknown[1]}`,
+        confirmText: '信任并继续',
+        cancelText: '取消连接'
+      })
       if (!trust) {
         triggerToast('已取消连接：未信任主机密钥', 'warning')
         return null
@@ -461,10 +487,46 @@ const handleSaveHost = async (host: HostItem) => {
 }
 
 const handleDeleteHost = async (host: HostItem) => {
-  if (confirm(`确定要删除服务器 ${host.name} 吗？`)) {
-    await deleteHostApi(host.id)
-    await loadHosts()
-    triggerToast(`已移除主机: ${host.name}`, 'warning')
+  const confirmed = await confirmDialog({
+    title: '删除服务器',
+    variant: 'danger',
+    message: `确定要删除服务器 ${host.name} 吗？`,
+    detail: `${host.username}@${host.host}:${host.port}\n保存在系统钥匙串中的密码 / 私钥也会一并删除。`,
+    confirmText: '删除',
+    cancelText: '取消'
+  })
+  if (!confirmed) return
+
+  await deleteHostApi(host.id)
+  await loadHosts()
+  triggerToast(`已移除主机: ${host.name}`, 'warning')
+}
+
+// 窗口关闭：有正在进行的传输或活动会话时先确认，避免误关丢失工作
+const handleCloseWindow = async () => {
+  const running = transferTasks.value.filter(t => t.status === 'running').length
+  const sessions = terminalTabs.value.filter(t => t.connected).length
+
+  if (running > 0 || sessions > 0) {
+    const parts: string[] = []
+    if (running > 0) parts.push(`${running} 个传输任务正在执行`)
+    if (sessions > 0) parts.push(`${sessions} 个 SSH 会话仍处于连接状态`)
+    const confirmed = await confirmDialog({
+      title: '退出 SnailSSH',
+      variant: 'warning',
+      message: `当前${parts.join('，')}，确定要退出吗？`,
+      confirmText: '退出',
+      cancelText: '留在应用'
+    })
+    if (!confirmed) return
+  }
+
+  if (!isTauri()) return
+  try {
+    const { getCurrentWindow } = await import('@tauri-apps/api/window')
+    await getCurrentWindow().close()
+  } catch (e) {
+    console.warn('Tauri window close error:', e)
   }
 }
 
@@ -486,7 +548,9 @@ const formatBytes = (bytes: number) => {
 }
 
 const createTransferTask = (name: string, type: 'upload' | 'download', size = '准备中...'): TransferTask => {
-  const task: TransferTask = {
+  // 必须用 reactive 包装：任务对象的 progress/status 会被 runTransfer 持续原地更新，
+  // 若放进数组的是普通对象，属性变更不会触发重渲染（进度条会永远停在 0%）。
+  const task = reactive<TransferTask>({
     id: 'task-' + Date.now() + '-' + Math.floor(Math.random() * 1000),
     name,
     type,
@@ -494,10 +558,16 @@ const createTransferTask = (name: string, type: 'upload' | 'download', size = '�
     speed: '准备中...',
     size,
     status: 'running'
-  }
+  })
   transferTasks.value.unshift(task)
   transfersOpen.value = true
   return task
+}
+
+// 本地路径拼接（保留 Windows 反斜杠）
+const joinLocalPath = (dir: string, name: string) => {
+  const sep = dir.includes('\\') ? '\\' : '/'
+  return `${dir}${dir.endsWith(sep) ? '' : sep}${name}`
 }
 
 // 订阅后端进度事件 -> 驱动任务卡片，结束后自动退订
@@ -514,6 +584,8 @@ const runTransfer = async (task: TransferTask, start: (taskId: string) => Promis
     task.status = 'completed'
     task.speed = '传输完成'
     triggerToast(`${task.name} 已完成`, 'success')
+    // 远端目录内容已变化，通知 SFTP 视图刷新，避免用户以为传输没生效
+    sftpRefreshSignal.value++
   } catch (e: any) {
     task.status = 'failed'
     task.speed = `失败: ${e?.message || e}`
@@ -531,29 +603,42 @@ const runMockTransfer = (task: TransferTask) => {
     if (task.progress >= 100) {
       task.status = 'completed'
       task.speed = '传输完成'
+      sftpRefreshSignal.value++
       clearInterval(timer)
     }
   }, 400)
 }
 
-const handleDownloadFile = async (file: any, remotePath: string) => {
+const handleDownloadFile = async (file: SftpFileItem, remotePath: string) => {
   const sessionId = currentSftpSessionId.value
   if (isTauri() && !sessionId) {
     triggerToast('请先连接该主机的 SSH/SFTP 会话', 'warning')
     return
   }
 
-  const localPath = await pickSavePath(file.name)
-  if (isTauri() && !localPath) return
-
-  const task = createTransferTask(`下载: ${file.name}`, 'download', file.size)
   if (!isTauri()) {
-    runMockTransfer(task)
+    runMockTransfer(createTransferTask(`下载: ${file.name}`, 'download', file.size))
     return
   }
 
+  // 目录：选一个本地父目录，后端递归下载并保留目录结构
+  if (file.isDir) {
+    const targetDir = await pickDirectory()
+    if (!targetDir) return
+    const localPath = joinLocalPath(targetDir, file.name)
+    const task = createTransferTask(`下载目录: ${file.name}`, 'download', file.size)
+    await runTransfer(task, (taskId) =>
+      sftpDownloadDirApi(sessionId, remotePath, localPath, taskId)
+    )
+    return
+  }
+
+  const localPath = await pickSavePath(file.name)
+  if (!localPath) return
+
+  const task = createTransferTask(`下载: ${file.name}`, 'download', file.size)
   await runTransfer(task, (taskId) =>
-    sftpDownloadFileApi(sessionId, remotePath, localPath as string, taskId)
+    sftpDownloadFileApi(sessionId, remotePath, localPath, taskId)
   )
 }
 
@@ -570,35 +655,86 @@ const handleUploadTrigger = async (remoteDir: string) => {
   const fileName = isTauri()
     ? (localPath as string).split(/[\\/]/).pop() || 'upload.bin'
     : `mock-upload-${Date.now()}.tar.gz`
+  const remotePath = remoteDir === '/' ? `/${fileName}` : `${remoteDir}/${fileName}`
 
-  const task = createTransferTask(`上传: ${fileName} → ${remoteDir}`, 'upload')
   if (!isTauri()) {
-    runMockTransfer(task)
+    runMockTransfer(createTransferTask(`上传: ${fileName} → ${remoteDir}`, 'upload'))
     return
   }
 
-  const remotePath = remoteDir === '/' ? `/${fileName}` : `${remoteDir}/${fileName}`
+  // 后端会直接覆盖同名文件，所以覆盖前先给出明确选择，避免误覆盖生产配置
+  try {
+    const list = await sftpReadDirApi(sessionId, remoteDir)
+    if (list.some(f => !f.isDir && f.name === fileName)) {
+      const overwrite = await confirmDialog({
+        title: '远端已存在同名文件',
+        variant: 'warning',
+        message: `是否用本地文件覆盖远端已有文件 ${fileName}？`,
+        detail: remotePath,
+        confirmText: '覆盖上传',
+        cancelText: '取消上传'
+      })
+      if (!overwrite) {
+        triggerToast('已取消上传，未修改远端文件', 'info')
+        return
+      }
+    }
+  } catch (e) {
+    console.warn('检查远端同名文件失败：', e)
+  }
+
+  const task = createTransferTask(`上传: ${fileName} → ${remoteDir}`, 'upload')
   await runTransfer(task, (taskId) =>
     sftpUploadFileApi(sessionId, localPath as string, remotePath, taskId)
   )
 }
 
-const handleOpenInTerminal = (path: string) => {
-  activeView.value = 'terminal'
-  const tab = terminalTabs.value[activeTabIndex.value]
-  if (isTauri() && tab?.connected) {
-    // 真实会话：把 cd 命令送入当前 Shell
-    writeSshSessionApi(tab.id, `cd ${shellQuote(path)}\n`).catch(() => {})
-    triggerToast(`已在终端切换至 ${path}`, 'info')
-  } else {
-    triggerToast('当前没有活动终端会话，无法切换目录', 'warning')
+const handleOpenInTerminal = async (path: string) => {
+  if (!isTauri()) {
+    activeView.value = 'terminal'
+    triggerToast('浏览器预览模式无法切换远端目录', 'info')
+    return
   }
+
+  const host = currentSftpHost.value
+  if (!host) {
+    triggerToast('尚未选择服务器', 'warning')
+    return
+  }
+
+  // 必须定位到 SFTP 所连主机的终端，而不是“当前活动标签页”，
+  // 否则会把 cd 写进另一台主机的会话
+  const existingIndex = terminalTabs.value.findIndex(t => t.hostId === host.id && t.connected)
+  let targetTabId = existingIndex >= 0 ? terminalTabs.value[existingIndex].id : ''
+  let openedNew = false
+
+  if (!targetTabId) {
+    const sessionId = await openSession(host)
+    if (!sessionId) return
+    const seq = (tabSeqByHost.get(host.id) || 0) + 1
+    tabSeqByHost.set(host.id, seq)
+    terminalTabs.value.push({
+      id: sessionId,
+      hostId: host.id,
+      title: seq > 1 ? `${host.name} (${seq})` : host.name,
+      sub: `${host.username}@${host.host}`,
+      connected: true
+    })
+    targetTabId = sessionId
+    openedNew = true
+    refreshHostMetrics(host, sessionId)
+  }
+
+  activeView.value = 'terminal'
+  activeTabIndex.value = Math.max(0, terminalTabs.value.findIndex(t => t.id === targetTabId))
+  writeSshSessionApi(targetTabId, `cd ${shellQuote(path)}\n`).catch(() => {})
+  triggerToast(openedNew ? `已新建终端并切换至 ${path}` : `已在终端切换至 ${path}`, 'info')
 }
 
 // 远端路径可能含空格/特殊字符，统一单引号包裹
 const shellQuote = (value: string) => `'${value.replace(/'/g, `'\\''`)}'`
 
-// 批量下载：选一次目标目录，逐个文件复用同一套传输任务与进度事件
+// 批量下载：选一次目标目录，逐个文件/目录复用同一套传输任务与进度事件
 const handleDownloadFiles = async (refs: RemoteFileRef[]) => {
   if (refs.length === 0) return
   const sessionId = currentSftpSessionId.value
@@ -615,22 +751,30 @@ const handleDownloadFiles = async (refs: RemoteFileRef[]) => {
   }
 
   for (const ref of refs) {
-    const task = createTransferTask(`下载: ${ref.file.name}`, 'download', ref.file.size)
+    const label = ref.file.isDir ? `下载目录: ${ref.file.name}` : `下载: ${ref.file.name}`
+    const task = createTransferTask(label, 'download', ref.file.size)
     if (!isTauri()) {
       runMockTransfer(task)
       continue
     }
-    const sep = targetDir.includes('\\') ? '\\' : '/'
-    const localPath = `${targetDir}${targetDir.endsWith(sep) ? '' : sep}${ref.file.name}`
+    const localPath = joinLocalPath(targetDir, ref.file.name)
     await runTransfer(task, (taskId) =>
-      sftpDownloadFileApi(sessionId, ref.remotePath, localPath, taskId)
+      ref.file.isDir
+        ? sftpDownloadDirApi(sessionId, ref.remotePath, localPath, taskId)
+        : sftpDownloadFileApi(sessionId, ref.remotePath, localPath, taskId)
     )
   }
 }
 
+const handleRemoveTask = (taskId: string) => {
+  transferTasks.value = transferTasks.value.filter(t => t.id !== taskId)
+}
+
 const handleClearCompletedTasks = () => {
-  transferTasks.value = transferTasks.value.filter(t => t.status !== 'completed')
-  triggerToast('已清理完成的传输任务', 'info')
+  const before = transferTasks.value.length
+  transferTasks.value = transferTasks.value.filter(t => t.status === 'running')
+  const removed = before - transferTasks.value.length
+  triggerToast(removed > 0 ? `已清理 ${removed} 条已结束的传输记录` : '没有可清理的传输记录', 'info')
 }
 
 const handlePaletteAction = (act: string) => {
@@ -638,18 +782,33 @@ const handlePaletteAction = (act: string) => {
   if (act === 'toggle-transfers') transfersOpen.value = !transfersOpen.value
 }
 
+// 快捷键只在“非输入态”生效：终端/编辑器里 Ctrl+K、Ctrl+T、Ctrl+N 有各自的含义
+// （例如终端里 Ctrl+K 是 readline 的删到行尾），不能被全局快捷键吞掉
+const isTerminalOrEditorTarget = (target: EventTarget | null): boolean => {
+  const el = target as HTMLElement | null
+  if (!el || typeof el.closest !== 'function') return false
+  if (el.tagName === 'TEXTAREA' || el.isContentEditable) return true
+  return !!el.closest('.xterm')
+}
+
 // 全局快捷键注册
 const setupGlobalKeybindings = () => {
   window.addEventListener('keydown', (e) => {
-    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
+    if (dialogState.open) return
+    const mod = e.ctrlKey || e.metaKey
+    if (!mod) return
+    const key = e.key.toLowerCase()
+    if (isTerminalOrEditorTarget(e.target)) return
+
+    if (key === 'k') {
       e.preventDefault()
       paletteOpen.value = true
     }
-    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'n' && !e.shiftKey) {
+    if (key === 'n' && !e.shiftKey) {
       e.preventDefault()
       openNewHostModal()
     }
-    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 't') {
+    if (key === 't') {
       e.preventDefault()
       transfersOpen.value = !transfersOpen.value
     }

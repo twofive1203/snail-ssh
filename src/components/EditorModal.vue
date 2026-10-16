@@ -25,7 +25,7 @@
             <Save class="w-3.5 h-3.5" />
             <span>{{ saving ? '同步中...' : '保存并远程同步' }}</span>
           </button>
-          <button @click="$emit('close')" class="p-1 rounded hover:bg-surface-elevated text-slate-400 hover:text-white">
+          <button @click="handleClose" class="p-1 rounded hover:bg-surface-elevated text-slate-400 hover:text-white" title="关闭编辑器">
             <X class="w-4 h-4" />
           </button>
         </div>
@@ -34,20 +34,28 @@
       <!-- 编辑器文本区域 -->
       <div class="flex-1 flex overflow-hidden">
         <!-- 行号 -->
-        <div class="w-12 py-3 bg-surface-base text-right pr-3 font-mono text-xs text-slate-600 select-none border-r border-surface-border leading-6 overflow-hidden">
+        <div
+          ref="gutterRef"
+          class="w-12 py-3 bg-surface-base text-right pr-3 font-mono text-xs text-slate-600 select-none border-r border-surface-border leading-6 overflow-hidden"
+        >
           <div v-for="n in lineCount" :key="n">{{ n }}</div>
         </div>
         <!-- 代码正文 -->
         <textarea
+          ref="textareaRef"
           v-model="content"
           spellcheck="false"
           class="flex-1 p-3 bg-[#0a0d14] text-slate-200 font-mono text-xs leading-6 resize-none focus:outline-none custom-scrollbar"
+          @scroll="syncScroll"
         ></textarea>
       </div>
 
       <!-- 编辑器底部信息 -->
       <div class="h-7 bg-surface-card border-t border-surface-border px-4 flex items-center justify-between text-[11px] font-mono text-surface-subtle">
-        <span>编码: UTF-8 | 换行: LF | 模式: Config / Code</span>
+        <span class="flex items-center gap-2">
+          <span>编码: UTF-8 | 换行: LF | 模式: Config / Code</span>
+          <span v-if="dirty" class="text-amber-400">● 未保存</span>
+        </span>
         <span>按 Ctrl+S 或点击右上角保存</span>
       </div>
     </div>
@@ -58,6 +66,7 @@
 import { ref, computed, watch, onMounted, onBeforeUnmount } from 'vue'
 import { FileCode, Save, X } from 'lucide-vue-next'
 import { sftpReadFileApi, sftpWriteFileApi } from '@/api/tauri'
+import { confirmDialog, dialogState } from '@/composables/useDialog'
 
 const props = defineProps<{
   open: boolean
@@ -72,6 +81,19 @@ const emit = defineEmits<{
 
 const content = ref('')
 const saving = ref(false)
+const textareaRef = ref<HTMLTextAreaElement | null>(null)
+const gutterRef = ref<HTMLDivElement | null>(null)
+// 远端原始内容，用于判断是否有未保存修改
+const originalContent = ref('')
+
+const dirty = computed(() => content.value !== originalContent.value)
+
+// 行号列是独立元素，需手动跟随正文滚动
+const syncScroll = () => {
+  if (gutterRef.value && textareaRef.value) {
+    gutterRef.value.scrollTop = textareaRef.value.scrollTop
+  }
+}
 
 const lineCount = computed(() => {
   const count = content.value.split('\n').length
@@ -86,10 +108,27 @@ watch(() => props.open, async (val) => {
   }
   try {
     content.value = await sftpReadFileApi(props.sessionId, props.filePath)
+    originalContent.value = content.value
+    syncScroll()
   } catch (err: any) {
     emit('toast', `读取文件失败: ${err?.message || err}`, 'error')
   }
 })
+
+// 关闭前拦一层，避免误点丢失尚未同步到远端的修改
+const handleClose = async () => {
+  if (dirty.value) {
+    const confirmed = await confirmDialog({
+      title: '放弃未保存的修改？',
+      variant: 'warning',
+      message: `${props.filePath} 有尚未保存到远端的修改，关闭后将丢失。`,
+      confirmText: '放弃修改',
+      cancelText: '继续编辑'
+    })
+    if (!confirmed) return
+  }
+  emit('close')
+}
 
 const handleSave = async () => {
   if (!props.sessionId) {
@@ -108,9 +147,15 @@ const handleSave = async () => {
   }
 }
 
-// 底部提示的 Ctrl+S 快捷键：仅在编辑器打开时接管
+// 底部提示的 Ctrl+S 快捷键：仅在编辑器打开时接管；ESC 关闭（带未保存拦截）
 const onKeydown = (e: KeyboardEvent) => {
   if (!props.open) return
+  if (e.key === 'Escape') {
+    if (dialogState.open) return
+    e.preventDefault()
+    handleClose()
+    return
+  }
   if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
     e.preventDefault()
     if (!saving.value) handleSave()

@@ -65,7 +65,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, watch, nextTick } from 'vue'
+import { ref, computed, watch, nextTick, onMounted, onBeforeUnmount } from 'vue'
 import { Search, Terminal, PlusCircle, ArrowUpDown } from 'lucide-vue-next'
 import type { HostItem } from '@/types'
 
@@ -74,7 +74,7 @@ const props = defineProps<{
   hosts: HostItem[]
 }>()
 
-defineEmits<{
+const emit = defineEmits<{
   (e: 'close'): void
   (e: 'select-host', host: HostItem): void
   (e: 'action', act: string): void
@@ -97,4 +97,16 @@ watch(() => props.open, (val) => {
     })
   }
 })
+
+// 面板上标注了 ESC，这里必须真的能用
+const onKeydown = (e: KeyboardEvent) => {
+  if (!props.open) return
+  if (e.key === 'Escape') {
+    e.preventDefault()
+    emit('close')
+  }
+}
+
+onMounted(() => window.addEventListener('keydown', onKeydown))
+onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
 </script>

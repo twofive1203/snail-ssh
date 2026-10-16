@@ -1,8 +1,8 @@
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
@@ -357,6 +357,136 @@ pub fn sftp_download_file(
         .flush()
         .map_err(|e| format!("本地文件落盘失败: {}", e))?;
     reporter.report(&app_handle, "completed", true);
+    Ok(())
+}
+
+/// 待下载的单个文件（远端路径 -> 本地路径）
+struct DownloadEntry {
+    remote: PathBuf,
+    local: PathBuf,
+}
+
+/// 目录递归下载：保留远端目录结构，进度按实际会传输的字节总数统计。
+pub fn sftp_download_dir(
+    session_arc: Arc<Mutex<ssh2::Session>>,
+    remote_path: &str,
+    local_path: &str,
+    task_id: &str,
+    app_handle: AppHandle,
+) -> Result<(), String> {
+    let sess = session_arc.lock();
+    let sftp = sess.sftp().map_err(|e| format!("初始化 SFTP 失败: {}", e))?;
+
+    // 先枚举待传输文件并统计总字节数，否则进度条无法给出百分比。
+    // 复用同一份列表，避免统计与传输两套递归逻辑出现分歧。
+    let mut entries = Vec::new();
+    let mut total = 0u64;
+    collect_download_entries(
+        &sftp,
+        Path::new(remote_path),
+        Path::new(local_path),
+        &mut entries,
+        &mut total,
+    )?;
+
+    // 空目录或目录软链接被全部跳过时，也要保证本地目录被创建出来
+    fs::create_dir_all(Path::new(local_path)).map_err(|e| format!("创建本地目录失败: {}", e))?;
+
+    let mut reporter = ProgressReporter::new(task_id, total);
+    let mut buf = vec![0u8; TRANSFER_CHUNK_SIZE];
+
+    for entry in &entries {
+        let mut remote_file = sftp
+            .open(&entry.remote)
+            .map_err(|e| format!("打开远端文件失败: {}", e))?;
+        if let Some(parent) = entry.local.parent() {
+            fs::create_dir_all(parent).map_err(|e| format!("创建本地目录失败: {}", e))?;
+        }
+        let mut local_file =
+            File::create(&entry.local).map_err(|e| format!("创建本地文件失败: {}", e))?;
+
+        loop {
+            let n = remote_file
+                .read(&mut buf)
+                .map_err(|e| format!("读取远端文件失败: {}", e))?;
+            if n == 0 {
+                break;
+            }
+            local_file
+                .write_all(&buf[..n])
+                .map_err(|e| format!("本地写入失败: {}", e))?;
+            reporter.advance(n as u64);
+            reporter.report(&app_handle, "running", false);
+        }
+
+        local_file
+            .flush()
+            .map_err(|e| format!("本地文件落盘失败: {}", e))?;
+    }
+
+    reporter.report(&app_handle, "completed", true);
+    Ok(())
+}
+
+/// 递归枚举目录下需要下载的普通文件。
+/// 只跟随指向普通文件的软链接；指向目录的软链接与 fifo/socket/设备文件均跳过，
+/// 前者避免递归成环，后者避免 open 时无限阻塞。
+fn collect_download_entries(
+    sftp: &ssh2::Sftp,
+    remote: &Path,
+    local: &Path,
+    out: &mut Vec<DownloadEntry>,
+    total: &mut u64,
+) -> Result<(), String> {
+    let lstat = sftp
+        .lstat(remote)
+        .map_err(|e| format!("读取远端信息失败: {}", e))?;
+    let file_type = lstat.file_type();
+
+    if file_type.is_symlink() {
+        match sftp.stat(remote) {
+            Ok(target) if target.is_file() => {
+                *total += target.size.unwrap_or(0);
+                out.push(DownloadEntry {
+                    remote: remote.to_path_buf(),
+                    local: local.to_path_buf(),
+                });
+            }
+            Ok(_) => eprintln!("[snail-ssh] 跳过目录软链接: {}", remote.display()),
+            Err(e) => eprintln!(
+                "[snail-ssh] 软链接无法解析，已跳过 {}: {}",
+                remote.display(),
+                e
+            ),
+        }
+        return Ok(());
+    }
+
+    if file_type.is_dir() {
+        let entries = sftp
+            .readdir(remote)
+            .map_err(|e| format!("读取远端目录失败: {}", e))?;
+        for (child, _) in entries {
+            let name = match child.file_name() {
+                Some(name) if name == "." || name == ".." => continue,
+                Some(name) => name.to_os_string(),
+                None => continue,
+            };
+            collect_download_entries(sftp, &child, &local.join(name), out, total)?;
+        }
+        return Ok(());
+    }
+
+    if file_type.is_file() {
+        *total += lstat.size.unwrap_or(0);
+        out.push(DownloadEntry {
+            remote: remote.to_path_buf(),
+            local: local.to_path_buf(),
+        });
+        return Ok(());
+    }
+
+    eprintln!("[snail-ssh] 跳过特殊文件: {}", remote.display());
     Ok(())
 }
 

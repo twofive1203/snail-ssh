@@ -234,6 +234,23 @@ async fn sftp_download_file(
     .await
 }
 
+#[tauri::command]
+async fn sftp_download_dir(
+    session_id: String,
+    remote_path: String,
+    local_path: String,
+    task_id: String,
+    ssh_manager: State<'_, SshManager>,
+    app_handle: AppHandle,
+) -> Result<(), String> {
+    let manager = ssh_manager.inner().clone();
+    run_blocking(move || {
+        let session = manager.get_sftp_session(&session_id)?;
+        sftp::sftp_download_dir(session, &remote_path, &local_path, &task_id, app_handle)
+    })
+    .await
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -257,6 +274,7 @@ pub fn run() {
             sftp_remove_file,
             sftp_upload_file,
             sftp_download_file,
+            sftp_download_dir,
         ])
         .run(tauri::generate_context!())
         .expect("运行 SnailSSH 客户端失败");

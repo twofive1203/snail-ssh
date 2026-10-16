@@ -161,8 +161,10 @@
             v-for="file in visibleFiles"
             :key="file.name"
             @click="handleFileClick(file)"
+            @dblclick="handleFileDoubleClick(file)"
             class="sftp-row hover:bg-surface-card/60 transition-colors group cursor-pointer"
             :class="{ 'bg-brand-500/10': selectedFileNames.has(file.name) }"
+            :title="file.name === '..' ? '返回上级目录' : file.isDir ? '双击进入目录' : file.editable ? '双击在线编辑' : '双击下载到本地'"
           >
             <td class="py-2.5 px-4 text-center" @click.stop>
               <input
@@ -194,10 +196,10 @@
                   <Edit3 class="w-3.5 h-3.5" />
                 </button>
                 <button
-                  v-if="!file.isDir"
+                  v-if="file.name !== '..'"
                   @click="handleDownload(file)"
                   class="p-1 rounded hover:bg-surface-elevated text-cyan-400 hover:text-cyan-300"
-                  title="下载至本地"
+                  :title="file.isDir ? '递归下载整个目录' : '下载至本地'"
                 >
                   <Download class="w-3.5 h-3.5" />
                 </button>
@@ -209,6 +211,25 @@
                 >
                   <Trash2 class="w-3.5 h-3.5" />
                 </button>
+              </div>
+            </td>
+          </tr>
+
+          <!-- 首次加载提示 -->
+          <tr v-if="loading && files.length === 0">
+            <td colspan="7" class="py-16 text-center text-xs text-slate-500 font-mono">
+              <RefreshCw class="w-4 h-4 animate-spin inline mr-2 text-brand-400" />
+              正在读取远端目录...
+            </td>
+          </tr>
+
+          <!-- 空目录状态：后端总会返回 ".."，因此用是否有真实条目判断 -->
+          <tr v-else-if="!loading && !hasRealEntries">
+            <td colspan="7" class="py-16 text-center font-mono">
+              <FolderOpen class="w-6 h-6 mx-auto mb-2 text-slate-600" />
+              <div class="text-xs text-slate-400">此目录为空</div>
+              <div class="text-[11px] text-slate-600 mt-1">
+                {{ showHidden ? '也没有隐藏文件' : '若目录内只有隐藏文件，可点击右上角的眼睛图标查看' }}
               </div>
             </td>
           </tr>
@@ -226,7 +247,11 @@
         </span>
       </div>
       <div class="flex items-center text-[11px] font-mono text-slate-500">
-        <span :class="activeSessionId ? 'text-emerald-400' : 'text-amber-400'">
+        <span v-if="loading" class="flex items-center gap-1.5 text-brand-400">
+          <RefreshCw class="w-3 h-3 animate-spin" />
+          正在同步远端目录...
+        </span>
+        <span v-else :class="activeSessionId ? 'text-emerald-400' : 'text-amber-400'">
           {{ activeSessionId ? 'SFTP 通道已就绪' : '未建立 SSH 会话' }}
         </span>
       </div>
@@ -238,8 +263,10 @@
 import { ref, computed, onMounted, watch } from 'vue'
 import type { HostItem, RemoteFileRef, SftpFileItem } from '@/types'
 import { sftpReadDirApi, sftpMkdirApi, sftpRemoveFileApi, sftpHomeDirApi } from '@/api/tauri'
+import { confirmDialog, promptDialog } from '@/composables/useDialog'
 import {
   Folder,
+  FolderOpen,
   ChevronDown,
   Copy,
   Upload,
@@ -262,6 +289,8 @@ const props = defineProps<{
   hosts: HostItem[]
   currentHost?: HostItem
   activeSessionId?: string
+  /** 传输完成后由父组件自增，触发目录刷新 */
+  refreshSignal?: number
 }>()
 
 const emit = defineEmits<{
@@ -296,6 +325,9 @@ const visibleFiles = computed(() => {
 const selectedFiles = computed(() =>
   visibleFiles.value.filter(f => f.name !== '..' && selectedFileNames.value.has(f.name))
 )
+
+// 除 ".." 外是否有真实条目，用于空目录空状态
+const hasRealEntries = computed(() => visibleFiles.value.some(f => f.name !== '..'))
 
 // 远端家目录（失败时保留当前路径）
 const resolveHome = async () => {
@@ -354,6 +386,13 @@ const handleFileClick = (file: SftpFileItem) => {
   } else if (file.editable) {
     emit('edit-file', joinPath(currentPath.value, file.name))
   }
+  // 不可编辑文件单击不做任何事，避免误触下载；改用双击
+}
+
+// 双击：目录进入、可编辑文件打开编辑器、其余文件直接下载
+const handleFileDoubleClick = (file: SftpFileItem) => {
+  if (file.isDir || file.editable) return
+  handleDownload(file)
 }
 
 const switchHost = (host: HostItem) => {
@@ -368,7 +407,6 @@ const copyPath = () => {
 
 const refreshFiles = () => {
   loadFiles()
-  emit('toast', '已刷新目录', 'info')
 }
 
 const triggerUpload = () => {
@@ -380,15 +418,26 @@ const openNewFolderPrompt = async () => {
     emit('toast', '尚未建立 SSH 会话，无法创建目录', 'warning')
     return
   }
-  const name = prompt('请输入新建文件夹名称:', 'new_folder')
-  if (name) {
-    try {
-      await sftpMkdirApi(props.activeSessionId, joinPath(currentPath.value, name))
-      emit('toast', `已新建文件夹: ${name}`, 'success')
-      loadFiles()
-    } catch (e: any) {
-      emit('toast', `新建文件夹失败: ${e?.message || e}`, 'error')
-    }
+  const name = await promptDialog({
+    title: '新建文件夹',
+    message: '将在当前目录下创建文件夹：',
+    detail: currentPath.value,
+    input: { label: '文件夹名称', placeholder: 'new_folder', value: '', required: true },
+    confirmText: '创建'
+  })
+  if (!name) return
+
+  if (name.includes('/')) {
+    emit('toast', '文件夹名称不能包含 "/"', 'warning')
+    return
+  }
+
+  try {
+    await sftpMkdirApi(props.activeSessionId, joinPath(currentPath.value, name))
+    emit('toast', `已新建文件夹: ${name}`, 'success')
+    loadFiles()
+  } catch (e: any) {
+    emit('toast', `新建文件夹失败: ${e?.message || e}`, 'error')
   }
 }
 
@@ -396,13 +445,11 @@ const handleDownload = (file: SftpFileItem) => {
   emit('download-file', file, joinPath(currentPath.value, file.name))
 }
 
-// 批量下载：目录暂不支持，仅收集文件项
+// 批量下载：文件与目录均支持（目录由后端递归下载）
 const downloadSelected = () => {
-  const refs = selectedFiles.value
-    .filter(f => !f.isDir)
-    .map(f => ({ file: f, remotePath: joinPath(currentPath.value, f.name) }))
+  const refs = selectedFiles.value.map(f => ({ file: f, remotePath: joinPath(currentPath.value, f.name) }))
   if (refs.length === 0) {
-    emit('toast', '请选择要下载的文件（目录暂不支持批量下载）', 'warning')
+    emit('toast', '请先选择要下载的文件或目录', 'warning')
     return
   }
   emit('download-files', refs)
@@ -417,7 +464,18 @@ const deleteSelected = async () => {
   const targets = selectedFiles.value
   if (targets.length === 0) return
   const label = targets.length === 1 ? targets[0].name : `${targets.length} 项`
-  if (!confirm(`确定要删除 ${label} 吗？目录会被递归删除。`)) return
+  const hasDir = targets.some(t => t.isDir)
+  const confirmed = await confirmDialog({
+    title: '删除远端文件',
+    variant: 'danger',
+    message: `确定要删除 ${label} 吗？此操作不可撤销。`,
+    detail: hasDir
+      ? `其中包含目录，目录内的所有内容都会被递归删除。\n\n${targets.map(t => t.name + (t.isDir ? '/' : '')).join('\n')}`
+      : currentPath.value,
+    confirmText: '删除',
+    cancelText: '取消'
+  })
+  if (!confirmed) return
 
   const sessionId = props.activeSessionId
   let failed = 0
@@ -430,8 +488,9 @@ const deleteSelected = async () => {
     }
   }
   selectedFileNames.value.clear()
-  loadFiles()
-  if (failed === 0) emit('toast', `已删除 ${label}`, 'warning')
+  await loadFiles()
+  if (failed === 0) emit('toast', `已删除 ${label}`, 'success')
+  else emit('toast', `${label} 中有 ${failed} 项删除失败`, 'error')
 }
 
 const handleDelete = async (file: SftpFileItem) => {
@@ -439,14 +498,24 @@ const handleDelete = async (file: SftpFileItem) => {
     emit('toast', '尚未建立 SSH 会话，无法删除', 'warning')
     return
   }
-  if (confirm(`确定要删除 ${file.name} 吗？目录会被递归删除。`)) {
-    try {
-      await sftpRemoveFileApi(props.activeSessionId, joinPath(currentPath.value, file.name))
-      emit('toast', `已删除 ${file.name}`, 'warning')
-      loadFiles()
-    } catch (e: any) {
-      emit('toast', `删除失败: ${e?.message || e}`, 'error')
-    }
+  const confirmed = await confirmDialog({
+    title: file.isDir ? '删除远端目录' : '删除远端文件',
+    variant: 'danger',
+    message: `确定要删除 ${file.name} 吗？此操作不可撤销。`,
+    detail: file.isDir
+      ? `目录内的所有内容都会被递归删除。\n\n${joinPath(currentPath.value, file.name)}`
+      : joinPath(currentPath.value, file.name),
+    confirmText: '删除',
+    cancelText: '取消'
+  })
+  if (!confirmed) return
+
+  try {
+    await sftpRemoveFileApi(props.activeSessionId, joinPath(currentPath.value, file.name))
+    emit('toast', `已删除 ${file.name}`, 'success')
+    await loadFiles()
+  } catch (e: any) {
+    emit('toast', `删除失败: ${e?.message || e}`, 'error')
   }
 }
 
@@ -499,6 +568,16 @@ watch(
   async () => {
     currentPath.value = '/'
     if (props.activeSessionId) await resolveHome()
+    loadFiles()
+  }
+)
+
+// 传输完成后刷新当前目录，让新上传/下载的文件立刻可见
+watch(
+  () => props.refreshSignal,
+  (val, old) => {
+    if (val === undefined || old === undefined) return
+    if (!props.activeSessionId) return
     loadFiles()
   }
 )

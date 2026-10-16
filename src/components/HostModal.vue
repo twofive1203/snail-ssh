@@ -15,7 +15,7 @@
           </div>
           <div>
             <h2 class="text-sm font-bold text-white">{{ isEditing ? '编辑 SSH 服务器' : '配置新建服务器' }}</h2>
-            <p class="text-[11px] text-surface-subtle">填写连接凭证、认证方式及跳板机参数</p>
+            <p class="text-[11px] text-surface-subtle">填写连接凭证与认证方式，密码/私钥会存入系统钥匙串</p>
           </div>
         </div>
         <button @click="$emit('close')" class="p-1.5 rounded-lg hover:bg-surface-elevated text-slate-400 hover:text-white transition-colors">
@@ -28,7 +28,10 @@
         <!-- 标签页 -->
         <div class="flex border-b border-surface-border text-xs mb-3">
           <button type="button" class="px-4 py-2 border-b-2 border-brand-500 text-brand-400 font-medium">常规设置</button>
-          <button type="button" @click="$emit('toast', '跳板机/代理功能已就绪', 'info')" class="px-4 py-2 border-b-2 border-transparent text-slate-400 hover:text-slate-200">跳板机 & 代理</button>
+          <button type="button" @click="$emit('toast', '跳板机 & 代理尚未实现，将在后续版本提供', 'warning')" class="px-4 py-2 border-b-2 border-transparent text-slate-500 hover:text-slate-300 flex items-center gap-1.5">
+            <span>跳板机 & 代理</span>
+            <span class="text-[9px] px-1 py-0.2 rounded bg-surface-highlight text-slate-400 border border-surface-border font-mono">即将推出</span>
+          </button>
         </div>
 
         <div class="grid grid-cols-2 gap-4">
@@ -186,10 +189,11 @@
 </template>
 
 <script setup lang="ts">
-import { ref, watch } from 'vue'
+import { ref, watch, onMounted, onBeforeUnmount } from 'vue'
 import { Server, X } from 'lucide-vue-next'
 import type { HostItem, AuthType } from '@/types'
 import { testSshConnectionApi, isTauri } from '@/api/tauri'
+import { confirmDialog, dialogState } from '@/composables/useDialog'
 
 const props = defineProps<{
   open: boolean
@@ -287,12 +291,14 @@ const testConnect = async () => {
       const parts = msg.split('|')
       const newFp = parts[1] || '未知'
       const oldFps = (parts[2] || '').split(';').filter(Boolean)
-      const proceed = confirm(
-        `警告：${form.value.host}:${form.value.port} 的主机密钥与 ~/.ssh/known_hosts 不一致！\n\n` +
-          `本次指纹：\n${newFp}\n\n` +
-          `已知记录：\n${oldFps.join('\n') || '（无法读取）'}\n\n` +
-          `仅在确认服务器确实更换过密钥时确认，将替换旧记录后重试。`
-      )
+      const proceed = await confirmDialog({
+        title: '主机密钥不一致',
+        variant: 'danger',
+        message: `${form.value.host}:${form.value.port} 的主机密钥与 ~/.ssh/known_hosts 记录不一致。`,
+        detail: `本次指纹：\n${newFp}\n\n已知记录：\n${oldFps.join('\n') || '（无法读取）'}`,
+        confirmText: '确认更换并重试',
+        cancelText: '取消'
+      })
       if (proceed) {
         try {
           const res = await testSshConnectionApi(buildConfig(), true)
@@ -305,9 +311,14 @@ const testConnect = async () => {
     }
     const unknown = msg.match(/HOST_KEY_UNKNOWN\|(.+)/)
     if (unknown) {
-      const trust = confirm(
-        `该主机密钥未记录在 ~/.ssh/known_hosts。\n\n指纹：\n${unknown[1]}\n\n是否信任并写入后再测试？`
-      )
+      const trust = await confirmDialog({
+        title: '首次连接该主机',
+        variant: 'warning',
+        message: '该主机密钥未记录在 ~/.ssh/known_hosts，是否信任并写入后再测试？',
+        detail: `主机密钥指纹：\n${unknown[1]}`,
+        confirmText: '信任并测试',
+        cancelText: '取消'
+      })
       if (trust) {
         try {
           const res = await testSshConnectionApi(buildConfig(), true)
@@ -323,6 +334,18 @@ const testConnect = async () => {
     testing.value = false
   }
 }
+
+// ESC 关闭弹窗；若上层还有确认框，先交给确认框处理
+const onKeydown = (e: KeyboardEvent) => {
+  if (!props.open || dialogState.open) return
+  if (e.key === 'Escape') {
+    e.preventDefault()
+    emit('close')
+  }
+}
+
+onMounted(() => window.addEventListener('keydown', onKeydown))
+onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
 
 const handleSubmit = () => {
   const tags = tagInput.value.split(',').map(s => s.trim()).filter(Boolean)

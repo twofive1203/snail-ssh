@@ -259,6 +259,20 @@
                   >
                     连接
                   </button>
+                  <button
+                    @click="$emit('edit-host', host)"
+                    class="p-1 rounded text-surface-subtle hover:text-white hover:bg-surface-highlight transition-colors"
+                    title="编辑配置"
+                  >
+                    <Edit3 class="w-3.5 h-3.5" />
+                  </button>
+                  <button
+                    @click="$emit('delete-host', host)"
+                    class="p-1 rounded text-surface-subtle hover:text-rose-400 hover:bg-surface-highlight transition-colors"
+                    title="删除主机"
+                  >
+                    <Trash2 class="w-3.5 h-3.5" />
+                  </button>
                 </div>
               </td>
             </tr>
