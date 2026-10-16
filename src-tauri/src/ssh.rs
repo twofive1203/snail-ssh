@@ -22,6 +22,8 @@ const PTY_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// SFTP 会话走阻塞模式，超时兜底避免服务器无响应时线程永久挂起
 const SFTP_IO_TIMEOUT_MS: u32 = 30_000;
+/// 工作目录探测的整体超时，避免远端命令挂住时阻塞自动跟随
+const CWD_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SshConnectConfig {
@@ -83,7 +85,8 @@ pub struct HostProbeResult {
 pub struct ActiveSession {
     /// Shell 会话：握手完成后切非阻塞，避免读阻塞锁死写入。
     /// 同时持有该 Arc 以保证底层连接不会被提前释放。
-    #[allow(dead_code)]
+    /// 工作目录探测也在它上面开瞬态通道：必须与本会话的 shell 同属一条连接，
+    /// 才能按“同父兄弟进程”精确认出本会话，而不是靠 pts 活跃度去猜。
     session: Arc<Mutex<ssh2::Session>>,
     channel: Arc<Mutex<ssh2::Channel>>,
     /// SFTP 专用会话（首次使用 SFTP 时懒加载的独立连接）
@@ -298,22 +301,21 @@ impl SshManager {
         Ok(self.get_active(session_id)?.config.clone())
     }
 
-    /// 获取终端会话当前的工作目录（CWD），通过独立 SFTP 会话开瞬态通道探测，避免干扰终端
+    /// 获取终端会话当前的工作目录（CWD）。
+    ///
+    /// 探测通道必须开在终端自己那条连接上：该连接下的 shell 通道与 exec 通道由
+    /// 同一个远端 sshd 会话进程派生（互为兄弟进程），脚本据此把候选收敛到本会话的
+    /// 登录 shell，不受其他会话、其他用户以及挂在 pts 上的常驻进程影响。
     pub fn get_session_cwd(&self, session_id: &str) -> Result<String, String> {
-        let sftp_sess = self.get_sftp_session(session_id)?;
-        let sess = sftp_sess.lock();
-        let mut channel = sess
-            .channel_session()
-            .map_err(|e| format!("打开工作目录探测通道失败: {}", e))?;
-        channel
-            .exec(CWD_DETECT_SCRIPT)
-            .map_err(|e| format!("执行工作目录探测脚本失败: {}", e))?;
+        let active = self.get_active(session_id)?;
+        if !active.is_alive.load(Ordering::Relaxed) {
+            return Err("会话已断开".into());
+        }
 
-        let mut output = String::new();
-        channel
-            .read_to_string(&mut output)
-            .map_err(|e| format!("读取工作目录失败: {}", e))?;
-        let _ = channel.wait_close();
+        let output = {
+            let sess = active.session.lock();
+            run_probe_command(&sess, CWD_DETECT_SCRIPT)?
+        };
 
         let path = output
             .lines()
@@ -330,34 +332,106 @@ impl SshManager {
     }
 }
 
-/// 远端工作目录探测脚本：
-/// 1. 查找 /dev/pts/ 下最新活跃修改时间的终端设备，定位占用该 pts 的进程并读取其 /proc/<pid>/cwd
-/// 2. 备用策略：查找当前用户的 pts shell 进程并读取 cwd
-/// 3. 若均无法读取则降级为 HOME 或 /
+/// 在指定连接上开一个瞬态 exec 通道执行脚本并读回输出。
+/// 会话可能处于非阻塞模式，因此按 EAGAIN 轮询并在超时后返回已读到的内容。
+fn run_probe_command(sess: &ssh2::Session, command: &str) -> Result<String, String> {
+    let mut channel = wait_retry(|| sess.channel_session(), PTY_WAIT_TIMEOUT)
+        .map_err(|e| format!("打开工作目录探测通道失败: {}", e))?;
+    wait_retry(|| channel.exec(command), PTY_WAIT_TIMEOUT)
+        .map_err(|e| format!("执行工作目录探测脚本失败: {}", e))?;
+
+    let mut output: Vec<u8> = Vec::new();
+    let mut buf = [0u8; 4096];
+    let start = Instant::now();
+    loop {
+        match channel.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => output.extend_from_slice(&buf[..n]),
+            Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                if start.elapsed() >= CWD_PROBE_TIMEOUT {
+                    break;
+                }
+                std::thread::sleep(IO_POLL_INTERVAL);
+            }
+            Err(e) => return Err(format!("读取工作目录失败: {}", e)),
+        }
+        if start.elapsed() >= CWD_PROBE_TIMEOUT {
+            break;
+        }
+    }
+    let _ = wait_retry(|| channel.wait_close(), Duration::from_secs(1));
+
+    Ok(String::from_utf8_lossy(&output).to_string())
+}
+
+/// 远端工作目录探测脚本（必须在终端所属连接上执行）：
+/// 1. 取探测进程的父进程（本连接的 sshd 会话进程），在它的兄弟进程中找标准输入
+///    指向伪终端的那个 —— 即本会话的登录 shell，可精确锁定，不受其他会话/后台常驻进程影响；
+/// 2. 兜底：/dev/pts 活跃度启发式，但只认“stdin 指向 pts 的 shell”进程
+///    （老算法会选中 sshd 的家目录或挂在 pts 上的后台服务，导致工作区跳到无关目录）；
+/// 3. 兜底：本用户下所有交互 shell 进程（同样要求 stdin 指向 pts）；
+/// 4. 仍无法判断则降级为 HOME 或 /
 const CWD_DETECT_SCRIPT: &str = r#"CWD=""
-for pts in $(ls -t /dev/pts/[0-9]* 2>/dev/null); do
-  for pid in $(fuser "$pts" 2>/dev/null); do
-    if [ -d "/proc/$pid" ] && [ "$pid" != "$$" ]; then
+
+SELF_PPID=$(awk '/^PPid:/{print $2}' "/proc/$$/status" 2>/dev/null)
+if [ -n "$SELF_PPID" ]; then
+  for pid in $(ps -eo pid=,ppid= 2>/dev/null | awk -v p="$SELF_PPID" '$2 == p {print $1}'); do
+    [ "$pid" = "$$" ] && continue
+    [ -d "/proc/$pid" ] || continue
+    case "$(readlink "/proc/$pid/fd/0" 2>/dev/null)" in
+      /dev/pts/*) ;;
+      *) continue ;;
+    esac
+    target=$(readlink -f "/proc/$pid/cwd" 2>/dev/null)
+    if [ -n "$target" ] && [ -d "$target" ]; then
+      CWD="$target"
+      break
+    fi
+  done
+fi
+
+if [ -z "$CWD" ]; then
+  for pts in $(ls -t /dev/pts/[0-9]* 2>/dev/null); do
+    for pid in $(fuser "$pts" 2>/dev/null); do
+      [ "$pid" = "$$" ] && continue
+      [ -d "/proc/$pid" ] || continue
+      case "$(cat "/proc/$pid/comm" 2>/dev/null)" in
+        bash|zsh|sh|dash|ash|ksh|mksh|fish|csh|tcsh) ;;
+        *) continue ;;
+      esac
+      case "$(readlink "/proc/$pid/fd/0" 2>/dev/null)" in
+        /dev/pts/*) ;;
+        *) continue ;;
+      esac
       target=$(readlink -f "/proc/$pid/cwd" 2>/dev/null)
       if [ -n "$target" ] && [ -d "$target" ]; then
         CWD="$target"
         break 2
       fi
-    fi
+    done
   done
-done
+fi
+
 if [ -z "$CWD" ]; then
-  pids=$(ps -u $(id -u 2>/dev/null || whoami) -o pid,tty,comm 2>/dev/null | grep -E 'pts/[0-9]+' | grep -E 'bash|zsh|sh|fish|ash|csh' | awk '{print $1}')
-  for pid in $pids; do
-    if [ -d "/proc/$pid" ] && [ "$pid" != "$$" ]; then
-      target=$(readlink -f "/proc/$pid/cwd" 2>/dev/null)
-      if [ -n "$target" ] && [ -d "$target" ]; then
-        CWD="$target"
-        break
-      fi
+  for pid in $(ps -u "$(id -u 2>/dev/null || echo 0)" -o pid= 2>/dev/null); do
+    [ "$pid" = "$$" ] && continue
+    [ -d "/proc/$pid" ] || continue
+    case "$(cat "/proc/$pid/comm" 2>/dev/null)" in
+      bash|zsh|sh|dash|ash|ksh|mksh|fish|csh|tcsh) ;;
+      *) continue ;;
+    esac
+    case "$(readlink "/proc/$pid/fd/0" 2>/dev/null)" in
+      /dev/pts/*) ;;
+      *) continue ;;
+    esac
+    target=$(readlink -f "/proc/$pid/cwd" 2>/dev/null)
+    if [ -n "$target" ] && [ -d "$target" ]; then
+      CWD="$target"
+      break
     fi
   done
 fi
+
 if [ -z "$CWD" ] || [ ! -d "$CWD" ]; then
   CWD="${HOME:-/}"
 fi
