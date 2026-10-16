@@ -82,6 +82,10 @@
         @close="transfersOpen = false"
         @clear-completed="handleClearCompletedTasks"
         @remove-task="handleRemoveTask"
+        @pause-task="handlePauseTask"
+        @resume-task="handleResumeTask"
+        @cancel-task="handleCancelTask"
+        @retry-task="handleRetryTask"
       />
     </div>
 
@@ -157,7 +161,7 @@ import DialogHost from '@/components/DialogHost.vue'
 import Toast from '@/components/Toast.vue'
 import { confirmDialog, promptDialog, dialogState } from '@/composables/useDialog'
 import { useRecentHosts, MAX_RECENT_DISPLAY } from '@/composables/useRecentHosts'
-import type { FileDragDropEvent, HostItem, HostSession, SftpFileItem, TransferTask, ToastMessage } from '@/types'
+import type { FileDragDropEvent, HostItem, HostSession, SftpFileItem, TransferContext, TransferTask, ToastMessage } from '@/types'
 import {
   getHostsApi,
   saveHostApi,
@@ -166,8 +170,8 @@ import {
   closeSshSessionApi,
   probeHostInfoApi,
   sftpUploadPathApi,
-  sftpDownloadFileApi,
-  sftpDownloadDirApi,
+  sftpDownloadPathApi,
+  sftpTransferControlApi,
   onSftpProgress,
   onFileDragDrop,
   pickLocalFiles,
@@ -243,7 +247,7 @@ const toastList = ref<ToastMessage[]>([])
 
 // 计算属性
 const activeTransfersCount = computed(() => {
-  return transferTasks.value.filter(t => t.status === 'running').length
+  return transferTasks.value.filter(t => t.status === 'running' || t.status === 'paused').length
 })
 
 const currentTransferSpeed = computed(() => {
@@ -640,7 +644,7 @@ const handleDeleteHost = async (host: HostItem) => {
 
 // 安全关闭窗口
 const handleCloseWindow = async () => {
-  const running = transferTasks.value.filter(t => t.status === 'running').length
+  const running = transferTasks.value.filter(t => t.status === 'running' || t.status === 'paused').length
   const activeSessCount = sessions.value.length
 
   if (running > 0 || activeSessCount > 0) {
@@ -681,7 +685,12 @@ const formatBytes = (bytes: number) => {
   return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`
 }
 
-const createTransferTask = (name: string, type: 'upload' | 'download', size = '准备中...'): TransferTask => {
+const createTransferTask = (
+  name: string,
+  type: 'upload' | 'download',
+  size = '准备中...',
+  context?: TransferContext
+): TransferTask => {
   const task = reactive<TransferTask>({
     id: 'task-' + Date.now() + '-' + Math.floor(Math.random() * 1000),
     name,
@@ -689,7 +698,8 @@ const createTransferTask = (name: string, type: 'upload' | 'download', size = '�
     progress: 0,
     speed: '准备中...',
     size,
-    status: 'running'
+    status: 'running',
+    context
   })
   transferTasks.value.unshift(task)
   transfersOpen.value = true
@@ -697,10 +707,21 @@ const createTransferTask = (name: string, type: 'upload' | 'download', size = '�
 }
 
 const runTransfer = async (task: TransferTask, start: (taskId: string) => Promise<void>) => {
+  // 重试/重放也从 running 起步（进度由后端按续传 offset 重新上报）
+  task.status = 'running'
+  task.speed = task.progress > 0 ? '继续中...' : '准备中...'
+
   const unlisten = await onSftpProgress(task.id, (payload) => {
     task.progress = payload.progress
     task.speed = payload.speed
     task.size = `${formatBytes(payload.transferred)} / ${formatBytes(payload.total)}`
+    if (payload.status === 'paused') {
+      task.status = 'paused'
+    } else if (payload.status === 'cancelled') {
+      task.status = 'cancelled'
+    } else if (payload.status === 'running' && task.status !== 'paused') {
+      task.status = 'running'
+    }
   })
 
   try {
@@ -711,9 +732,16 @@ const runTransfer = async (task: TransferTask, start: (taskId: string) => Promis
     triggerToast(`${task.name} 已完成`, 'success')
     sftpRefreshSignal.value++
   } catch (e: any) {
-    task.status = 'failed'
-    task.speed = `失败: ${e?.message || e}`
-    triggerToast(`传输失败: ${e?.message || e}`, 'error')
+    if (String(e?.message || e).includes('TRANSFER_CANCELLED')) {
+      // 取消不是失败：保留已传部分文件供续传，不刷新目录
+      task.status = 'cancelled'
+      task.speed = '已取消'
+      triggerToast(`${task.name} 已取消`, 'info')
+    } else {
+      task.status = 'failed'
+      task.speed = `失败: ${e?.message || e}`
+      triggerToast(`传输失败: ${e?.message || e}`, 'error')
+    }
   } finally {
     unlisten()
   }
@@ -748,23 +776,30 @@ const handleDownloadFile = async (session: HostSession, file: SftpFileItem, remo
     fullRemote = remotePath === '/' ? `/${file.name}` : `${remotePath.replace(/\/+$/, '')}/${file.name}`
   }
 
-  const task = createTransferTask(`下载: ${file.name}`, 'download', file.size)
-  if (file.isDir) {
-    await runTransfer(task, (taskId) =>
-      sftpDownloadDirApi(sessionId, fullRemote, localPath, taskId)
-    )
-  } else {
-    await runTransfer(task, (taskId) =>
-      sftpDownloadFileApi(sessionId, fullRemote, localPath, taskId)
-    )
-  }
+  const task = createTransferTask(`下载: ${file.name}`, 'download', file.size, {
+    sessionId,
+    localPath,
+    remotePath: fullRemote,
+    upload: false
+  })
+  await runTransfer(task, (taskId) =>
+    sftpDownloadPathApi(sessionId, fullRemote, localPath, taskId)
+  )
 }
 
 /** 批量入队上传：先一次性建好所有任务卡片，再顺序执行（同一 SFTP 会话不并发混用） */
 const enqueueUploadPaths = async (localPaths: string[], sessionId: string, remoteDir: string) => {
   const jobs = localPaths.map(localPath => {
     const name = localPath.split(/[/\\]/).filter(Boolean).pop() || 'file'
-    return { localPath, task: createTransferTask(`上传: ${name}`, 'upload') }
+    return {
+      localPath,
+      task: createTransferTask(`上传: ${name}`, 'upload', '准备中...', {
+        sessionId,
+        localPath,
+        remotePath: remoteDir,
+        upload: true
+      })
+    }
   })
   for (const job of jobs) {
     await runTransfer(job.task, (taskId) => sftpUploadPathApi(sessionId, job.localPath, remoteDir, taskId))
@@ -844,9 +879,52 @@ const handleRemoveTask = (taskId: string) => {
   transferTasks.value = transferTasks.value.filter(t => t.id !== taskId)
 }
 
+const handlePauseTask = async (task: TransferTask) => {
+  try {
+    await sftpTransferControlApi(task.id, 'pause')
+    task.status = 'paused'
+    task.speed = '已暂停'
+  } catch (e: any) {
+    triggerToast(`暂停失败: ${e?.message || e}`, 'error')
+  }
+}
+
+const handleResumeTask = async (task: TransferTask) => {
+  try {
+    await sftpTransferControlApi(task.id, 'resume')
+    task.status = 'running'
+    task.speed = '继续中...'
+  } catch (e: any) {
+    triggerToast(`继续失败: ${e?.message || e}`, 'error')
+  }
+}
+
+const handleCancelTask = async (task: TransferTask) => {
+  try {
+    await sftpTransferControlApi(task.id, 'cancel')
+    task.status = 'cancelled'
+    task.speed = '已取消'
+  } catch (e: any) {
+    triggerToast(`取消失败: ${e?.message || e}`, 'error')
+  }
+}
+
+/** 失败/取消后重试：原样重放 context，后端按已传 offset 断点续传 */
+const handleRetryTask = async (task: TransferTask) => {
+  const ctx = task.context
+  if (!ctx) {
+    triggerToast('该任务缺少重试信息，请重新发起传输', 'warning')
+    return
+  }
+  await runTransfer(task, (taskId) => ctx.upload
+    ? sftpUploadPathApi(ctx.sessionId, ctx.localPath, ctx.remotePath, taskId)
+    : sftpDownloadPathApi(ctx.sessionId, ctx.remotePath, ctx.localPath, taskId))
+}
+
 const handleClearCompletedTasks = () => {
   const before = transferTasks.value.length
-  transferTasks.value = transferTasks.value.filter(t => t.status === 'running')
+  // 暂停中的任务不能当作“已结束”清掉
+  transferTasks.value = transferTasks.value.filter(t => t.status === 'running' || t.status === 'paused')
   const removed = before - transferTasks.value.length
   triggerToast(removed > 0 ? `已清理 ${removed} 条已结束的传输记录` : '没有可清理的传输记录', 'info')
 }

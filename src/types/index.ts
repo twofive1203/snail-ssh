@@ -74,14 +74,26 @@ export interface SftpFileItem {
   isHidden: boolean
 }
 
+/** 传输任务状态：cancelled 与 failed 区分，暂停可继续 */
+export type TransferStatus = 'running' | 'paused' | 'completed' | 'failed' | 'cancelled'
+
 export interface SftpProgressPayload {
   taskId: string
   progress: number
   speed: string
   /** scanning 仅在目录上传枚举阶段出现（进度百分比尚不可知） */
-  status: 'running' | 'completed' | 'failed' | 'scanning'
+  status: TransferStatus | 'scanning'
   transferred: number
   total: number
+}
+
+/** 重试所需上下文：原样重放即可从已传字节续传 */
+export interface TransferContext {
+  sessionId: string
+  localPath: string
+  /** 上传时为目标父目录；下载时为远端完整路径 */
+  remotePath: string
+  upload: boolean
 }
 
 export interface TransferTask {
@@ -91,7 +103,8 @@ export interface TransferTask {
   progress: number
   speed: string
   size: string
-  status: 'running' | 'completed' | 'failed'
+  status: TransferStatus
+  context?: TransferContext
 }
 
 /** 后端真实连通性测试结果 */

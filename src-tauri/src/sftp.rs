@@ -1,11 +1,14 @@
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use ssh2::{OpenFlags, OpenType};
 use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
+
+use crate::transfer::{resume_offset, TransferSignal, TRANSFER_CANCELLED};
 
 /// 在线编辑器单次读取上限，避免把超大文件整个读进内存
 const MAX_EDITABLE_FILE_SIZE: u64 = 8 * 1024 * 1024;
@@ -379,27 +382,73 @@ pub fn sftp_stat(
     Ok(build_file_item(&name, &stat))
 }
 
-pub fn sftp_upload_file(
-    session_arc: Arc<Mutex<ssh2::Session>>,
-    local_path: &str,
-    remote_path: &str,
-    task_id: &str,
-    app_handle: AppHandle,
+/// 块循环中的暂停/取消检查点：暂停时阻塞轮询，取消时上报并返回哨兵错误。
+fn pause_or_cancel(
+    signal: &TransferSignal,
+    reporter: &mut ProgressReporter,
+    app: &AppHandle,
 ) -> Result<(), String> {
-    let mut local_file =
-        File::open(local_path).map_err(|e| format!("打开本地文件失败: {}", e))?;
-    let total_size = local_file.metadata().map(|m| m.len()).unwrap_or(0);
+    if signal.is_cancelled() {
+        reporter.report(app, "cancelled", true);
+        return Err(TRANSFER_CANCELLED.into());
+    }
+    if signal.is_paused() {
+        reporter.report(app, "paused", true);
+        if !signal.wait_if_paused() {
+            reporter.report(app, "cancelled", true);
+            return Err(TRANSFER_CANCELLED.into());
+        }
+    }
+    Ok(())
+}
 
-    let sess = session_arc.lock();
-    let sftp = sess.sftp().map_err(|e| format!("初始化 SFTP 失败: {}", e))?;
-    let mut remote_file = sftp
-        .create(Path::new(remote_path))
-        .map_err(|e| format!("创建远程文件失败: {}", e))?;
+/// 上传单个文件（供单文件与目录上传复用）：支持取消/暂停与断点续传。
+/// 续传起点按"远端已存在且比本地源短"计算；`reporter` 的 total 为完整文件大小，
+/// 续传时 `advance(offset)` 让进度从已有位置起算。
+fn transfer_upload_one(
+    sftp: &ssh2::Sftp,
+    local: &Path,
+    remote: &Path,
+    reporter: &mut ProgressReporter,
+    signal: &TransferSignal,
+    app: &AppHandle,
+) -> Result<(), String> {
+    let mut local_file = File::open(local).map_err(|e| format!("打开本地文件失败: {}", e))?;
+    let source_len = local_file.metadata().map(|m| m.len()).unwrap_or(0);
+    let remote_len = sftp
+        .stat(remote)
+        .ok()
+        .and_then(|stat| stat.size);
+    let offset = resume_offset(remote_len, source_len);
 
-    let mut reporter = ProgressReporter::new(task_id, total_size);
+    // 红线：续传路径绝不能带 OpenFlags::TRUNC，否则会把已传部分清空；
+    // offset == 0 时用 create()（语义等于截断重建），正确处理远端更长/需重传的情况。
+    let mut remote_file = if offset == 0 {
+        sftp.create(remote)
+            .map_err(|e| format!("创建远程文件失败: {}", e))?
+    } else {
+        sftp.open_mode(
+            remote,
+            OpenFlags::WRITE | OpenFlags::CREATE,
+            0o644,
+            OpenType::File,
+        )
+        .map_err(|e| format!("打开远程文件失败: {}", e))?
+    };
+
+    if offset > 0 {
+        local_file
+            .seek(SeekFrom::Start(offset))
+            .map_err(|e| format!("定位本地文件失败: {}", e))?;
+        remote_file
+            .seek(SeekFrom::Start(offset))
+            .map_err(|e| format!("定位远程文件失败: {}", e))?;
+        reporter.advance(offset);
+    }
+
     let mut buf = vec![0u8; TRANSFER_CHUNK_SIZE];
-
     loop {
+        pause_or_cancel(signal, reporter, app)?;
         let n = local_file
             .read(&mut buf)
             .map_err(|e| format!("读取本地文件失败: {}", e))?;
@@ -410,37 +459,52 @@ pub fn sftp_upload_file(
             .write_all(&buf[..n])
             .map_err(|e| format!("传输中断: {}", e))?;
         reporter.advance(n as u64);
-        reporter.report(&app_handle, "running", false);
+        signal.set_transferred(reporter.transferred);
+        reporter.report(app, "running", false);
     }
-
-    reporter.report(&app_handle, "completed", true);
     Ok(())
 }
 
-pub fn sftp_download_file(
-    session_arc: Arc<Mutex<ssh2::Session>>,
-    remote_path: &str,
-    local_path: &str,
-    task_id: &str,
-    app_handle: AppHandle,
+/// 下载单个文件（供单文件与目录下载复用）：支持取消/暂停与断点续传。
+fn transfer_download_one(
+    sftp: &ssh2::Sftp,
+    remote: &Path,
+    local: &Path,
+    reporter: &mut ProgressReporter,
+    signal: &TransferSignal,
+    app: &AppHandle,
 ) -> Result<(), String> {
-    let sess = session_arc.lock();
-    let sftp = sess.sftp().map_err(|e| format!("初始化 SFTP 失败: {}", e))?;
     let mut remote_file = sftp
-        .open(Path::new(remote_path))
+        .open(remote)
         .map_err(|e| format!("打开远程文件失败: {}", e))?;
-    let total_size = remote_file
+    let remote_len = remote_file
         .stat()
         .map(|s| s.size.unwrap_or(0))
         .unwrap_or(0);
+    let local_len = fs::metadata(local).ok().map(|m| m.len());
+    let offset = resume_offset(local_len, remote_len);
 
-    let mut local_file =
-        File::create(local_path).map_err(|e| format!("创建本地文件失败: {}", e))?;
+    // offset == 0 时截断重建，避免本地残留旧文件的尾巴；offset > 0 时保留已下部分续写。
+    let mut local_file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(offset == 0)
+        .open(local)
+        .map_err(|e| format!("创建本地文件失败: {}", e))?;
 
-    let mut reporter = ProgressReporter::new(task_id, total_size);
+    if offset > 0 {
+        remote_file
+            .seek(SeekFrom::Start(offset))
+            .map_err(|e| format!("定位远程文件失败: {}", e))?;
+        local_file
+            .seek(SeekFrom::Start(offset))
+            .map_err(|e| format!("定位本地文件失败: {}", e))?;
+        reporter.advance(offset);
+    }
+
     let mut buf = vec![0u8; TRANSFER_CHUNK_SIZE];
-
     loop {
+        pause_or_cancel(signal, reporter, app)?;
         let n = remote_file
             .read(&mut buf)
             .map_err(|e| format!("读取远程文件失败: {}", e))?;
@@ -451,14 +515,91 @@ pub fn sftp_download_file(
             .write_all(&buf[..n])
             .map_err(|e| format!("本地写入失败: {}", e))?;
         reporter.advance(n as u64);
-        reporter.report(&app_handle, "running", false);
+        signal.set_transferred(reporter.transferred);
+        reporter.report(app, "running", false);
     }
 
     local_file
         .flush()
         .map_err(|e| format!("本地文件落盘失败: {}", e))?;
+    Ok(())
+}
+
+pub fn sftp_upload_file(
+    session_arc: Arc<Mutex<ssh2::Session>>,
+    local_path: &str,
+    remote_path: &str,
+    task_id: &str,
+    signal: Arc<TransferSignal>,
+    app_handle: AppHandle,
+) -> Result<(), String> {
+    let total_size = fs::metadata(local_path).map(|m| m.len()).unwrap_or(0);
+    let sess = session_arc.lock();
+    let sftp = sess.sftp().map_err(|e| format!("初始化 SFTP 失败: {}", e))?;
+
+    let mut reporter = ProgressReporter::new(task_id, total_size);
+    transfer_upload_one(
+        &sftp,
+        Path::new(local_path),
+        Path::new(remote_path),
+        &mut reporter,
+        &signal,
+        &app_handle,
+    )?;
     reporter.report(&app_handle, "completed", true);
     Ok(())
+}
+
+pub fn sftp_download_file(
+    session_arc: Arc<Mutex<ssh2::Session>>,
+    remote_path: &str,
+    local_path: &str,
+    task_id: &str,
+    signal: Arc<TransferSignal>,
+    app_handle: AppHandle,
+) -> Result<(), String> {
+    let sess = session_arc.lock();
+    let sftp = sess.sftp().map_err(|e| format!("初始化 SFTP 失败: {}", e))?;
+    let total_size = sftp
+        .stat(Path::new(remote_path))
+        .ok()
+        .and_then(|s| s.size)
+        .unwrap_or(0);
+
+    let mut reporter = ProgressReporter::new(task_id, total_size);
+    transfer_download_one(
+        &sftp,
+        Path::new(remote_path),
+        Path::new(local_path),
+        &mut reporter,
+        &signal,
+        &app_handle,
+    )?;
+    reporter.report(&app_handle, "completed", true);
+    Ok(())
+}
+
+/// 统一下载入口：按远端条目类型分派单文件 / 目录（前端无需判断类型）。
+pub fn sftp_download_path(
+    session_arc: Arc<Mutex<ssh2::Session>>,
+    remote_path: &str,
+    local_path: &str,
+    task_id: &str,
+    signal: Arc<TransferSignal>,
+    app_handle: AppHandle,
+) -> Result<(), String> {
+    let is_dir = {
+        let sess = session_arc.lock();
+        let sftp = sess.sftp().map_err(|e| format!("初始化 SFTP 失败: {}", e))?;
+        sftp.stat(Path::new(remote_path))
+            .map(|s| s.is_dir())
+            .map_err(|e| format!("读取远程信息失败: {}", e))?
+    };
+    if is_dir {
+        sftp_download_dir(session_arc, remote_path, local_path, task_id, signal, app_handle)
+    } else {
+        sftp_download_file(session_arc, remote_path, local_path, task_id, signal, app_handle)
+    }
 }
 
 /// 待下载的单个文件（远端路径 -> 本地路径）
@@ -473,6 +614,7 @@ pub fn sftp_download_dir(
     remote_path: &str,
     local_path: &str,
     task_id: &str,
+    signal: Arc<TransferSignal>,
     app_handle: AppHandle,
 ) -> Result<(), String> {
     let sess = session_arc.lock();
@@ -494,35 +636,27 @@ pub fn sftp_download_dir(
     fs::create_dir_all(Path::new(local_path)).map_err(|e| format!("创建本地目录失败: {}", e))?;
 
     let mut reporter = ProgressReporter::new(task_id, total);
-    let mut buf = vec![0u8; TRANSFER_CHUNK_SIZE];
 
     for entry in &entries {
-        let mut remote_file = sftp
-            .open(&entry.remote)
-            .map_err(|e| format!("打开远端文件失败: {}", e))?;
+        // 本地已与远端等大：视为已续传完成，直接计入进度避免进度回退
+        let remote_len = sftp.stat(&entry.remote).ok().and_then(|s| s.size);
+        if let (Some(remote_len), Ok(meta)) = (remote_len, fs::metadata(&entry.local)) {
+            if remote_len > 0 && meta.len() == remote_len {
+                reporter.advance(remote_len);
+                continue;
+            }
+        }
         if let Some(parent) = entry.local.parent() {
             fs::create_dir_all(parent).map_err(|e| format!("创建本地目录失败: {}", e))?;
         }
-        let mut local_file =
-            File::create(&entry.local).map_err(|e| format!("创建本地文件失败: {}", e))?;
-
-        loop {
-            let n = remote_file
-                .read(&mut buf)
-                .map_err(|e| format!("读取远端文件失败: {}", e))?;
-            if n == 0 {
-                break;
-            }
-            local_file
-                .write_all(&buf[..n])
-                .map_err(|e| format!("本地写入失败: {}", e))?;
-            reporter.advance(n as u64);
-            reporter.report(&app_handle, "running", false);
-        }
-
-        local_file
-            .flush()
-            .map_err(|e| format!("本地文件落盘失败: {}", e))?;
+        transfer_download_one(
+            &sftp,
+            &entry.remote,
+            &entry.local,
+            &mut reporter,
+            &signal,
+            &app_handle,
+        )?;
     }
 
     reporter.report(&app_handle, "completed", true);
@@ -604,11 +738,19 @@ pub fn sftp_upload_path(
     local_path: &str,
     remote_dir: &str,
     task_id: &str,
+    signal: Arc<TransferSignal>,
     app_handle: AppHandle,
 ) -> Result<(), String> {
     let meta = fs::metadata(local_path).map_err(|e| format!("读取本地路径失败: {}", e))?;
     if meta.is_dir() {
-        return sftp_upload_dir(session_arc, local_path, remote_dir, task_id, app_handle);
+        return sftp_upload_dir(
+            session_arc,
+            local_path,
+            remote_dir,
+            task_id,
+            signal,
+            app_handle,
+        );
     }
     let name = Path::new(local_path)
         .file_name()
@@ -619,6 +761,7 @@ pub fn sftp_upload_path(
         local_path,
         &remote_path.to_string_lossy(),
         task_id,
+        signal,
         app_handle,
     )
 }
@@ -629,6 +772,7 @@ pub fn sftp_upload_dir(
     local_path: &str,
     remote_dir: &str,
     task_id: &str,
+    signal: Arc<TransferSignal>,
     app_handle: AppHandle,
 ) -> Result<(), String> {
     let local_root = Path::new(local_path);
@@ -661,31 +805,19 @@ pub fn sftp_upload_dir(
     ensure_remote_dir(&sftp, &remote_root)?;
 
     let mut reporter = ProgressReporter::new(task_id, total);
-    let mut buf = vec![0u8; TRANSFER_CHUNK_SIZE];
 
     for entry in &entries {
         if let Some(parent) = entry.remote.parent() {
             ensure_remote_dir(&sftp, parent)?;
         }
-        let mut local_file =
-            File::open(&entry.local).map_err(|e| format!("打开本地文件失败: {}", e))?;
-        let mut remote_file = sftp
-            .create(&entry.remote)
-            .map_err(|e| format!("创建远程文件失败: {}", e))?;
-
-        loop {
-            let n = local_file
-                .read(&mut buf)
-                .map_err(|e| format!("读取本地文件失败: {}", e))?;
-            if n == 0 {
-                break;
-            }
-            remote_file
-                .write_all(&buf[..n])
-                .map_err(|e| format!("传输中断: {}", e))?;
-            reporter.advance(n as u64);
-            reporter.report(&app_handle, "running", false);
-        }
+        transfer_upload_one(
+            &sftp,
+            &entry.local,
+            &entry.remote,
+            &mut reporter,
+            &signal,
+            &app_handle,
+        )?;
     }
 
     reporter.report(&app_handle, "completed", true);

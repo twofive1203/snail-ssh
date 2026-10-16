@@ -668,6 +668,20 @@ export async function sftpDownloadDirApi(sessionId: string, remotePath: string, 
   }
 }
 
+/** 统一下载入口：文件/目录由后端按远端类型分派 */
+export async function sftpDownloadPathApi(sessionId: string, remotePath: string, localPath: string, taskId: string): Promise<void> {
+  if (isTauri()) {
+    await invoke('sftp_download_path', { sessionId, remotePath, localPath, taskId })
+  }
+}
+
+/** 传输控制：pause / resume / cancel。任务不存在时后端返回明确错误 */
+export async function sftpTransferControlApi(taskId: string, action: 'pause' | 'resume' | 'cancel'): Promise<void> {
+  if (isTauri()) {
+    await invoke('sftp_transfer_control', { taskId, action })
+  }
+}
+
 // 监听单次传输任务的实时进度（bytes/进度/速度）
 export async function onSftpProgress(taskId: string, callback: (payload: SftpProgressPayload) => void): Promise<UnlistenFn> {
   if (isTauri()) {

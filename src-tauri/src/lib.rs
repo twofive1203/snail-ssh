@@ -2,13 +2,17 @@ mod history;
 mod sftp;
 mod ssh;
 mod storage;
+mod transfer;
 
 use history::HistoryEntry;
+use parking_lot::Mutex as ParkingMutex;
 use serde::{Deserialize, Serialize};
 use sftp::SftpFileItem;
 use ssh::{ConnectionTestResult, HostProbeResult, RemoteSystemMetrics, SshConnectConfig, SshManager};
+use std::sync::Arc;
 use storage::HostItem;
 use tauri::{AppHandle, Manager, State};
+use transfer::{TransferRegistry, TransferSignal};
 
 #[derive(Serialize, Deserialize)]
 pub struct CreateSessionResponse {
@@ -26,6 +30,32 @@ where
     tauri::async_runtime::spawn_blocking(job)
         .await
         .map_err(|e| format!("后台任务执行失败: {}", e))?
+}
+
+/// 统一的传输命令包装：取 SFTP 会话 -> 注册控制信号 -> 执行 -> 无论成败都清理注册表。
+async fn run_transfer<F>(
+    session_id: String,
+    task_id: String,
+    ssh_manager: State<'_, SshManager>,
+    registry: State<'_, TransferRegistry>,
+    job: F,
+) -> Result<(), String>
+where
+    F: FnOnce(Arc<ParkingMutex<ssh2::Session>>, Arc<TransferSignal>) -> Result<(), String>
+        + Send
+        + 'static,
+{
+    let manager = ssh_manager.inner().clone();
+    let registry = registry.inner().clone();
+    run_blocking(move || {
+        let session = manager.get_sftp_session(&session_id)?;
+        let signal = registry.register(&task_id, &session_id);
+        let result = job(session, signal);
+        // 成功/失败/取消都要清理，否则注册表会随任务数增长
+        registry.finish(&task_id);
+        result
+    })
+    .await
 }
 
 // ==========================================
@@ -112,9 +142,16 @@ async fn resize_ssh_session(
 async fn close_ssh_session(
     session_id: String,
     ssh_manager: State<'_, SshManager>,
+    transfer_registry: State<'_, TransferRegistry>,
 ) -> Result<(), String> {
     let manager = ssh_manager.inner().clone();
-    run_blocking(move || manager.close_session(&session_id)).await
+    let registry = transfer_registry.inner().clone();
+    run_blocking(move || {
+        // 先取消该会话名下仍在跑的传输，唤醒暂停中的线程避免永久阻塞
+        registry.cancel_by_session(&session_id);
+        manager.close_session(&session_id)
+    })
+    .await
 }
 
 // ==========================================
@@ -408,11 +445,11 @@ async fn sftp_upload_file(
     task_id: String,
     ssh_manager: State<'_, SshManager>,
     app_handle: AppHandle,
+    transfer_registry: State<'_, TransferRegistry>,
 ) -> Result<(), String> {
-    let manager = ssh_manager.inner().clone();
-    run_blocking(move || {
-        let session = manager.get_sftp_session(&session_id)?;
-        sftp::sftp_upload_file(session, &local_path, &remote_path, &task_id, app_handle)
+    let tid = task_id.clone();
+    run_transfer(session_id, task_id, ssh_manager, transfer_registry, move |session, signal| {
+        sftp::sftp_upload_file(session, &local_path, &remote_path, &tid, signal, app_handle)
     })
     .await
 }
@@ -425,11 +462,11 @@ async fn sftp_upload_path(
     task_id: String,
     ssh_manager: State<'_, SshManager>,
     app_handle: AppHandle,
+    transfer_registry: State<'_, TransferRegistry>,
 ) -> Result<(), String> {
-    let manager = ssh_manager.inner().clone();
-    run_blocking(move || {
-        let session = manager.get_sftp_session(&session_id)?;
-        sftp::sftp_upload_path(session, &local_path, &remote_dir, &task_id, app_handle)
+    let tid = task_id.clone();
+    run_transfer(session_id, task_id, ssh_manager, transfer_registry, move |session, signal| {
+        sftp::sftp_upload_path(session, &local_path, &remote_dir, &tid, signal, app_handle)
     })
     .await
 }
@@ -442,11 +479,11 @@ async fn sftp_download_file(
     task_id: String,
     ssh_manager: State<'_, SshManager>,
     app_handle: AppHandle,
+    transfer_registry: State<'_, TransferRegistry>,
 ) -> Result<(), String> {
-    let manager = ssh_manager.inner().clone();
-    run_blocking(move || {
-        let session = manager.get_sftp_session(&session_id)?;
-        sftp::sftp_download_file(session, &remote_path, &local_path, &task_id, app_handle)
+    let tid = task_id.clone();
+    run_transfer(session_id, task_id, ssh_manager, transfer_registry, move |session, signal| {
+        sftp::sftp_download_file(session, &remote_path, &local_path, &tid, signal, app_handle)
     })
     .await
 }
@@ -459,13 +496,41 @@ async fn sftp_download_dir(
     task_id: String,
     ssh_manager: State<'_, SshManager>,
     app_handle: AppHandle,
+    transfer_registry: State<'_, TransferRegistry>,
 ) -> Result<(), String> {
-    let manager = ssh_manager.inner().clone();
-    run_blocking(move || {
-        let session = manager.get_sftp_session(&session_id)?;
-        sftp::sftp_download_dir(session, &remote_path, &local_path, &task_id, app_handle)
+    let tid = task_id.clone();
+    run_transfer(session_id, task_id, ssh_manager, transfer_registry, move |session, signal| {
+        sftp::sftp_download_dir(session, &remote_path, &local_path, &tid, signal, app_handle)
     })
     .await
+}
+
+/// 统一下载入口：文件/目录由后端按远端类型分派
+#[tauri::command]
+async fn sftp_download_path(
+    session_id: String,
+    remote_path: String,
+    local_path: String,
+    task_id: String,
+    ssh_manager: State<'_, SshManager>,
+    app_handle: AppHandle,
+    transfer_registry: State<'_, TransferRegistry>,
+) -> Result<(), String> {
+    let tid = task_id.clone();
+    run_transfer(session_id, task_id, ssh_manager, transfer_registry, move |session, signal| {
+        sftp::sftp_download_path(session, &remote_path, &local_path, &tid, signal, app_handle)
+    })
+    .await
+}
+
+/// 传输控制（pause / resume / cancel）：同步命令，不阻塞
+#[tauri::command]
+fn sftp_transfer_control(
+    task_id: String,
+    action: String,
+    transfer_registry: State<'_, TransferRegistry>,
+) -> Result<(), String> {
+    transfer_registry.control(&task_id, &action)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -473,6 +538,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(SshManager::new())
+        .manage(TransferRegistry::new())
         .setup(|app| {
             if let Some(icon) = app.default_window_icon() {
                 for window in app.webview_windows().values() {
@@ -517,6 +583,8 @@ pub fn run() {
             sftp_upload_path,
             sftp_download_file,
             sftp_download_dir,
+            sftp_download_path,
+            sftp_transfer_control,
         ])
         .run(tauri::generate_context!())
         .expect("运行 SnailSSH 客户端失败");
