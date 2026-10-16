@@ -14,6 +14,18 @@ pub struct CreateSessionResponse {
     pub session_id: String,
 }
 
+/// 把阻塞型后端操作放到线程池执行：同步命令在 IPC 线程内直接运行，
+/// 一旦发生阻塞会连带冻结 WebView 界面，因此耗时命令一律走这里。
+async fn run_blocking<F, T>(job: F) -> Result<T, String>
+where
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+    T: Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(job)
+        .await
+        .map_err(|e| format!("后台任务执行失败: {}", e))?
+}
+
 // ==========================================
 // 主机存储命令
 // ==========================================
@@ -36,108 +48,126 @@ fn delete_host(id: String) -> Result<(), String> {
 // SSH 交互终端命令
 // ==========================================
 #[tauri::command]
-fn create_ssh_session(
+async fn create_ssh_session(
     config: SshConnectConfig,
     ssh_manager: State<'_, SshManager>,
     app_handle: AppHandle,
 ) -> Result<CreateSessionResponse, String> {
-    let session_id = ssh_manager.create_session(config, app_handle)?;
-    Ok(CreateSessionResponse { session_id })
+    let manager = ssh_manager.inner().clone();
+    run_blocking(move || {
+        manager
+            .create_session(config, app_handle)
+            .map(|session_id| CreateSessionResponse { session_id })
+    })
+    .await
 }
 
 #[tauri::command]
-fn write_ssh_session(
+async fn write_ssh_session(
     session_id: String,
     data: String,
     ssh_manager: State<'_, SshManager>,
 ) -> Result<(), String> {
-    ssh_manager.write_session(&session_id, &data)
+    let manager = ssh_manager.inner().clone();
+    run_blocking(move || manager.write_session(&session_id, &data)).await
 }
 
 #[tauri::command]
-fn resize_ssh_session(
+async fn resize_ssh_session(
     session_id: String,
     cols: u32,
     rows: u32,
     ssh_manager: State<'_, SshManager>,
 ) -> Result<(), String> {
-    ssh_manager.resize_session(&session_id, cols, rows)
+    let manager = ssh_manager.inner().clone();
+    run_blocking(move || manager.resize_session(&session_id, cols, rows)).await
 }
 
 #[tauri::command]
-fn close_ssh_session(
+async fn close_ssh_session(
     session_id: String,
     ssh_manager: State<'_, SshManager>,
 ) -> Result<(), String> {
-    ssh_manager.close_session(&session_id)
+    let manager = ssh_manager.inner().clone();
+    run_blocking(move || manager.close_session(&session_id)).await
 }
 
 // ==========================================
 // SFTP 远程文件管理命令
 // ==========================================
 #[tauri::command]
-fn sftp_read_dir(
+async fn sftp_read_dir(
     session_id: String,
     path: String,
     ssh_manager: State<'_, SshManager>,
 ) -> Result<Vec<SftpFileItem>, String> {
-    let raw_sess = ssh_manager
-        .get_raw_session(&session_id)
-        .ok_or_else(|| "会话未找到或未连接".to_string())?;
-    sftp::sftp_read_dir(raw_sess, &path)
+    let manager = ssh_manager.inner().clone();
+    run_blocking(move || {
+        let session = manager.get_sftp_session(&session_id)?;
+        sftp::sftp_read_dir(session, &path)
+    })
+    .await
 }
 
 #[tauri::command]
-fn sftp_read_file(
+async fn sftp_read_file(
     session_id: String,
     path: String,
     ssh_manager: State<'_, SshManager>,
 ) -> Result<String, String> {
-    let raw_sess = ssh_manager
-        .get_raw_session(&session_id)
-        .ok_or_else(|| "会话未找到或未连接".to_string())?;
-    sftp::sftp_read_file(raw_sess, &path)
+    let manager = ssh_manager.inner().clone();
+    run_blocking(move || {
+        let session = manager.get_sftp_session(&session_id)?;
+        sftp::sftp_read_file(session, &path)
+    })
+    .await
 }
 
 #[tauri::command]
-fn sftp_write_file(
+async fn sftp_write_file(
     session_id: String,
     path: String,
     content: String,
     ssh_manager: State<'_, SshManager>,
 ) -> Result<(), String> {
-    let raw_sess = ssh_manager
-        .get_raw_session(&session_id)
-        .ok_or_else(|| "会话未找到或未连接".to_string())?;
-    sftp::sftp_write_file(raw_sess, &path, &content)
+    let manager = ssh_manager.inner().clone();
+    run_blocking(move || {
+        let session = manager.get_sftp_session(&session_id)?;
+        sftp::sftp_write_file(session, &path, &content)
+    })
+    .await
 }
 
 #[tauri::command]
-fn sftp_mkdir(
+async fn sftp_mkdir(
     session_id: String,
     path: String,
     ssh_manager: State<'_, SshManager>,
 ) -> Result<(), String> {
-    let raw_sess = ssh_manager
-        .get_raw_session(&session_id)
-        .ok_or_else(|| "会话未找到或未连接".to_string())?;
-    sftp::sftp_mkdir(raw_sess, &path)
+    let manager = ssh_manager.inner().clone();
+    run_blocking(move || {
+        let session = manager.get_sftp_session(&session_id)?;
+        sftp::sftp_mkdir(session, &path)
+    })
+    .await
 }
 
 #[tauri::command]
-fn sftp_remove_file(
+async fn sftp_remove_file(
     session_id: String,
     path: String,
     ssh_manager: State<'_, SshManager>,
 ) -> Result<(), String> {
-    let raw_sess = ssh_manager
-        .get_raw_session(&session_id)
-        .ok_or_else(|| "会话未找到或未连接".to_string())?;
-    sftp::sftp_remove_file(raw_sess, &path)
+    let manager = ssh_manager.inner().clone();
+    run_blocking(move || {
+        let session = manager.get_sftp_session(&session_id)?;
+        sftp::sftp_remove_file(session, &path)
+    })
+    .await
 }
 
 #[tauri::command]
-fn sftp_upload_file(
+async fn sftp_upload_file(
     session_id: String,
     local_path: String,
     remote_path: String,
@@ -145,14 +175,16 @@ fn sftp_upload_file(
     ssh_manager: State<'_, SshManager>,
     app_handle: AppHandle,
 ) -> Result<(), String> {
-    let raw_sess = ssh_manager
-        .get_raw_session(&session_id)
-        .ok_or_else(|| "会话未找到或未连接".to_string())?;
-    sftp::sftp_upload_file(raw_sess, &local_path, &remote_path, &task_id, app_handle)
+    let manager = ssh_manager.inner().clone();
+    run_blocking(move || {
+        let session = manager.get_sftp_session(&session_id)?;
+        sftp::sftp_upload_file(session, &local_path, &remote_path, &task_id, app_handle)
+    })
+    .await
 }
 
 #[tauri::command]
-fn sftp_download_file(
+async fn sftp_download_file(
     session_id: String,
     remote_path: String,
     local_path: String,
@@ -160,10 +192,12 @@ fn sftp_download_file(
     ssh_manager: State<'_, SshManager>,
     app_handle: AppHandle,
 ) -> Result<(), String> {
-    let raw_sess = ssh_manager
-        .get_raw_session(&session_id)
-        .ok_or_else(|| "会话未找到或未连接".to_string())?;
-    sftp::sftp_download_file(raw_sess, &remote_path, &local_path, &task_id, app_handle)
+    let manager = ssh_manager.inner().clone();
+    run_blocking(move || {
+        let session = manager.get_sftp_session(&session_id)?;
+        sftp::sftp_download_file(session, &remote_path, &local_path, &task_id, app_handle)
+    })
+    .await
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]

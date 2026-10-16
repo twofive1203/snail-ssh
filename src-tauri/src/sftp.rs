@@ -4,7 +4,15 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
+
+/// 在线编辑器单次读取上限，避免把超大文件整个读进内存
+const MAX_EDITABLE_FILE_SIZE: u64 = 8 * 1024 * 1024;
+/// 传输块大小
+const TRANSFER_CHUNK_SIZE: usize = 64 * 1024;
+/// 进度事件最小上报间隔
+const PROGRESS_INTERVAL: Duration = Duration::from_millis(150);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SftpFileItem {
@@ -26,10 +34,70 @@ pub struct SftpFileItem {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransferProgressPayload {
+    #[serde(rename = "taskId")]
     pub task_id: String,
     pub progress: u32,
     pub speed: String,
     pub status: String,
+    pub transferred: u64,
+    pub total: u64,
+}
+
+/// 传输进度统计：按采样窗口计算瞬时速度，并限制事件频率
+struct ProgressReporter {
+    task_id: String,
+    total: u64,
+    transferred: u64,
+    window_started_at: Instant,
+    window_bytes: u64,
+}
+
+impl ProgressReporter {
+    fn new(task_id: &str, total: u64) -> Self {
+        Self {
+            task_id: task_id.to_string(),
+            total,
+            transferred: 0,
+            window_started_at: Instant::now(),
+            window_bytes: 0,
+        }
+    }
+
+    fn advance(&mut self, n: u64) {
+        self.transferred += n;
+    }
+
+    fn report(&mut self, app: &AppHandle, status: &str, force: bool) {
+        let elapsed = self.window_started_at.elapsed();
+        if !force && elapsed < PROGRESS_INTERVAL {
+            return;
+        }
+
+        let seconds = elapsed.as_secs_f64().max(0.001);
+        let bytes_in_window = self.transferred.saturating_sub(self.window_bytes);
+        let speed = bytes_in_window as f64 / seconds;
+
+        self.window_started_at = Instant::now();
+        self.window_bytes = self.transferred;
+
+        let progress = if self.total == 0 {
+            100
+        } else {
+            ((self.transferred as f64 / self.total as f64) * 100.0).min(100.0) as u32
+        };
+
+        let _ = app.emit(
+            &format!("sftp-progress-{}", self.task_id),
+            TransferProgressPayload {
+                task_id: self.task_id.clone(),
+                progress,
+                speed: format_speed(speed),
+                status: status.to_string(),
+                transferred: self.transferred,
+                total: self.total,
+            },
+        );
+    }
 }
 
 pub fn sftp_read_dir(
@@ -38,9 +106,8 @@ pub fn sftp_read_dir(
 ) -> Result<Vec<SftpFileItem>, String> {
     let sess = session_arc.lock();
     let sftp = sess.sftp().map_err(|e| format!("初始化 SFTP 失败: {}", e))?;
-    let path = Path::new(remote_path);
     let mut entries = sftp
-        .readdir(path)
+        .readdir(Path::new(remote_path))
         .map_err(|e| format!("读取远程目录失败: {}", e))?;
 
     let mut result = Vec::new();
@@ -53,50 +120,45 @@ pub fn sftp_read_dir(
             size: "-".into(),
             size_bytes: 0,
             permissions: "drwxr-xr-x (755)".into(),
-            owner: "root".into(),
-            group: "root".into(),
+            owner: "-".into(),
+            group: "-".into(),
             modified_time: "-".into(),
             editable: false,
             is_hidden: false,
         });
     }
 
-    entries.sort_by(|a, b| a.0.file_name().cmp(&b.0.file_name()));
-
-    for (p, stat) in entries {
+    for (p, stat) in entries.drain(..) {
         let name = match p.file_name() {
             Some(n) => n.to_string_lossy().to_string(),
             None => continue,
         };
-
         if name == "." || name == ".." {
             continue;
         }
 
         let is_dir = stat.is_dir();
         let size_bytes = stat.size.unwrap_or(0);
-        let size_str = if is_dir {
-            "4.0 KB".into()
-        } else {
-            format_file_size(size_bytes)
-        };
-
-        let mode = stat.perm.unwrap_or(0);
-        let perm_str = format_permissions(is_dir, mode);
-        let is_hidden = name.starts_with('.');
-        let editable = !is_dir && is_editable_file(&name);
+        let perm = stat.perm.unwrap_or(0);
 
         result.push(SftpFileItem {
-            name,
+            name: name.clone(),
             is_dir,
-            size: size_str,
+            size: if is_dir {
+                "-".into()
+            } else {
+                format_file_size(size_bytes)
+            },
             size_bytes,
-            permissions: perm_str,
-            owner: "root".into(),
-            group: "root".into(),
-            modified_time: "刚刚".into(),
-            editable,
-            is_hidden,
+            permissions: format_permissions(is_dir, perm),
+            owner: stat.uid.map(|v| v.to_string()).unwrap_or_else(|| "-".into()),
+            group: stat.gid.map(|v| v.to_string()).unwrap_or_else(|| "-".into()),
+            modified_time: stat
+                .mtime
+                .map(format_timestamp)
+                .unwrap_or_else(|| "-".into()),
+            editable: !is_dir && is_editable_file(&name),
+            is_hidden: name.starts_with('.'),
         });
     }
 
@@ -128,6 +190,15 @@ pub fn sftp_read_file(
         .open(Path::new(remote_path))
         .map_err(|e| format!("打开远程文件失败: {}", e))?;
 
+    let size = file.stat().map(|s| s.size.unwrap_or(0)).unwrap_or(0);
+    if size > MAX_EDITABLE_FILE_SIZE {
+        return Err(format!(
+            "文件过大（{}），超过在线编辑器 {} 上限，请先下载到本地",
+            format_file_size(size),
+            format_file_size(MAX_EDITABLE_FILE_SIZE)
+        ));
+    }
+
     let mut content = Vec::new();
     file.read_to_end(&mut content)
         .map_err(|e| format!("读取文件失败: {}", e))?;
@@ -148,7 +219,6 @@ pub fn sftp_write_file(
 
     file.write_all(content.as_bytes())
         .map_err(|e| format!("写入远程文件失败: {}", e))?;
-    file.flush().map_err(|e| e.to_string())?;
 
     Ok(())
 }
@@ -170,7 +240,7 @@ pub fn sftp_remove_file(
     let sess = session_arc.lock();
     let sftp = sess.sftp().map_err(|e| e.to_string())?;
     let path = Path::new(remote_path);
-    // 尝试文件删除或目录删除
+    // 先按文件删除，失败再按目录删除
     if sftp.unlink(path).is_ok() {
         Ok(())
     } else {
@@ -188,38 +258,32 @@ pub fn sftp_upload_file(
 ) -> Result<(), String> {
     let mut local_file =
         File::open(local_path).map_err(|e| format!("打开本地文件失败: {}", e))?;
-    let total_size = local_file.metadata().map(|m| m.len()).unwrap_or(1);
+    let total_size = local_file.metadata().map(|m| m.len()).unwrap_or(0);
 
     let sess = session_arc.lock();
-    let sftp = sess.sftp().map_err(|e| e.to_string())?;
+    let sftp = sess.sftp().map_err(|e| format!("初始化 SFTP 失败: {}", e))?;
     let mut remote_file = sftp
         .create(Path::new(remote_path))
         .map_err(|e| format!("创建远程文件失败: {}", e))?;
 
-    let mut buf = [0u8; 64 * 1024]; // 64KB 块缓冲
-    let mut sent = 0u64;
+    let mut reporter = ProgressReporter::new(task_id, total_size);
+    let mut buf = vec![0u8; TRANSFER_CHUNK_SIZE];
 
-    while let Ok(n) = local_file.read(&mut buf) {
+    loop {
+        let n = local_file
+            .read(&mut buf)
+            .map_err(|e| format!("读取本地文件失败: {}", e))?;
         if n == 0 {
             break;
         }
         remote_file
             .write_all(&buf[..n])
             .map_err(|e| format!("传输中断: {}", e))?;
-        sent += n as u64;
-
-        let pct = ((sent as f64 / total_size as f64) * 100.0).min(100.0) as u32;
-        let _ = app_handle.emit(
-            &format!("sftp-progress-{}", task_id),
-            TransferProgressPayload {
-                task_id: task_id.to_string(),
-                progress: pct,
-                speed: "16.5 MB/s".into(),
-                status: if pct >= 100 { "completed".into() } else { "running".into() },
-            },
-        );
+        reporter.advance(n as u64);
+        reporter.report(&app_handle, "running", false);
     }
 
+    reporter.report(&app_handle, "completed", true);
     Ok(())
 }
 
@@ -231,40 +295,39 @@ pub fn sftp_download_file(
     app_handle: AppHandle,
 ) -> Result<(), String> {
     let sess = session_arc.lock();
-    let sftp = sess.sftp().map_err(|e| e.to_string())?;
+    let sftp = sess.sftp().map_err(|e| format!("初始化 SFTP 失败: {}", e))?;
     let mut remote_file = sftp
         .open(Path::new(remote_path))
         .map_err(|e| format!("打开远程文件失败: {}", e))?;
-    let stat = remote_file.stat().map_err(|e| e.to_string())?;
-    let total_size = stat.size.unwrap_or(1);
+    let total_size = remote_file
+        .stat()
+        .map(|s| s.size.unwrap_or(0))
+        .unwrap_or(0);
 
     let mut local_file =
         File::create(local_path).map_err(|e| format!("创建本地文件失败: {}", e))?;
 
-    let mut buf = [0u8; 64 * 1024];
-    let mut downloaded = 0u64;
+    let mut reporter = ProgressReporter::new(task_id, total_size);
+    let mut buf = vec![0u8; TRANSFER_CHUNK_SIZE];
 
-    while let Ok(n) = remote_file.read(&mut buf) {
+    loop {
+        let n = remote_file
+            .read(&mut buf)
+            .map_err(|e| format!("读取远程文件失败: {}", e))?;
         if n == 0 {
             break;
         }
         local_file
             .write_all(&buf[..n])
             .map_err(|e| format!("本地写入失败: {}", e))?;
-        downloaded += n as u64;
-
-        let pct = ((downloaded as f64 / total_size as f64) * 100.0).min(100.0) as u32;
-        let _ = app_handle.emit(
-            &format!("sftp-progress-{}", task_id),
-            TransferProgressPayload {
-                task_id: task_id.to_string(),
-                progress: pct,
-                speed: "14.2 MB/s".into(),
-                status: if pct >= 100 { "completed".into() } else { "running".into() },
-            },
-        );
+        reporter.advance(n as u64);
+        reporter.report(&app_handle, "running", false);
     }
 
+    local_file
+        .flush()
+        .map_err(|e| format!("本地文件落盘失败: {}", e))?;
+    reporter.report(&app_handle, "completed", true);
     Ok(())
 }
 
@@ -277,6 +340,16 @@ fn format_file_size(bytes: u64) -> String {
         format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
     } else {
         format!("{:.2} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+    }
+}
+
+fn format_speed(bytes_per_sec: f64) -> String {
+    if bytes_per_sec < 1024.0 {
+        format!("{:.0} B/s", bytes_per_sec)
+    } else if bytes_per_sec < 1024.0 * 1024.0 {
+        format!("{:.1} KB/s", bytes_per_sec / 1024.0)
+    } else {
+        format!("{:.1} MB/s", bytes_per_sec / (1024.0 * 1024.0))
     }
 }
 
@@ -297,6 +370,35 @@ fn format_permissions(is_dir: bool, perm: u32) -> String {
     let oct = perm & 0o777;
 
     format!("{}{}{}{} ({:o})", d, user, group, other, oct)
+}
+
+/// Unix 时间戳格式化为 UTC 的 "YYYY-MM-DD HH:MM"
+fn format_timestamp(epoch_secs: u64) -> String {
+    let days = (epoch_secs / 86_400) as i64;
+    let seconds_of_day = epoch_secs % 86_400;
+    let (year, month, day) = civil_from_days(days);
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}",
+        year,
+        month,
+        day,
+        seconds_of_day / 3600,
+        (seconds_of_day % 3600) / 60
+    )
+}
+
+/// 天数（自 1970-01-01）转公历日期，见 Howard Hinnant 的 civil_from_days
+fn civil_from_days(days_since_epoch: i64) -> (i64, u32, u32) {
+    let z = days_since_epoch + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if month <= 2 { year + 1 } else { year }, month, day)
 }
 
 fn is_editable_file(name: &str) -> bool {

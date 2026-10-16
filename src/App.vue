@@ -53,8 +53,7 @@
           @close-tab="handleCloseTerminalTab"
           @add-tab="handleAddTerminalTab"
           @jump-to-sftp="handleJumpToCurrentSftp"
-          @toggle-split="triggerToast('已激活水平分屏视图', 'info')"
-          @broadcast-mode="triggerToast('多会话同步指令广播模式已就绪', 'info')"
+          @session-closed="handleSessionClosed"
         />
 
         <!-- 视图 3: SFTP 文件管理 -->
@@ -62,8 +61,8 @@
           v-else-if="activeView === 'sftp'"
           :hosts="hosts"
           :current-host="currentSftpHost"
-          :active-session-id="currentSessionId"
-          @select-host="host => currentSftpHost = host"
+          :active-session-id="currentSftpSessionId"
+          @select-host="handleConnectSftp"
           @edit-file="handleOpenEditor"
           @download-file="handleDownloadFile"
           @upload-trigger="handleUploadTrigger"
@@ -94,7 +93,7 @@
     <EditorModal
       :open="editorOpen"
       :file-path="editingFilePath"
-      :session-id="currentSessionId"
+      :session-id="currentSftpSessionId || currentSessionId"
       @close="editorOpen = false"
       @toast="triggerToast"
     />
@@ -126,7 +125,7 @@ import HostModal from '@/components/HostModal.vue'
 import EditorModal from '@/components/EditorModal.vue'
 import Toast from '@/components/Toast.vue'
 import type { HostItem, TerminalTab, TransferTask, ToastMessage } from '@/types'
-import { getHostsApi, saveHostApi, deleteHostApi, createSshSessionApi, isTauri } from '@/api/tauri'
+import { getHostsApi, saveHostApi, deleteHostApi, createSshSessionApi, closeSshSessionApi, sftpUploadFileApi, sftpDownloadFileApi, onSftpProgress, pickLocalFile, pickSavePath, isTauri } from '@/api/tauri'
 
 // 核心视图状态
 const activeView = ref<'hosts' | 'terminal' | 'sftp'>('hosts')
@@ -134,7 +133,8 @@ const selectedGroup = ref<string>('all')
 
 // 数据状态
 const hosts = ref<HostItem[]>([])
-const terminalTabs = ref<TerminalTab[]>([
+// 浏览器预览保留演示标签页；桌面端从空会话开始，避免出现无法写入的假会话
+const demoTabs: TerminalTab[] = [
   {
     id: 'tab-0',
     hostId: 'prod-k8s-master-01',
@@ -149,9 +149,13 @@ const terminalTabs = ref<TerminalTab[]>([
     sub: 'deploy@43.154.201.89',
     connected: true
   }
-])
+]
+const terminalTabs = ref<TerminalTab[]>(isTauri() ? [] : demoTabs)
 const activeTabIndex = ref(0)
 const currentSftpHost = ref<HostItem | undefined>(undefined)
+// 每个主机复用一个 SSH 会话，终端与 SFTP 共用同一个 sessionId
+const sessionByHost = new Map<string, string>()
+const currentSftpSessionId = ref<string>('')
 
 // 传输队列状态
 const transfersOpen = ref(false)
@@ -201,7 +205,8 @@ const activeTransfersCount = computed(() => {
 })
 
 const currentTransferSpeed = computed(() => {
-  return activeTransfersCount.value > 0 ? '18.4 MB/s' : '0 B/s'
+  const running = transferTasks.value.find(t => t.status === 'running')
+  return running ? running.speed : '0 B/s'
 })
 
 const groupCounts = computed(() => {
@@ -227,6 +232,10 @@ const triggerToast = (text: string, type: 'info' | 'success' | 'warning' | 'erro
 
 const switchView = (v: 'hosts' | 'terminal' | 'sftp') => {
   activeView.value = v
+  // 直接进入 SFTP 视图时，先确保该主机已建立会话
+  if (v === 'sftp' && !currentSftpSessionId.value && currentSftpHost.value) {
+    handleConnectSftp(currentSftpHost.value)
+  }
 }
 
 // 加载服务器数据
@@ -237,20 +246,34 @@ const loadHosts = async () => {
   }
 }
 
+// ==========================================
+// SSH / SFTP 会话建立（同一主机复用同一连接）
+// ==========================================
+const ensureSession = async (host: HostItem): Promise<string | null> => {
+  if (!isTauri()) return `mock-${host.id}`
+
+  const existing = sessionByHost.get(host.id)
+  if (existing && terminalTabs.value.some(t => t.id === existing)) return existing
+
+  try {
+    const res = await createSshSessionApi(host, 80, 24)
+    sessionByHost.set(host.id, res.sessionId)
+    return res.sessionId
+  } catch (e: any) {
+    triggerToast(`SSH 连接失败: ${e?.message || e}`, 'error')
+    return null
+  }
+}
+
 // SSH 直连
 const handleConnectSsh = async (host: HostItem) => {
   activeView.value = 'terminal'
   triggerToast(`正在建立 SSH 会话至 ${host.name} (${host.host})...`, 'info')
 
-  let sessionId = 'tab-' + Date.now()
-  if (isTauri()) {
-    try {
-      const res = await createSshSessionApi(host, 80, 24)
-      sessionId = res.sessionId
-    } catch (e: any) {
-      triggerToast(`SSH 连接失败: ${e?.message || e}`, 'error')
-      return
-    }
+  const sessionId = await ensureSession(host)
+  if (!sessionId) {
+    activeView.value = 'hosts'
+    return
   }
 
   const existingIdx = terminalTabs.value.findIndex(t => t.hostId === host.id)
@@ -270,26 +293,54 @@ const handleConnectSsh = async (host: HostItem) => {
   triggerToast(`已连通 ${host.name} (SSH-2.0)`, 'success')
 }
 
-// SFTP 直连
-const handleConnectSftp = (host: HostItem) => {
+// SFTP 直连：复用该主机已有的 SSH 会话
+const handleConnectSftp = async (host: HostItem) => {
   currentSftpHost.value = host
+
+  const sessionId = await ensureSession(host)
+  if (!sessionId) return
+
+  currentSftpSessionId.value = sessionId
   activeView.value = 'sftp'
-  triggerToast(`已加载 ${host.name} 的 SFTP 目录系统`, 'success')
+  triggerToast(`已连接 ${host.name} 的 SFTP 文件系统`, 'success')
+}
+
+// 远端主动断开（Shell 退出 / 链路中断）
+const handleSessionClosed = (tabId: string, reason: string) => {
+  const tab = terminalTabs.value.find(t => t.id === tabId)
+  if (tab) tab.connected = false
+  triggerToast(`会话已断开: ${reason}`, 'warning')
 }
 
 // 终端 Tab 操作
 const handleCloseTerminalTab = (index: number) => {
-  if (terminalTabs.value.length <= 1) {
-    triggerToast('至少保留一个活动终端会话', 'warning')
-    return
+  const tab = terminalTabs.value[index]
+  if (!tab) return
+
+  if (isTauri() && tab.id.startsWith('ssh-')) {
+    closeSshSessionApi(tab.id).catch(() => {})
   }
+  for (const [hostId, sessionId] of Array.from(sessionByHost.entries())) {
+    if (sessionId === tab.id) sessionByHost.delete(hostId)
+  }
+  if (currentSftpSessionId.value === tab.id) currentSftpSessionId.value = ''
+
   terminalTabs.value.splice(index, 1)
-  if (activeTabIndex.value >= terminalTabs.value.length) {
+  if (terminalTabs.value.length === 0) {
+    activeTabIndex.value = 0
+  } else if (activeTabIndex.value >= terminalTabs.value.length) {
     activeTabIndex.value = terminalTabs.value.length - 1
   }
 }
 
 const handleAddTerminalTab = () => {
+  // 真实环境下不存在“凭空新建的本地 shell”，引导用户先选主机
+  if (isTauri()) {
+    activeView.value = 'hosts'
+    triggerToast('请选择一台服务器发起 SSH 连接', 'info')
+    return
+  }
+
   const host = hosts.value[0] || {
     id: 'custom',
     name: 'shell',
@@ -301,7 +352,7 @@ const handleAddTerminalTab = () => {
     tags: []
   }
   terminalTabs.value.push({
-    id: 'tab-' + Date.now(),
+    id: 'mock-tab-' + Date.now(),
     hostId: host.id,
     title: host.name,
     sub: `${host.username}@${host.host}`,
@@ -352,63 +403,113 @@ const handleOpenEditor = (filePath: string) => {
   editorOpen.value = true
 }
 
-const handleDownloadFile = (file: any, _remotePath: string) => {
+// ==========================================
+// 文件传输（真实 SFTP 上传/下载 + 实时进度）
+// ==========================================
+const formatBytes = (bytes: number) => {
+  if (!bytes) return '0 B'
+  if (bytes < 1024) return `${bytes} B`
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`
+  return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`
+}
+
+const createTransferTask = (name: string, type: 'upload' | 'download', size = '准备中...'): TransferTask => {
   const task: TransferTask = {
-    id: 'task-' + Date.now(),
-    name: `下载: ${file.name}`,
-    type: 'download',
-    progress: 10,
-    speed: '12.4 MB/s',
-    size: file.size,
+    id: 'task-' + Date.now() + '-' + Math.floor(Math.random() * 1000),
+    name,
+    type,
+    progress: 0,
+    speed: '准备中...',
+    size,
     status: 'running'
   }
   transferTasks.value.unshift(task)
   transfersOpen.value = true
-  triggerToast(`已将 ${file.name} 添加至下载队列`, 'info')
+  return task
+}
 
-  // 进度模拟
-  const interval = setInterval(() => {
-    task.progress += 25
+// 订阅后端进度事件 -> 驱动任务卡片，结束后自动退订
+const runTransfer = async (task: TransferTask, start: (taskId: string) => Promise<void>) => {
+  const unlisten = await onSftpProgress(task.id, (payload) => {
+    task.progress = payload.progress
+    task.speed = payload.speed
+    task.size = `${formatBytes(payload.transferred)} / ${formatBytes(payload.total)}`
+  })
+
+  try {
+    await start(task.id)
+    task.progress = 100
+    task.status = 'completed'
+    task.speed = '传输完成'
+    triggerToast(`${task.name} 已完成`, 'success')
+  } catch (e: any) {
+    task.status = 'failed'
+    task.speed = `失败: ${e?.message || e}`
+    triggerToast(`传输失败: ${e?.message || e}`, 'error')
+  } finally {
+    unlisten()
+  }
+}
+
+// 浏览器预览下的进度模拟
+const runMockTransfer = (task: TransferTask) => {
+  const timer = setInterval(() => {
+    task.progress = Math.min(100, task.progress + 25)
+    task.speed = '12.4 MB/s'
     if (task.progress >= 100) {
-      task.progress = 100
       task.status = 'completed'
-      clearInterval(interval)
-      triggerToast(`文件 ${file.name} 下载完成！`, 'success')
+      task.speed = '传输完成'
+      clearInterval(timer)
     }
   }, 400)
 }
 
-const handleUploadTrigger = (remoteDir: string) => {
-  const input = document.createElement('input')
-  input.type = 'file'
-  input.onchange = (e: any) => {
-    const f = e.target?.files?.[0]
-    if (f) {
-      const task: TransferTask = {
-        id: 'task-' + Date.now(),
-        name: `上传: ${f.name} -> ${remoteDir}`,
-        type: 'upload',
-        progress: 15,
-        speed: '16.8 MB/s',
-        size: `${(f.size / 1024 / 1024).toFixed(1)} MB`,
-        status: 'running'
-      }
-      transferTasks.value.unshift(task)
-      transfersOpen.value = true
-      triggerToast(`已开始上传 ${f.name}`, 'info')
-
-      const interval = setInterval(() => {
-        task.progress += 30
-        if (task.progress >= 100) {
-          task.progress = 100
-          task.status = 'completed'
-          clearInterval(interval)
-          triggerToast(`文件 ${f.name} 上传完成！`, 'success')
-        }
-      }, 350)
-    }
+const handleDownloadFile = async (file: any, remotePath: string) => {
+  const sessionId = currentSftpSessionId.value
+  if (isTauri() && !sessionId) {
+    triggerToast('请先连接该主机的 SSH/SFTP 会话', 'warning')
+    return
   }
-  input.click()
+
+  const localPath = await pickSavePath(file.name)
+  if (isTauri() && !localPath) return
+
+  const task = createTransferTask(`下载: ${file.name}`, 'download', file.size)
+  if (!isTauri()) {
+    runMockTransfer(task)
+    return
+  }
+
+  await runTransfer(task, (taskId) =>
+    sftpDownloadFileApi(sessionId, remotePath, localPath as string, taskId)
+  )
+}
+
+const handleUploadTrigger = async (remoteDir: string) => {
+  const sessionId = currentSftpSessionId.value
+  if (isTauri() && !sessionId) {
+    triggerToast('请先连接该主机的 SSH/SFTP 会话', 'warning')
+    return
+  }
+
+  const localPath = await pickLocalFile()
+  if (isTauri() && !localPath) return
+
+  const fileName = isTauri()
+    ? (localPath as string).split(/[\\/]/).pop() || 'upload.bin'
+    : `mock-upload-${Date.now()}.tar.gz`
+
+  const task = createTransferTask(`上传: ${fileName} → ${remoteDir}`, 'upload')
+  if (!isTauri()) {
+    runMockTransfer(task)
+    return
+  }
+
+  const remotePath = remoteDir === '/' ? `/${fileName}` : `${remoteDir}/${fileName}`
+  await runTransfer(task, (taskId) =>
+    sftpUploadFileApi(sessionId, localPath as string, remotePath, taskId)
+  )
 }
 
 const handleOpenInTerminal = (path: string) => {

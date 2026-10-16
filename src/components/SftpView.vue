@@ -195,19 +195,17 @@
           {{ selectedFileNames.size > 0 ? `已选中 ${selectedFileNames.size} 项` : '未选中项目' }}
         </span>
       </div>
-      <!-- 磁盘容量指示条 -->
-      <div class="flex items-center gap-2">
-        <span class="text-[11px] font-mono text-slate-400">远端磁盘 /dev/vda1: 42.8 GB / 100 GB (42%)</span>
-        <div class="w-24 h-1.5 bg-surface-highlight rounded-full overflow-hidden">
-          <div class="h-full bg-brand-500 rounded-full" style="width: 42%;"></div>
-        </div>
+      <div class="flex items-center text-[11px] font-mono text-slate-500">
+        <span :class="activeSessionId ? 'text-emerald-400' : 'text-amber-400'">
+          {{ activeSessionId ? 'SFTP 通道已就绪' : '未建立 SSH 会话' }}
+        </span>
       </div>
     </div>
   </section>
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, watch } from 'vue'
 import type { HostItem, SftpFileItem } from '@/types'
 import { sftpReadDirApi, sftpMkdirApi, sftpRemoveFileApi } from '@/api/tauri'
 import {
@@ -266,9 +264,16 @@ const isAllSelected = computed(() => {
 })
 
 const loadFiles = async () => {
+  // 没有会话时不发请求，避免出现"会话不存在"的报错
+  if (!props.activeSessionId) {
+    files.value = []
+    selectedFileNames.value.clear()
+    return
+  }
+
   loading.value = true
   try {
-    const list = await sftpReadDirApi(props.activeSessionId || 'default', currentPath.value)
+    const list = await sftpReadDirApi(props.activeSessionId, currentPath.value)
     files.value = list
     selectedFileNames.value.clear()
   } catch (err: any) {
@@ -322,10 +327,14 @@ const triggerUpload = () => {
 }
 
 const openNewFolderPrompt = async () => {
+  if (!props.activeSessionId) {
+    emit('toast', '尚未建立 SSH 会话，无法创建目录', 'warning')
+    return
+  }
   const name = prompt('请输入新建文件夹名称:', 'new_folder')
   if (name) {
     try {
-      await sftpMkdirApi(props.activeSessionId || 'default', `${currentPath.value}/${name}`)
+      await sftpMkdirApi(props.activeSessionId, `${currentPath.value}/${name}`)
       emit('toast', `已新建文件夹: ${name}`, 'success')
       loadFiles()
     } catch (e: any) {
@@ -339,9 +348,13 @@ const handleDownload = (file: SftpFileItem) => {
 }
 
 const handleDelete = async (file: SftpFileItem) => {
+  if (!props.activeSessionId) {
+    emit('toast', '尚未建立 SSH 会话，无法删除', 'warning')
+    return
+  }
   if (confirm(`确定要删除 ${file.name} 吗？`)) {
     try {
-      await sftpRemoveFileApi(props.activeSessionId || 'default', `${currentPath.value}/${file.name}`)
+      await sftpRemoveFileApi(props.activeSessionId, `${currentPath.value}/${file.name}`)
       emit('toast', `已删除 ${file.name}`, 'warning')
       loadFiles()
     } catch (e: any) {
@@ -391,4 +404,13 @@ const getFileIconColor = (file: SftpFileItem) => {
 onMounted(() => {
   loadFiles()
 })
+
+// 主机/会话切换后重新加载当前目录
+watch(
+  () => [props.activeSessionId, props.currentHost?.id].join('|'),
+  () => {
+    currentPath.value = '/'
+    loadFiles()
+  }
+)
 </script>

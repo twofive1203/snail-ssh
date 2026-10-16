@@ -12,7 +12,7 @@
         >
           <span
             class="w-2 h-2 rounded-full"
-            :class="tab.connected ? 'bg-emerald-400 animate-pulse' : 'bg-amber-400'"
+            :class="tab.connected ? 'bg-emerald-400 animate-pulse' : 'bg-rose-500'"
           ></span>
           <span class="font-mono font-medium">{{ tab.title }}</span>
           <span class="text-[10px] font-mono text-slate-500 hidden sm:inline">{{ tab.sub }}</span>
@@ -28,7 +28,7 @@
         <button
           @click="$emit('add-tab')"
           class="p-1 rounded-md text-surface-subtle hover:text-white hover:bg-surface-card transition-colors ml-1"
-          title="打开新终端"
+          title="连接新的服务器终端"
         >
           <Plus class="w-4 h-4" />
         </button>
@@ -46,27 +46,11 @@
         </button>
 
         <button
-          @click="$emit('toggle-split')"
-          class="p-1.5 rounded hover:bg-surface-elevated text-surface-subtle hover:text-white transition-colors"
-          title="水平/垂直分屏"
-        >
-          <Columns2 class="w-3.5 h-3.5" />
-        </button>
-
-        <button
           @click="clearCurrentTerminal"
           class="p-1.5 rounded hover:bg-surface-elevated text-surface-subtle hover:text-white transition-colors"
-          title="清除屏幕"
+          title="清除屏幕 (Ctrl+L)"
         >
           <Eraser class="w-3.5 h-3.5" />
-        </button>
-
-        <button
-          @click="$emit('broadcast-mode')"
-          class="p-1.5 rounded hover:bg-surface-elevated text-surface-subtle hover:text-white transition-colors"
-          title="多会话指令广播 (Broadcast)"
-        >
-          <Radio class="w-3.5 h-3.5" />
         </button>
       </div>
     </div>
@@ -82,7 +66,8 @@
           v-for="s in snippets"
           :key="s.label"
           @click="sendSnippetCommand(s.cmd)"
-          class="px-2 py-0.5 rounded bg-surface-card hover:bg-surface-elevated text-[11px] font-mono text-slate-300 hover:text-brand-300 border border-surface-border transition-colors shrink-0"
+          :disabled="!currentTab"
+          class="px-2 py-0.5 rounded bg-surface-card hover:bg-surface-elevated text-[11px] font-mono text-slate-300 hover:text-brand-300 border border-surface-border transition-colors shrink-0 disabled:opacity-40 disabled:cursor-not-allowed"
         >
           {{ s.label }}
         </button>
@@ -94,17 +79,32 @@
       </div>
     </div>
 
-    <!-- 真实 xterm.js 容器 -->
+    <!-- 真实 xterm.js 容器：每个标签页一个独立实例，切换不丢回显 -->
     <div class="flex-1 w-full h-full relative overflow-hidden bg-[#0c0e14] p-2">
-      <div ref="terminalContainerRef" class="w-full h-full"></div>
+      <div
+        v-if="tabs.length === 0"
+        class="w-full h-full flex flex-col items-center justify-center gap-3 text-center"
+      >
+        <TerminalIcon class="w-10 h-10 text-slate-600" />
+        <p class="text-sm text-slate-400">当前没有活动的终端会话</p>
+        <p class="text-xs text-slate-500 font-mono">请在「服务器资产」中选择主机并点击「连接 SSH」，或用 Ctrl+K 快速直连</p>
+      </div>
+
+      <div
+        v-for="tab in tabs"
+        :key="tab.id"
+        :ref="el => setContainer(tab.id, el)"
+        class="w-full h-full"
+        :style="{ display: tab.id === currentTabId ? 'block' : 'none' }"
+      ></div>
     </div>
 
     <!-- 终端状态栏 -->
     <div class="h-6 bg-surface-sidebar border-t border-surface-border px-3 flex items-center justify-between text-[11px] font-mono text-surface-subtle shrink-0">
       <div class="flex items-center gap-3">
-        <span class="flex items-center gap-1.5 text-emerald-400">
-          <span class="w-1.5 h-1.5 rounded-full bg-emerald-400"></span>
-          <span>SSH 协议就绪 (OpenSSH 2.0 / Pty)</span>
+        <span class="flex items-center gap-1.5" :class="currentTab?.connected ? 'text-emerald-400' : 'text-rose-400'">
+          <span class="w-1.5 h-1.5 rounded-full" :class="currentTab?.connected ? 'bg-emerald-400' : 'bg-rose-400'"></span>
+          <span>{{ currentTab?.connected ? 'SSH 协议就绪 (OpenSSH 2.0 / Pty)' : '会话未连接' }}</span>
         </span>
         <span>编码: UTF-8</span>
       </div>
@@ -116,33 +116,41 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted, onBeforeUnmount, watch, nextTick } from 'vue'
+import { ref, computed, watch, nextTick, onMounted, onBeforeUnmount } from 'vue'
 import { Terminal as Xterm } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import { WebLinksAddon } from '@xterm/addon-web-links'
-import { X, Plus, FolderGit2, Columns2, Eraser, Radio, Zap } from 'lucide-vue-next'
+import { X, Plus, FolderGit2, Eraser, Zap, Terminal as TerminalIcon } from 'lucide-vue-next'
 import type { TerminalTab } from '@/types'
-import { writeSshSessionApi, resizeSshSessionApi, onSshStdout, isTauri } from '@/api/tauri'
+import {
+  writeSshSessionApi,
+  resizeSshSessionApi,
+  onSshStdout,
+  onSshClosed,
+  isTauri
+} from '@/api/tauri'
 
 const props = defineProps<{
   tabs: TerminalTab[]
   activeTabIndex: number
 }>()
 
-defineEmits<{
+const emit = defineEmits<{
   (e: 'switch-tab', index: number): void
   (e: 'close-tab', index: number): void
   (e: 'add-tab'): void
   (e: 'jump-to-sftp'): void
-  (e: 'toggle-split'): void
-  (e: 'broadcast-mode'): void
+  (e: 'session-closed', tabId: string, reason: string): void
 }>()
 
-const terminalContainerRef = ref<HTMLDivElement | null>(null)
-let xtermInstance: Xterm | null = null
-let fitAddon: FitAddon | null = null
-let unlistenStdout: (() => void) | null = null
-const termSize = ref<{ cols: number; rows: number }>({ cols: 80, rows: 24 })
+interface TerminalSession {
+  term: Xterm
+  fit: FitAddon
+  container: HTMLDivElement
+  inputBuffer: string
+  unlisten: Array<() => void>
+  writeFailed: boolean
+}
 
 const snippets = [
   { label: 'docker ps', cmd: 'docker ps\n' },
@@ -153,97 +161,177 @@ const snippets = [
   { label: 'htop', cmd: 'htop\n' },
 ]
 
-const initTerminal = () => {
-  if (!terminalContainerRef.value) return
+const terminalTheme = {
+  background: '#0c0e14',
+  foreground: '#e2e8f0',
+  cursor: '#10b981',
+  selectionBackground: 'rgba(16, 185, 129, 0.3)',
+  black: '#1e293b',
+  red: '#ef4444',
+  green: '#10b981',
+  yellow: '#f59e0b',
+  blue: '#06b6d4',
+  magenta: '#d946ef',
+  cyan: '#38bdf8',
+  white: '#f8fafc',
+}
 
-  // 销毁旧实例
-  if (xtermInstance) {
-    xtermInstance.dispose()
-    xtermInstance = null
+const containerMap = new Map<string, HTMLDivElement>()
+const sessions = new Map<string, TerminalSession>()
+const termSize = ref<{ cols: number; rows: number }>({ cols: 80, rows: 24 })
+
+const currentTabId = computed(() => props.tabs[props.activeTabIndex]?.id ?? '')
+const currentTab = computed(() => props.tabs[props.activeTabIndex])
+const currentSession = computed(() => sessions.get(currentTabId.value))
+
+const setContainer = (tabId: string, el: any) => {
+  if (el) {
+    containerMap.set(tabId, el as HTMLDivElement)
+  } else {
+    containerMap.delete(tabId)
   }
+}
 
+const createSession = (tab: TerminalTab, container: HTMLDivElement): TerminalSession => {
   const term = new Xterm({
     fontFamily: '"JetBrains Mono", "Fira Code", monospace',
     fontSize: 13,
     lineHeight: 1.3,
     cursorBlink: true,
     cursorStyle: 'block',
-    theme: {
-      background: '#0c0e14',
-      foreground: '#e2e8f0',
-      cursor: '#10b981',
-      selectionBackground: 'rgba(16, 185, 129, 0.3)',
-      black: '#1e293b',
-      red: '#ef4444',
-      green: '#10b981',
-      yellow: '#f59e0b',
-      blue: '#06b6d4',
-      magenta: '#d946ef',
-      cyan: '#38bdf8',
-      white: '#f8fafc',
-    },
+    theme: terminalTheme,
     allowProposedApi: true,
   })
 
-  fitAddon = new FitAddon()
-  term.loadAddon(fitAddon)
+  const fit = new FitAddon()
+  term.loadAddon(fit)
   term.loadAddon(new WebLinksAddon())
 
-  term.open(terminalContainerRef.value)
-  fitAddon.fit()
+  const session: TerminalSession = { term, fit, container, inputBuffer: '', unlisten: [], writeFailed: false }
 
-  termSize.value = { cols: term.cols, rows: term.rows }
+  term.open(container)
 
   // 绑定用户输入
   term.onData((data) => {
-    const currentTab = props.tabs[props.activeTabIndex]
-    if (!currentTab) return
-
     if (isTauri()) {
-      writeSshSessionApi(currentTab.id, data)
+      writeSshSessionApi(tab.id, data).catch((err: any) => {
+        if (session.writeFailed) return
+        session.writeFailed = true
+        term.write(`\r\n\x1b[31m[写入失败] ${err?.message || err}\x1b[0m\r\n`)
+      })
     } else {
-      // 浏览器预览 Mock 响应
-      handleMockTerminalInput(term, data)
+      handleMockTerminalInput(session, data)
     }
   })
 
-  // 监听窗口缩放
+  // 窗口尺寸变化时同步给远端 PTY
   term.onResize(({ cols, rows }) => {
+    if (tab.id !== currentTabId.value) return
     termSize.value = { cols, rows }
-    const currentTab = props.tabs[props.activeTabIndex]
-    if (currentTab && isTauri()) {
-      resizeSshSessionApi(currentTab.id, cols, rows)
+    if (isTauri()) {
+      resizeSshSessionApi(tab.id, cols, rows).catch(() => {})
     }
   })
 
-  xtermInstance = term
+  // 真实会话不打印假欢迎信息，避免误导连接状态；仅浏览器预览时输出演示横幅
+  if (!isTauri()) {
+    printMockBanner(term)
+  }
 
-  // 打印欢迎信息或连接
-  printWelcomeMotd(term)
-  bindSessionStdout()
+  return session
 }
 
-// 终端标准 MOTD 输出
-const printWelcomeMotd = (term: Xterm) => {
-  term.write('\r\n\x1b[1;32m   _____             _ _   _____ _____ _    _ \x1b[0m\r\n')
-  term.write('\x1b[1;32m  / ____|           (_) | / ____/ ____| |  | |\x1b[0m\r\n')
-  term.write('\x1b[1;32m | (___  _ __   __ _ _| || (___| (___ | |__| |\x1b[0m\r\n')
-  term.write('\x1b[1;32m  \\___ \\| \'_ \\ / _` | | | \\___ \\\\___ \\|  __  |\x1b[0m\r\n')
-  term.write('\x1b[1;32m  ____) | | | | (_| | | | ____) |___) | |  | |\x1b[0m\r\n')
-  term.write('\x1b[1;32m |_____/|_| |_|\\__,_|_|_||_____/_____/|_|  |_|\x1b[0m\r\n\r\n')
-  term.write('\x1b[90mConnected via SSH-2.0-OpenSSH_8.9p1 Ubuntu (x86_64)\x1b[0m\r\n')
-  term.write('\x1b[36mLast login: Fri Feb 20 18:24:12 2025 from 123.120.45.67\x1b[0m\r\n\r\n')
-  term.write('\x1b[1;32mroot@k8s-master\x1b[0m:\x1b[1;34m~\x1b[0m\x1b[1;32m# \x1b[0m')
+const bindSessionEvents = async (tab: TerminalTab, session: TerminalSession) => {
+  if (!isTauri()) return
+  const unlistenStdout = await onSshStdout(tab.id, (chunk) => {
+    session.term.write(chunk)
+  })
+  const unlistenClosed = await onSshClosed(tab.id, (reason) => {
+    session.term.write(`\r\n\x1b[33m[会话结束] ${reason}\x1b[0m\r\n`)
+    emit('session-closed', tab.id, reason)
+  })
+  session.unlisten.push(unlistenStdout, unlistenClosed)
 }
 
-// 模拟打字响应逻辑 (浏览器开发降级)
-let currentInputBuffer = ''
-const handleMockTerminalInput = (term: Xterm, data: string) => {
+/** 按标签页同步 xterm 实例：新增则创建，移除则销毁 */
+const syncSessions = async () => {
+  await nextTick()
+
+  for (const [tabId, session] of sessions) {
+    if (props.tabs.some(t => t.id === tabId)) continue
+    session.unlisten.forEach(fn => fn())
+    session.term.dispose()
+    sessions.delete(tabId)
+  }
+
+  for (const tab of props.tabs) {
+    if (sessions.has(tab.id)) continue
+    const container = containerMap.get(tab.id)
+    if (!container) continue
+    const session = createSession(tab, container)
+    sessions.set(tab.id, session)
+    // 可见元素才能量出真实行列数，隐藏的标签页等切换时再 fit
+    if (container.offsetParent) {
+      session.fit.fit()
+      termSize.value = { cols: session.term.cols, rows: session.term.rows }
+    }
+    await bindSessionEvents(tab, session)
+  }
+
+  fitActive()
+}
+
+const fitActive = () => {
+  const session = sessions.get(currentTabId.value)
+  if (!session || !session.container.offsetParent) return
+  session.fit.fit()
+  termSize.value = { cols: session.term.cols, rows: session.term.rows }
+}
+
+const clearCurrentTerminal = () => {
+  const session = currentSession.value
+  if (!session) return
+  if (isTauri()) {
+    // 交给远端 Shell 执行清屏，保留当前提示符
+    writeSshSessionApi(currentTabId.value, '\x0c').catch(() => {})
+  } else {
+    session.term.clear()
+  }
+}
+
+const sendSnippetCommand = (cmd: string) => {
+  const session = currentSession.value
+  const tab = currentTab.value
+  if (!session || !tab) return
+  if (isTauri()) {
+    writeSshSessionApi(tab.id, cmd).catch((err: any) => {
+      session.term.write(`\r\n\x1b[31m[写入失败] ${err?.message || err}\x1b[0m\r\n`)
+    })
+  } else {
+    session.term.write(cmd)
+    handleMockTerminalInput(session, '\r')
+  }
+}
+
+// ==========================================
+// 浏览器预览 (非 Tauri) 降级：模拟终端打字响应
+// ==========================================
+const printMockBanner = (term: Xterm) => {
+  term.write('\r\n\x1b[1;36m SnailSSH 浏览器预览模式（未连接真实主机）\x1b[0m\r\n')
+  term.write('\x1b[90m在桌面客户端中运行可建立真实 SSH 会话。\x1b[0m\r\n\r\n')
+  term.write('\x1b[1;32mpreview@snail-ssh\x1b[0m:\x1b[1;34m~\x1b[0m\x1b[1;32m$ \x1b[0m')
+}
+
+const writeMockPrompt = (term: Xterm) => {
+  term.write('\x1b[1;32mpreview@snail-ssh\x1b[0m:\x1b[1;34m~\x1b[0m\x1b[1;32m$ \x1b[0m')
+}
+
+const handleMockTerminalInput = (session: TerminalSession, data: string) => {
+  const { term } = session
   if (data === '\r') {
-    // 回车
     term.write('\r\n')
-    const cmd = currentInputBuffer.trim()
-    currentInputBuffer = ''
+    const cmd = session.inputBuffer.trim()
+    session.inputBuffer = ''
     if (cmd === 'clear') {
       term.clear()
     } else if (cmd === 'docker ps') {
@@ -257,76 +345,42 @@ const handleMockTerminalInput = (term: Xterm, data: string) => {
     } else if (cmd.length > 0) {
       term.write(`\x1b[33mCommand executed: ${cmd} (exit: 0)\x1b[0m\r\n`)
     }
-    term.write('\x1b[1;32mroot@k8s-master\x1b[0m:\x1b[1;34m~\x1b[0m\x1b[1;32m# \x1b[0m')
+    writeMockPrompt(term)
   } else if (data === '\u007F') {
-    // 退格
-    if (currentInputBuffer.length > 0) {
-      currentInputBuffer = currentInputBuffer.slice(0, -1)
+    if (session.inputBuffer.length > 0) {
+      session.inputBuffer = session.inputBuffer.slice(0, -1)
       term.write('\b \b')
     }
+  } else if (data === '\x0c') {
+    term.clear()
+    writeMockPrompt(term)
   } else {
-    currentInputBuffer += data
+    session.inputBuffer += data
     term.write(data)
   }
 }
 
-const bindSessionStdout = async () => {
-  if (unlistenStdout) {
-    unlistenStdout()
-    unlistenStdout = null
-  }
-  const currentTab = props.tabs[props.activeTabIndex]
-  if (!currentTab) return
+const handleWindowResize = () => fitActive()
 
-  if (isTauri()) {
-    unlistenStdout = await onSshStdout(currentTab.id, (chunk) => {
-      if (xtermInstance) {
-        xtermInstance.write(chunk)
-      }
-    })
-  }
-}
-
-const sendSnippetCommand = (cmd: string) => {
-  if (!xtermInstance) return
-  const currentTab = props.tabs[props.activeTabIndex]
-  if (currentTab && isTauri()) {
-    writeSshSessionApi(currentTab.id, cmd)
-  } else {
-    xtermInstance.write(cmd)
-    handleMockTerminalInput(xtermInstance, '\r')
-  }
-}
-
-const clearCurrentTerminal = () => {
-  if (xtermInstance) {
-    xtermInstance.clear()
-    xtermInstance.write('\x1b[1;32mroot@k8s-master\x1b[0m:\x1b[1;34m~\x1b[0m\x1b[1;32m# \x1b[0m')
-  }
-}
-
-const handleWindowResize = () => {
-  if (fitAddon) {
-    fitAddon.fit()
-  }
-}
-
-watch(() => props.activeTabIndex, () => {
-  nextTick(() => {
-    initTerminal()
-  })
+// 标签页增删 -> 创建/销毁终端实例
+watch(() => props.tabs.map(t => t.id).join('|'), () => { syncSessions() })
+// 切换标签页 -> 重新计算尺寸（隐藏时无法 fit）
+watch(() => props.activeTabIndex, async () => {
+  await nextTick()
+  fitActive()
 })
 
-onMounted(() => {
-  nextTick(() => {
-    initTerminal()
-    window.addEventListener('resize', handleWindowResize)
-  })
+onMounted(async () => {
+  window.addEventListener('resize', handleWindowResize)
+  await syncSessions()
 })
 
 onBeforeUnmount(() => {
   window.removeEventListener('resize', handleWindowResize)
-  if (unlistenStdout) unlistenStdout()
-  if (xtermInstance) xtermInstance.dispose()
+  for (const session of sessions.values()) {
+    session.unlisten.forEach(fn => fn())
+    session.term.dispose()
+  }
+  sessions.clear()
 })
 </script>

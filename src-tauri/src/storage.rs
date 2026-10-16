@@ -15,6 +15,8 @@ pub struct HostItem {
     pub password: Option<String>,
     #[serde(default, rename = "privateKey")]
     pub private_key: Option<String>,
+    #[serde(default)]
+    pub passphrase: Option<String>,
     pub group: String,
     #[serde(default)]
     pub tags: Vec<String>,
@@ -94,6 +96,7 @@ fn get_default_mock_hosts() -> Vec<HostItem> {
             auth_type: "key".into(),
             password: None,
             private_key: None,
+            passphrase: None,
             group: "production".into(),
             tags: vec!["k8s".into(), "master".into(), "aliyun-hz".into()],
             os: Some("ubuntu".into()),
@@ -114,6 +117,7 @@ fn get_default_mock_hosts() -> Vec<HostItem> {
             auth_type: "password".into(),
             password: None,
             private_key: None,
+            passphrase: None,
             group: "staging".into(),
             tags: vec!["nginx".into(), "gateway".into(), "hk-node".into()],
             os: Some("debian".into()),

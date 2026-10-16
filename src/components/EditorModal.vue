@@ -79,19 +79,26 @@ const lineCount = computed(() => {
 })
 
 watch(() => props.open, async (val) => {
-  if (val && props.filePath) {
-    try {
-      content.value = await sftpReadFileApi(props.sessionId || 'default', props.filePath)
-    } catch (err: any) {
-      emit('toast', `读取文件失败: ${err?.message || err}`, 'error')
-    }
+  if (!val || !props.filePath) return
+  if (!props.sessionId) {
+    emit('toast', '尚未建立 SSH 会话，无法读取远程文件', 'warning')
+    return
+  }
+  try {
+    content.value = await sftpReadFileApi(props.sessionId, props.filePath)
+  } catch (err: any) {
+    emit('toast', `读取文件失败: ${err?.message || err}`, 'error')
   }
 })
 
 const handleSave = async () => {
+  if (!props.sessionId) {
+    emit('toast', '尚未建立 SSH 会话，无法写入远程文件', 'warning')
+    return
+  }
   saving.value = true
   try {
-    await sftpWriteFileApi(props.sessionId || 'default', props.filePath, content.value)
+    await sftpWriteFileApi(props.sessionId, props.filePath, content.value)
     emit('toast', '文件已成功写入远程服务器！', 'success')
     emit('close')
   } catch (err: any) {

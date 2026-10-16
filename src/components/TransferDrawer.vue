@@ -49,9 +49,9 @@
           </div>
           <span
             class="font-mono text-[11px] font-semibold shrink-0"
-            :class="task.status === 'completed' ? 'text-emerald-400' : 'text-brand-400'"
+            :class="task.status === 'completed' ? 'text-emerald-400' : task.status === 'failed' ? 'text-rose-400' : 'text-brand-400'"
           >
-            {{ task.status === 'completed' ? '完成' : `${task.progress}%` }}
+            {{ task.status === 'completed' ? '完成' : task.status === 'failed' ? '失败' : `${task.progress}%` }}
           </span>
         </div>
 

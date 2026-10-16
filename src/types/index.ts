@@ -43,6 +43,15 @@ export interface SftpFileItem {
   isHidden: boolean
 }
 
+export interface SftpProgressPayload {
+  taskId: string
+  progress: number
+  speed: string
+  status: 'running' | 'completed' | 'failed'
+  transferred: number
+  total: number
+}
+
 export interface TransferTask {
   id: string
   name: string

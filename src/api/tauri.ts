@@ -1,6 +1,7 @@
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
-import type { HostItem, SftpFileItem } from '@/types'
+import { open as openDialog, save as saveDialog } from '@tauri-apps/plugin-dialog'
+import type { HostItem, SftpFileItem, SftpProgressPayload } from '@/types'
 
 // 检测是否处于 Tauri 环境
 export const isTauri = (): boolean => {
@@ -189,6 +190,7 @@ export async function createSshSessionApi(host: HostItem, cols: number, rows: nu
         auth_type: host.authType,
         password: host.password || null,
         private_key: host.privateKey || null,
+        passphrase: host.passphrase || null,
         cols,
         rows,
       }
@@ -222,6 +224,31 @@ export async function onSshStdout(sessionId: string, callback: (data: string) =>
     })
   }
   return () => {}
+}
+
+// 远端主动关闭 Shell / 连接中断通知
+export async function onSshClosed(sessionId: string, callback: (reason: string) => void): Promise<UnlistenFn> {
+  if (isTauri()) {
+    return await listen<string>(`ssh-closed-${sessionId}`, (event) => {
+      callback(event.payload)
+    })
+  }
+  return () => {}
+}
+
+// ==========================================
+// 本地文件选择 / 保存路径选择 (Tauri Dialog)
+// ==========================================
+export async function pickLocalFile(): Promise<string | null> {
+  if (!isTauri()) return null
+  const selected = await openDialog({ multiple: false, directory: false })
+  return typeof selected === 'string' ? selected : null
+}
+
+export async function pickSavePath(defaultFileName: string): Promise<string | null> {
+  if (!isTauri()) return null
+  const selected = await saveDialog({ defaultPath: defaultFileName })
+  return selected ?? null
 }
 
 // ==========================================
@@ -319,4 +346,14 @@ export async function sftpDownloadFileApi(sessionId: string, remotePath: string,
   if (isTauri()) {
     await invoke('sftp_download_file', { sessionId, remotePath, localPath, taskId })
   }
+}
+
+// 监听单次传输任务的实时进度（bytes/进度/速度）
+export async function onSftpProgress(taskId: string, callback: (payload: SftpProgressPayload) => void): Promise<UnlistenFn> {
+  if (isTauri()) {
+    return await listen<SftpProgressPayload>(`sftp-progress-${taskId}`, (event) => {
+      callback(event.payload)
+    })
+  }
+  return () => {}
 }
