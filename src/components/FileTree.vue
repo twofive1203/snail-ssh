@@ -60,6 +60,16 @@
           <Upload class="w-3.5 h-3.5" />
         </button>
 
+        <!-- 下载选中项 (文件或目录) -->
+        <button
+          v-if="selectedNode"
+          @click="downloadSelectedNode"
+          class="p-1 rounded text-slate-400 hover:text-cyan-300 hover:bg-surface-elevated transition-colors"
+          :title="selectedNode.isDir ? `下载目录「${selectedNode.name}」到本地` : `下载「${selectedNode.name}」到本地`"
+        >
+          <Download class="w-3.5 h-3.5" />
+        </button>
+
         <!-- 新建文件夹 -->
         <button
           @click="createNewFolder"
@@ -200,7 +210,7 @@
           :key="file.path"
           @click="handleSelectNode(file)"
           @dblclick="file.isDir ? handleToggleNode(file) : handleOpenFile(file)"
-          @contextmenu.prevent="handleNodeContextMenu($event, file)"
+          @contextmenu.prevent.stop="handleNodeContextMenu($event, file)"
           class="flex items-center justify-between px-2 py-1.5 rounded cursor-pointer text-xs font-mono transition-colors"
           :class="selectedPath === file.path ? 'bg-brand-500/25 text-emerald-300 font-semibold border-l-2 border-brand-500' : 'hover:bg-surface-card/70 text-slate-300'"
         >
@@ -397,13 +407,13 @@ const contextMenuItems = computed<ContextMenuItem[]>(() => {
 
   const items: ContextMenuItem[] = []
   if (!node.isDir) {
+    items.push({ key: 'download', label: '下载到本地', icon: Download })
     if (node.editable) {
       items.push({ key: 'edit', label: '在线编辑代码', icon: Edit3 })
     }
-    items.push({ key: 'download', label: '下载到本地', icon: Download })
   } else {
-    items.push({ key: 'open-term', label: '在右侧终端打开', icon: Terminal })
     items.push({ key: 'download-dir', label: '下载整个目录', icon: Download })
+    items.push({ key: 'open-term', label: '在右侧终端打开', icon: Terminal })
   }
 
   items.push({ divider: true })
@@ -524,7 +534,7 @@ const handleOpenFile = (node: FileTreeNode) => {
       editable: node.editable,
       isHidden: node.isHidden
     }
-    emit('download-file', sftpItem, currentPath.value)
+    emit('download-file', sftpItem, node.path)
   }
 }
 
@@ -605,6 +615,9 @@ const createNewFolder = async () => {
 
 // 右键处理
 const handleNodeContextMenu = (evt: MouseEvent, node: FileTreeNode) => {
+  evt.stopPropagation()
+  selectedPath.value = node.path
+  selectedNode.value = node
   contextMenu.value = {
     open: true,
     x: evt.clientX,
@@ -631,6 +644,7 @@ const handleContextMenuSelect = async (item: ContextMenuItem) => {
       if (node) emit('edit-file', node.path)
       break
     case 'download':
+    case 'download-dir':
       if (node) {
         const sftpItem: SftpFileItem = {
           name: node.name,
@@ -644,7 +658,7 @@ const handleContextMenuSelect = async (item: ContextMenuItem) => {
           editable: node.editable,
           isHidden: node.isHidden
         }
-        emit('download-file', sftpItem, currentPath.value)
+        emit('download-file', sftpItem, node.path)
       }
       break
     case 'open-term': {
@@ -689,6 +703,24 @@ const handleContextMenuSelect = async (item: ContextMenuItem) => {
       triggerUpload()
       break
   }
+}
+
+const downloadSelectedNode = () => {
+  const node = selectedNode.value
+  if (!node) return
+  const sftpItem: SftpFileItem = {
+    name: node.name,
+    isDir: node.isDir,
+    size: node.size,
+    sizeBytes: node.sizeBytes,
+    permissions: node.permissions,
+    owner: node.owner,
+    group: node.group,
+    modifiedTime: node.modifiedTime,
+    editable: node.editable,
+    isHidden: node.isHidden
+  }
+  emit('download-file', sftpItem, node.path)
 }
 
 watch(

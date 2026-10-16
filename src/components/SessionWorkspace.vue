@@ -73,6 +73,7 @@ import type { HostSession, SftpFileItem } from '@/types'
 const props = defineProps<{
   session: HostSession
   refreshSignal?: number
+  isActive?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -179,6 +180,19 @@ watch(
     if (enabled) {
       nextTick(() => {
         performAutoSync()
+      })
+    }
+  }
+)
+
+watch(
+  () => props.isActive,
+  async (active) => {
+    if (active) {
+      await nextTick()
+      requestAnimationFrame(() => {
+        terminalRef.value?.fit()
+        terminalRef.value?.focus()
       })
     }
   }

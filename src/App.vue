@@ -18,7 +18,7 @@
     <!-- 2. 主体工作区 -->
     <div class="flex flex-1 overflow-hidden relative">
       <!-- 视图 A: 服务器资产管理 (activeSessionId === 'hosts') -->
-      <div v-if="activeSessionId === 'hosts'" class="flex flex-1 overflow-hidden">
+      <div v-show="activeSessionId === 'hosts'" class="flex flex-1 overflow-hidden">
         <!-- 主机分类侧边栏 -->
         <Sidebar
           active-view="hosts"
@@ -52,29 +52,28 @@
       </div>
 
       <!-- 视图 B: 主机会话协同工作区 (左侧树形文件 + 右侧交互终端) -->
-      <template v-else>
-        <SessionWorkspace
-          v-for="s in sessions"
-          :key="s.id"
-          v-show="s.id === activeSessionId"
-          :session="s"
-          :refresh-signal="sftpRefreshSignal"
-          @switch-terminal-tab="(idx: number) => s.activeTerminalIndex = idx"
-          @close-terminal-tab="(idx: number) => handleCloseSessionTerminalTab(s, idx)"
-          @add-terminal-tab="() => handleAddTerminalTab(s)"
-          @duplicate-terminal-tab="() => handleDuplicateTerminalTab(s)"
-          @reconnect-terminal-tab="(idx: number) => handleReconnectTerminalTab(s, idx)"
-          @rename-terminal-tab="(idx: number) => handleRenameTerminalTab(s, idx)"
-          @copy-terminal-info="(idx: number, kind: 'ip' | 'login' | 'ssh-command') => handleCopyTerminalInfo(s, idx, kind)"
-          @close-other-terminal-tabs="(idx: number) => handleCloseOtherTerminalTabs(s, idx)"
-          @close-tabs-after="(idx: number) => handleCloseTerminalTabsAfter(s, idx)"
-          @session-closed="(tabId: string, reason: string) => handleSessionClosed(s, tabId, reason)"
-          @edit-file="handleOpenEditor"
-          @download-file="(file: SftpFileItem, path: string) => handleDownloadFile(s, file, path)"
-          @upload-trigger="(dir: string) => handleUploadTrigger(s, dir)"
-          @toast="triggerToast"
-        />
-      </template>
+      <SessionWorkspace
+        v-for="s in sessions"
+        :key="s.id"
+        v-show="s.id === activeSessionId"
+        :session="s"
+        :is-active="s.id === activeSessionId"
+        :refresh-signal="sftpRefreshSignal"
+        @switch-terminal-tab="(idx: number) => s.activeTerminalIndex = idx"
+        @close-terminal-tab="(idx: number) => handleCloseSessionTerminalTab(s, idx)"
+        @add-terminal-tab="() => handleAddTerminalTab(s)"
+        @duplicate-terminal-tab="() => handleDuplicateTerminalTab(s)"
+        @reconnect-terminal-tab="(idx: number) => handleReconnectTerminalTab(s, idx)"
+        @rename-terminal-tab="(idx: number) => handleRenameTerminalTab(s, idx)"
+        @copy-terminal-info="(idx: number, kind: 'ip' | 'login' | 'ssh-command') => handleCopyTerminalInfo(s, idx, kind)"
+        @close-other-terminal-tabs="(idx: number) => handleCloseOtherTerminalTabs(s, idx)"
+        @close-tabs-after="(idx: number) => handleCloseTerminalTabsAfter(s, idx)"
+        @session-closed="(tabId: string, reason: string) => handleSessionClosed(s, tabId, reason)"
+        @edit-file="handleOpenEditor"
+        @download-file="(file: SftpFileItem, path: string) => handleDownloadFile(s, file, path)"
+        @upload-trigger="(dir: string) => handleUploadTrigger(s, dir)"
+        @toast="triggerToast"
+      />
 
       <!-- 传输任务浮动抽屉 -->
       <TransferDrawer
@@ -144,6 +143,7 @@ import {
   probeHostInfoApi,
   sftpUploadFileApi,
   sftpDownloadFileApi,
+  sftpDownloadDirApi,
   onSftpProgress,
   pickLocalFile,
   pickSavePath,
@@ -673,11 +673,22 @@ const handleDownloadFile = async (session: HostSession, file: SftpFileItem, remo
   const localPath = await pickSavePath(file.name)
   if (!localPath) return
 
-  const fullRemote = remotePath === '/' ? `/${file.name}` : `${remotePath}/${file.name}`
+  // 计算远程绝对路径：如果 remotePath 已包含文件名或以文件名结尾，则直接使用；否则进行拼接
+  let fullRemote = remotePath
+  if (!fullRemote.endsWith('/' + file.name) && fullRemote !== file.name) {
+    fullRemote = remotePath === '/' ? `/${file.name}` : `${remotePath.replace(/\/+$/, '')}/${file.name}`
+  }
+
   const task = createTransferTask(`下载: ${file.name}`, 'download', file.size)
-  await runTransfer(task, (taskId) =>
-    sftpDownloadFileApi(sessionId, fullRemote, localPath, taskId)
-  )
+  if (file.isDir) {
+    await runTransfer(task, (taskId) =>
+      sftpDownloadDirApi(sessionId, fullRemote, localPath, taskId)
+    )
+  } else {
+    await runTransfer(task, (taskId) =>
+      sftpDownloadFileApi(sessionId, fullRemote, localPath, taskId)
+    )
+  }
 }
 
 const handleUploadTrigger = async (session: HostSession, remoteDir: string) => {

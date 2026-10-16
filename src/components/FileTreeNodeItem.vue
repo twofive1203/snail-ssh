@@ -10,7 +10,7 @@
       :style="{ paddingLeft: `${depth * 14 + 8}px` }"
       @click="handleClick"
       @dblclick="handleDoubleClick"
-      @contextmenu.prevent="handleContextMenu($event)"
+      @contextmenu.prevent.stop="handleContextMenu($event)"
     >
       <!-- 展开/折叠箭头（仅文件夹展示） -->
       <button
@@ -197,6 +197,7 @@ const handleDoubleClick = () => {
 }
 
 const handleContextMenu = (evt: MouseEvent) => {
+  evt.stopPropagation()
   emit('select', props.node)
   emit('context-menu', evt, props.node)
 }

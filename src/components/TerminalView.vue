@@ -345,6 +345,12 @@ const fitActive = () => {
   termSize.value = { cols: session.term.cols, rows: session.term.rows }
 }
 
+const focusActive = () => {
+  const session = sessions.get(currentTabId.value)
+  if (!session || !session.container.offsetParent) return
+  session.term.focus()
+}
+
 const clearCurrentTerminal = () => clearTerminal(currentTabId.value)
 
 /** 按标签页清屏（右键菜单可作用于非活动标签） */
@@ -551,6 +557,7 @@ defineExpose({
   sendCommand: sendSnippetCommand,
   clearTerminal: clearCurrentTerminal,
   getCurrentCwd,
-  fit: fitActive
+  fit: fitActive,
+  focus: focusActive
 })
 </script>
