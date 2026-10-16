@@ -1,0 +1,157 @@
+<template>
+  <div class="flex-1 flex h-full w-full overflow-hidden relative select-none bg-surface-base">
+    <!-- 1. 左侧：树形文件工作区 -->
+    <aside
+      class="h-full flex flex-col shrink-0 transition-all duration-150 relative border-r border-surface-border bg-surface-sidebar"
+      :style="{
+        width: isCollapsed ? '0px' : `${sidebarWidth}px`,
+        opacity: isCollapsed ? 0 : 1,
+        pointerEvents: isCollapsed ? 'none' : 'auto'
+      }"
+    >
+      <FileTree
+        v-if="!isCollapsed"
+        :host="session.host"
+        :session-id="session.sftpSessionId || session.id"
+        :refresh-signal="refreshSignal"
+        @toggle-collapse="toggleCollapse"
+        @open-in-terminal="handleOpenInTerminal"
+        @edit-file="(path) => emit('edit-file', path)"
+        @download-file="(file, path) => emit('download-file', file, path)"
+        @upload-trigger="(dir) => emit('upload-trigger', dir)"
+        @toast="(msg, type) => emit('toast', msg, type)"
+      />
+    </aside>
+
+    <!-- 2. 中间：可拖拽调整宽度的 Splitter 分割条 -->
+    <div
+      v-if="!isCollapsed"
+      class="w-1.5 h-full cursor-col-resize hover:bg-brand-500/50 active:bg-brand-500 transition-colors shrink-0 z-20 flex items-center justify-center group -ml-0.5"
+      @mousedown="startResize"
+      title="拖拽调节宽度 (双击恢复默认 280px)"
+      @dblclick="resetWidth"
+    >
+      <div class="w-0.5 h-6 bg-slate-600 group-hover:bg-brand-300 rounded-full transition-colors"></div>
+    </div>
+
+    <!-- 3. 右侧：交互式终端 (单会话支持多终端 Tab) -->
+    <main class="flex-1 h-full overflow-hidden flex flex-col relative bg-[#0c0e14]">
+      <TerminalView
+        ref="terminalRef"
+        :tabs="session.terminalTabs"
+        :active-tab-index="session.activeTerminalIndex"
+        :sidebar-collapsed="isCollapsed"
+        @switch-tab="(idx) => emit('switch-terminal-tab', idx)"
+        @close-tab="(idx) => emit('close-terminal-tab', idx)"
+        @add-tab="emit('add-terminal-tab')"
+        @toggle-sidebar="toggleCollapse"
+        @duplicate-tab="(idx) => emit('duplicate-terminal-tab', idx)"
+        @reconnect-tab="(idx) => emit('reconnect-terminal-tab', idx)"
+        @rename-tab="(idx) => emit('rename-terminal-tab', idx)"
+        @copy-tab-info="(idx, kind) => emit('copy-terminal-info', idx, kind)"
+        @close-other-tabs="(idx) => emit('close-other-terminal-tabs', idx)"
+        @close-tabs-after="(idx) => emit('close-terminal-tabs-after', idx)"
+        @session-closed="(tabId, reason) => emit('session-closed', tabId, reason)"
+      />
+    </main>
+  </div>
+</template>
+
+<script setup lang="ts">
+import { ref, onBeforeUnmount, nextTick } from 'vue'
+import FileTree from '@/components/FileTree.vue'
+import TerminalView from '@/components/TerminalView.vue'
+import type { HostSession, SftpFileItem } from '@/types'
+
+const props = defineProps<{
+  session: HostSession
+  refreshSignal?: number
+}>()
+
+const emit = defineEmits<{
+  (e: 'switch-terminal-tab', index: number): void
+  (e: 'close-terminal-tab', index: number): void
+  (e: 'add-terminal-tab'): void
+  (e: 'duplicate-terminal-tab', index: number): void
+  (e: 'reconnect-terminal-tab', index: number): void
+  (e: 'rename-terminal-tab', index: number): void
+  (e: 'copy-terminal-info', index: number, kind: 'ip' | 'login' | 'ssh-command'): void
+  (e: 'close-other-terminal-tabs', index: number): void
+  (e: 'close-terminal-tabs-after', index: number): void
+  (e: 'session-closed', tabId: string, reason: string): void
+  (e: 'edit-file', path: string): void
+  (e: 'download-file', file: SftpFileItem, path: string): void
+  (e: 'upload-trigger', dir: string): void
+  (e: 'toast', msg: string, type: 'info' | 'success' | 'warning' | 'error'): void
+}>()
+
+const terminalRef = ref<InstanceType<typeof TerminalView> | null>(null)
+
+const isCollapsed = ref(props.session.sidebarCollapsed || false)
+const sidebarWidth = ref(props.session.sidebarWidth || 280)
+
+const toggleCollapse = () => {
+  isCollapsed.value = !isCollapsed.value
+  props.session.sidebarCollapsed = isCollapsed.value
+  nextTick(() => {
+    terminalRef.value?.fit()
+  })
+}
+
+const resetWidth = () => {
+  sidebarWidth.value = 280
+  props.session.sidebarWidth = 280
+  nextTick(() => {
+    terminalRef.value?.fit()
+  })
+}
+
+// 拖拽调整宽度逻辑
+let isResizing = false
+let startX = 0
+let startWidth = 280
+
+const onMouseMove = (e: MouseEvent) => {
+  if (!isResizing) return
+  const deltaX = e.clientX - startX
+  const newWidth = Math.max(180, Math.min(680, startWidth + deltaX))
+  sidebarWidth.value = newWidth
+  props.session.sidebarWidth = newWidth
+}
+
+const onMouseUp = () => {
+  if (!isResizing) return
+  isResizing = false
+  window.removeEventListener('mousemove', onMouseMove)
+  window.removeEventListener('mouseup', onMouseUp)
+  document.body.style.cursor = ''
+  document.body.style.userSelect = ''
+  nextTick(() => {
+    terminalRef.value?.fit()
+  })
+}
+
+const startResize = (e: MouseEvent) => {
+  isResizing = true
+  startX = e.clientX
+  startWidth = sidebarWidth.value
+  document.body.style.cursor = 'col-resize'
+  document.body.style.userSelect = 'none'
+  window.addEventListener('mousemove', onMouseMove)
+  window.addEventListener('mouseup', onMouseUp)
+}
+
+onBeforeUnmount(() => {
+  window.removeEventListener('mousemove', onMouseMove)
+  window.removeEventListener('mouseup', onMouseUp)
+})
+
+// 深度联动：在右侧终端中打开指定目录
+const handleOpenInTerminal = (path: string) => {
+  if (!terminalRef.value) return
+  // 转义单双引号，安全 cd
+  const sanitized = path.replace(/"/g, '\\"')
+  terminalRef.value.sendCommand(`cd "${sanitized}"\n`)
+  emit('toast', `已在终端定位至: ${path}`, 'info')
+}
+</script>

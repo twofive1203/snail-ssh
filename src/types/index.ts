@@ -98,6 +98,38 @@ export interface RemoteFileRef {
   remotePath: string
 }
 
+export interface FileTreeNode {
+  path: string
+  name: string
+  isDir: boolean
+  size: string
+  sizeBytes: number
+  permissions: string
+  owner: string
+  group: string
+  modifiedTime: string
+  editable: boolean
+  isHidden: boolean
+  children?: FileTreeNode[]
+  expanded?: boolean
+  loading?: boolean
+  loaded?: boolean
+}
+
+export interface HostSession {
+  id: string
+  hostId: string
+  host: HostItem
+  title: string
+  terminalTabs: TerminalTab[]
+  activeTerminalIndex: number
+  sftpSessionId?: string
+  currentPath: string
+  sidebarCollapsed: boolean
+  sidebarWidth: number
+  viewMode: 'tree' | 'list'
+}
+
 export interface ToastMessage {
   id: string
   text: string

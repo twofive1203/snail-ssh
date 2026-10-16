@@ -35,15 +35,16 @@
         </button>
       </div>
 
-      <!-- 终端操作按钮组：打开SFTP、分屏、清屏 -->
+      <!-- 终端操作按钮组：展开文件树、清屏 -->
       <div class="flex items-center gap-1 text-xs">
         <button
-          @click="$emit('jump-to-sftp')"
-          class="flex items-center gap-1.5 px-2 py-1 rounded bg-cyan-500/10 text-cyan-400 border border-cyan-500/30 hover:bg-cyan-500/20 text-xs font-medium transition-all"
-          title="打开此服务器的 SFTP 目录"
+          v-if="sidebarCollapsed"
+          @click="$emit('toggle-sidebar')"
+          class="flex items-center gap-1.5 px-2 py-1 rounded bg-brand-500/10 text-emerald-400 border border-brand-500/30 hover:bg-brand-500/20 text-xs font-medium transition-all"
+          title="展开左侧文件工作区"
         >
           <FolderGit2 class="w-3.5 h-3.5" />
-          <span class="hidden sm:inline">打开 SFTP</span>
+          <span class="hidden sm:inline">文件工作区</span>
         </button>
 
         <button
@@ -145,16 +146,23 @@ import {
   isTauri
 } from '@/api/tauri'
 
-const props = defineProps<{
-  tabs: TerminalTab[]
-  activeTabIndex: number
-}>()
+const props = withDefaults(
+  defineProps<{
+    tabs: TerminalTab[]
+    activeTabIndex: number
+    sidebarCollapsed?: boolean
+  }>(),
+  {
+    sidebarCollapsed: false
+  }
+)
 
 const emit = defineEmits<{
   (e: 'switch-tab', index: number): void
   (e: 'close-tab', index: number): void
   (e: 'add-tab'): void
   (e: 'jump-to-sftp'): void
+  (e: 'toggle-sidebar'): void
   (e: 'duplicate-tab', index: number): void
   (e: 'reconnect-tab', index: number): void
   (e: 'rename-tab', index: number): void
@@ -458,5 +466,11 @@ onBeforeUnmount(() => {
     session.term.dispose()
   }
   sessions.clear()
+})
+
+defineExpose({
+  sendCommand: sendSnippetCommand,
+  clearTerminal: clearCurrentTerminal,
+  fit: fitActive
 })
 </script>
