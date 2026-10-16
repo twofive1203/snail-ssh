@@ -141,6 +141,8 @@ import type { ContextMenuItem, TerminalTab } from '@/types'
 import {
   writeSshSessionApi,
   resizeSshSessionApi,
+  getSshSessionCwdApi,
+  setMockTerminalCwd,
   onSshStdout,
   onSshClosed,
   isTauri
@@ -171,6 +173,8 @@ const emit = defineEmits<{
   (e: 'close-other-tabs', index: number): void
   (e: 'close-tabs-after', index: number): void
   (e: 'session-closed', tabId: string, reason: string): void
+  (e: 'terminal-cwd-change', tabId: string, cwd: string): void
+  (e: 'terminal-enter', tabId: string): void
 }>()
 
 interface TerminalSession {
@@ -241,8 +245,31 @@ const createSession = (tab: TerminalTab, container: HTMLDivElement): TerminalSes
 
   term.open(container)
 
+  // 监听 OSC 7 (标准终端当前目录转义序列)
+  term.parser.registerOscHandler(7, (data) => {
+    const p = parseOsc7Path(data)
+    if (p) {
+      tab.cwd = p
+      emit('terminal-cwd-change', tab.id, p)
+    }
+    return true
+  })
+
+  // 监听 OSC 1337 (iTerm2 / Shell Integration 扩展目录格式)
+  term.parser.registerOscHandler(1337, (data) => {
+    const p = parseOsc1337Path(data)
+    if (p) {
+      tab.cwd = p
+      emit('terminal-cwd-change', tab.id, p)
+    }
+    return true
+  })
+
   // 绑定用户输入
   term.onData((data) => {
+    if (data.includes('\r')) {
+      emit('terminal-enter', tab.id)
+    }
     if (isTauri()) {
       writeSshSessionApi(tab.id, data).catch((err: any) => {
         if (session.writeFailed) return
@@ -250,7 +277,7 @@ const createSession = (tab: TerminalTab, container: HTMLDivElement): TerminalSes
         term.write(`\r\n\x1b[31m[写入失败] ${err?.message || err}\x1b[0m\r\n`)
       })
     } else {
-      handleMockTerminalInput(session, data)
+      handleMockTerminalInput(tab, session, data)
     }
   })
 
@@ -393,8 +420,52 @@ const sendSnippetCommand = (cmd: string) => {
     })
   } else {
     session.term.write(cmd)
-    handleMockTerminalInput(session, '\r')
+    handleMockTerminalInput(tab, session, '\r')
   }
+}
+
+const parseOsc7Path = (data: string): string | null => {
+  try {
+    if (data.startsWith('file://')) {
+      const url = new URL(data)
+      return decodeURIComponent(url.pathname)
+    }
+    if (data.startsWith('/')) {
+      return data.trim()
+    }
+  } catch {
+    const stripped = data.replace(/^file:\/\/[^/]*/, '')
+    if (stripped.startsWith('/')) {
+      return decodeURIComponent(stripped)
+    }
+  }
+  return null
+}
+
+const parseOsc1337Path = (data: string): string | null => {
+  if (data.startsWith('CurrentDir=')) {
+    const p = data.substring('CurrentDir='.length).trim()
+    if (p.startsWith('/')) return p
+  }
+  return null
+}
+
+const getCurrentCwd = async (): Promise<string> => {
+  const tab = currentTab.value
+  if (!tab) return '/'
+  if (isTauri()) {
+    try {
+      const remoteCwd = await getSshSessionCwdApi(tab.id)
+      if (remoteCwd) {
+        tab.cwd = remoteCwd
+        emit('terminal-cwd-change', tab.id, remoteCwd)
+        return remoteCwd
+      }
+    } catch (e) {
+      console.warn('获取终端目录失败:', e)
+    }
+  }
+  return tab.cwd || '/'
 }
 
 // ==========================================
@@ -410,7 +481,7 @@ const writeMockPrompt = (term: Xterm) => {
   term.write('\x1b[1;32mpreview@snail-ssh\x1b[0m:\x1b[1;34m~\x1b[0m\x1b[1;32m$ \x1b[0m')
 }
 
-const handleMockTerminalInput = (session: TerminalSession, data: string) => {
+const handleMockTerminalInput = (tab: TerminalTab, session: TerminalSession, data: string) => {
   const { term } = session
   if (data === '\r') {
     term.write('\r\n')
@@ -418,6 +489,14 @@ const handleMockTerminalInput = (session: TerminalSession, data: string) => {
     session.inputBuffer = ''
     if (cmd === 'clear') {
       term.clear()
+    } else if (cmd.startsWith('cd ')) {
+      let target = cmd.slice(3).trim()
+      if (target === '~' || target === '') target = '/root'
+      else if (!target.startsWith('/')) target = '/root/' + target
+      tab.cwd = target
+      setMockTerminalCwd(tab.id, target)
+      emit('terminal-cwd-change', tab.id, target)
+      term.write(`\x1b[32m已切换到目录: ${target}\x1b[0m\r\n`)
     } else if (cmd === 'docker ps') {
       term.write('\x1b[90mCONTAINER ID   IMAGE          COMMAND       STATUS       PORTS                   NAMES\x1b[0m\r\n')
       term.write('\x1b[32ma9c812d4ef01\x1b[0m   nginx:alpine   "/docker..."  Up 2 hours   0.0.0.0:80->80/tcp      web-gateway\r\n')
@@ -471,6 +550,7 @@ onBeforeUnmount(() => {
 defineExpose({
   sendCommand: sendSnippetCommand,
   clearTerminal: clearCurrentTerminal,
+  getCurrentCwd,
   fit: fitActive
 })
 </script>

@@ -113,6 +113,15 @@ async fn probe_host_info(
     .await
 }
 
+#[tauri::command]
+async fn get_ssh_session_cwd(
+    session_id: String,
+    ssh_manager: State<'_, SshManager>,
+) -> Result<String, String> {
+    let manager = ssh_manager.inner().clone();
+    run_blocking(move || manager.get_session_cwd(&session_id)).await
+}
+
 // ==========================================
 // SFTP 远程文件管理命令
 // ==========================================
@@ -274,6 +283,7 @@ pub fn run() {
             close_ssh_session,
             test_ssh_connection,
             probe_host_info,
+            get_ssh_session_cwd,
             sftp_home_dir,
             sftp_read_dir,
             sftp_read_file,

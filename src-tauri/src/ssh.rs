@@ -297,7 +297,72 @@ impl SshManager {
     pub fn get_config(&self, session_id: &str) -> Result<SshConnectConfig, String> {
         Ok(self.get_active(session_id)?.config.clone())
     }
+
+    /// 获取终端会话当前的工作目录（CWD），通过独立 SFTP 会话开瞬态通道探测，避免干扰终端
+    pub fn get_session_cwd(&self, session_id: &str) -> Result<String, String> {
+        let sftp_sess = self.get_sftp_session(session_id)?;
+        let sess = sftp_sess.lock();
+        let mut channel = sess
+            .channel_session()
+            .map_err(|e| format!("打开工作目录探测通道失败: {}", e))?;
+        channel
+            .exec(CWD_DETECT_SCRIPT)
+            .map_err(|e| format!("执行工作目录探测脚本失败: {}", e))?;
+
+        let mut output = String::new();
+        channel
+            .read_to_string(&mut output)
+            .map_err(|e| format!("读取工作目录失败: {}", e))?;
+        let _ = channel.wait_close();
+
+        let path = output
+            .lines()
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty())
+            .last()
+            .unwrap_or("/");
+
+        if path.starts_with('/') {
+            Ok(path.to_string())
+        } else {
+            Ok("/".to_string())
+        }
+    }
 }
+
+/// 远端工作目录探测脚本：
+/// 1. 查找 /dev/pts/ 下最新活跃修改时间的终端设备，定位占用该 pts 的进程并读取其 /proc/<pid>/cwd
+/// 2. 备用策略：查找当前用户的 pts shell 进程并读取 cwd
+/// 3. 若均无法读取则降级为 HOME 或 /
+const CWD_DETECT_SCRIPT: &str = r#"CWD=""
+for pts in $(ls -t /dev/pts/[0-9]* 2>/dev/null); do
+  for pid in $(fuser "$pts" 2>/dev/null); do
+    if [ -d "/proc/$pid" ] && [ "$pid" != "$$" ]; then
+      target=$(readlink -f "/proc/$pid/cwd" 2>/dev/null)
+      if [ -n "$target" ] && [ -d "$target" ]; then
+        CWD="$target"
+        break 2
+      fi
+    fi
+  done
+done
+if [ -z "$CWD" ]; then
+  pids=$(ps -u $(id -u 2>/dev/null || whoami) -o pid,tty,comm 2>/dev/null | grep -E 'pts/[0-9]+' | grep -E 'bash|zsh|sh|fish|ash|csh' | awk '{print $1}')
+  for pid in $pids; do
+    if [ -d "/proc/$pid" ] && [ "$pid" != "$$" ]; then
+      target=$(readlink -f "/proc/$pid/cwd" 2>/dev/null)
+      if [ -n "$target" ] && [ -d "$target" ]; then
+        CWD="$target"
+        break
+      fi
+    fi
+  done
+fi
+if [ -z "$CWD" ] || [ ! -d "$CWD" ]; then
+  CWD="${HOME:-/}"
+fi
+echo "$CWD"
+"#;
 
 /// 建立 TCP 连接、完成握手、校验主机密钥并认证。
 /// 主机密钥在认证之前校验，避免把凭证发送给中间人。

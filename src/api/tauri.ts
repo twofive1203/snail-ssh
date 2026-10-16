@@ -262,6 +262,20 @@ export async function closeSshSessionApi(sessionId: string): Promise<void> {
   }
 }
 
+// 模拟终端路径字典 (非 Tauri 降级使用)
+const mockTerminalCwdMap = new Map<string, string>()
+
+export function setMockTerminalCwd(sessionId: string, cwd: string): void {
+  mockTerminalCwdMap.set(sessionId, cwd)
+}
+
+export async function getSshSessionCwdApi(sessionId: string): Promise<string> {
+  if (isTauri()) {
+    return await invoke<string>('get_ssh_session_cwd', { sessionId })
+  }
+  return mockTerminalCwdMap.get(sessionId) || '/etc/nginx'
+}
+
 export async function onSshStdout(sessionId: string, callback: (data: string) => void): Promise<UnlistenFn> {
   if (isTauri()) {
     return await listen<string>(`ssh-stdout-${sessionId}`, (event) => {

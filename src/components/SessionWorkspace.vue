@@ -11,9 +11,14 @@
     >
       <FileTree
         v-if="!isCollapsed"
+        ref="fileTreeRef"
         :host="session.host"
         :session-id="session.sftpSessionId || session.id"
         :refresh-signal="refreshSignal"
+        :auto-follow="session.autoFollowTerminal || false"
+        :terminal-cwd="currentActiveTabCwd"
+        @update:auto-follow="(val) => session.autoFollowTerminal = val"
+        @manual-sync="handleManualSync"
         @toggle-collapse="toggleCollapse"
         @open-in-terminal="handleOpenInTerminal"
         @edit-file="(path) => emit('edit-file', path)"
@@ -52,13 +57,15 @@
         @close-other-tabs="(idx) => emit('close-other-terminal-tabs', idx)"
         @close-tabs-after="(idx) => emit('close-terminal-tabs-after', idx)"
         @session-closed="(tabId, reason) => emit('session-closed', tabId, reason)"
+        @terminal-cwd-change="handleTerminalCwdChange"
+        @terminal-enter="handleTerminalEnter"
       />
     </main>
   </div>
 </template>
 
 <script setup lang="ts">
-import { ref, onBeforeUnmount, nextTick } from 'vue'
+import { ref, computed, watch, onBeforeUnmount, nextTick } from 'vue'
 import FileTree from '@/components/FileTree.vue'
 import TerminalView from '@/components/TerminalView.vue'
 import type { HostSession, SftpFileItem } from '@/types'
@@ -86,9 +93,96 @@ const emit = defineEmits<{
 }>()
 
 const terminalRef = ref<InstanceType<typeof TerminalView> | null>(null)
+const fileTreeRef = ref<InstanceType<typeof FileTree> | null>(null)
 
 const isCollapsed = ref(props.session.sidebarCollapsed || false)
 const sidebarWidth = ref(props.session.sidebarWidth || 280)
+
+const currentActiveTabCwd = computed(() => {
+  return props.session.terminalTabs[props.session.activeTerminalIndex]?.cwd || ''
+})
+
+let enterDebounceTimer: any = null
+
+const handleTerminalCwdChange = (tabId: string, cwd: string) => {
+  const activeTab = props.session.terminalTabs[props.session.activeTerminalIndex]
+  if (activeTab && activeTab.id === tabId) {
+    if (props.session.autoFollowTerminal) {
+      const current = fileTreeRef.value?.getCurrentPath()
+      if (current !== cwd) {
+        fileTreeRef.value?.jumpToPath(cwd)
+      }
+    }
+  }
+}
+
+const handleTerminalEnter = (tabId: string) => {
+  if (!props.session.autoFollowTerminal) return
+  const activeTab = props.session.terminalTabs[props.session.activeTerminalIndex]
+  if (!activeTab || activeTab.id !== tabId) return
+
+  clearTimeout(enterDebounceTimer)
+  enterDebounceTimer = setTimeout(async () => {
+    await performAutoSync()
+  }, 350)
+}
+
+const performAutoSync = async () => {
+  if (!terminalRef.value) return
+  try {
+    const cwd = await terminalRef.value.getCurrentCwd()
+    if (cwd) {
+      const current = fileTreeRef.value?.getCurrentPath()
+      if (current !== cwd) {
+        await fileTreeRef.value?.jumpToPath(cwd)
+      }
+    }
+  } catch (e) {
+    console.warn('自动跟随获取终端目录失败:', e)
+  }
+}
+
+const handleManualSync = async () => {
+  if (!terminalRef.value) return
+  try {
+    const cwd = await terminalRef.value.getCurrentCwd()
+    if (cwd) {
+      const current = fileTreeRef.value?.getCurrentPath()
+      if (current === cwd) {
+        emit('toast', `工作区已处于当前终端目录: ${cwd}`, 'info')
+      } else {
+        await fileTreeRef.value?.jumpToPath(cwd)
+        emit('toast', `已同步至终端目录: ${cwd}`, 'success')
+      }
+    } else {
+      emit('toast', '未能获取到当前终端目录', 'warning')
+    }
+  } catch (e: any) {
+    emit('toast', `目录同步失败: ${e?.message || e}`, 'error')
+  }
+}
+
+watch(
+  () => props.session.activeTerminalIndex,
+  () => {
+    if (props.session.autoFollowTerminal) {
+      nextTick(() => {
+        performAutoSync()
+      })
+    }
+  }
+)
+
+watch(
+  () => props.session.autoFollowTerminal,
+  (enabled) => {
+    if (enabled) {
+      nextTick(() => {
+        performAutoSync()
+      })
+    }
+  }
+)
 
 const toggleCollapse = () => {
   isCollapsed.value = !isCollapsed.value
@@ -142,6 +236,7 @@ const startResize = (e: MouseEvent) => {
 }
 
 onBeforeUnmount(() => {
+  clearTimeout(enterDebounceTimer)
   window.removeEventListener('mousemove', onMouseMove)
   window.removeEventListener('mouseup', onMouseUp)
 })

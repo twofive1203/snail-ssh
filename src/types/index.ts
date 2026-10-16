@@ -28,6 +28,7 @@ export interface TerminalTab {
   title: string
   sub: string
   connected: boolean
+  cwd?: string
 }
 
 /** 右键菜单项：divider 为 true 时渲染成分隔线，其余字段忽略 */
@@ -128,6 +129,7 @@ export interface HostSession {
   sidebarCollapsed: boolean
   sidebarWidth: number
   viewMode: 'tree' | 'list'
+  autoFollowTerminal?: boolean
 }
 
 export interface ToastMessage {

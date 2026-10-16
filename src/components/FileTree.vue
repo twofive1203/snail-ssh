@@ -213,7 +213,47 @@
       </div>
     </div>
 
-    <!-- 5. 底部状态栏 -->
+    <!-- 5. 底部目录跟随工具栏 -->
+    <div class="h-8 bg-surface-card/40 border-t border-surface-border/60 px-2 flex items-center justify-between shrink-0 select-none">
+      <div class="flex items-center gap-1.5">
+        <!-- 自动跟随开关按钮 -->
+        <button
+          @click="toggleAutoFollow"
+          :class="autoFollow ? 'bg-brand-500/15 text-emerald-400 border-brand-500/40 hover:bg-brand-500/25' : 'bg-surface-card text-slate-400 border-surface-border hover:text-white hover:bg-surface-elevated'"
+          class="flex items-center gap-1.5 px-2 py-1 rounded-md border text-[11px] font-mono transition-all group"
+          :title="autoFollow ? '自动跟随：开启中（终端切目录，工作区自动进入）' : '自动跟随：已关闭（点击开启）'"
+        >
+          <span
+            class="w-1.5 h-1.5 rounded-full transition-all"
+            :class="autoFollow ? 'bg-emerald-400 shadow-glow-emerald animate-pulse' : 'bg-slate-600'"
+          ></span>
+          <Compass class="w-3 h-3 transition-transform" :class="{ 'rotate-45 text-emerald-400': autoFollow }" />
+          <span>{{ autoFollow ? '跟随:开' : '跟随:关' }}</span>
+        </button>
+
+        <!-- 手动跟随按钮 -->
+        <button
+          @click="triggerManualSync"
+          :disabled="syncing"
+          class="flex items-center gap-1 px-2 py-1 rounded-md bg-surface-card hover:bg-surface-elevated border border-surface-border text-slate-300 hover:text-white text-[11px] font-mono transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+          title="手动跟随：点击立即进入终端所在目录"
+        >
+          <Locate class="w-3 h-3 text-cyan-400" :class="{ 'animate-spin': syncing }" />
+          <span>同步</span>
+        </button>
+      </div>
+
+      <!-- 右侧当前终端路径预览提示 -->
+      <div
+        v-if="terminalCwd"
+        class="text-[10px] font-mono text-slate-500 truncate max-w-[100px] hover:text-slate-300 transition-colors"
+        :title="`当前终端路径: ${terminalCwd}`"
+      >
+        终端: {{ terminalCwd }}
+      </div>
+    </div>
+
+    <!-- 6. 底部状态栏 -->
     <div class="h-6 bg-surface-sidebar border-t border-surface-border px-3 flex items-center justify-between text-[10px] font-mono text-slate-500 shrink-0">
       <span class="truncate max-w-[160px]" :title="selectedNode?.path || currentPath">
         {{ selectedNode ? selectedNode.name : currentPath }}
@@ -260,7 +300,8 @@ import {
   Copy,
   Trash2,
   FilePlus,
-  Compass
+  Compass,
+  Locate
 } from 'lucide-vue-next'
 import ContextMenu from '@/components/ContextMenu.vue'
 import FileTreeNodeItem from '@/components/FileTreeNodeItem.vue'
@@ -273,11 +314,19 @@ import {
 } from '@/api/tauri'
 import { confirmDialog, promptDialog } from '@/composables/useDialog'
 
-const props = defineProps<{
-  host: HostItem
-  sessionId?: string
-  refreshSignal?: number
-}>()
+const props = withDefaults(
+  defineProps<{
+    host: HostItem
+    sessionId?: string
+    refreshSignal?: number
+    terminalCwd?: string
+    autoFollow?: boolean
+  }>(),
+  {
+    terminalCwd: '',
+    autoFollow: false
+  }
+)
 
 const emit = defineEmits<{
   (e: 'toggle-collapse'): void
@@ -286,6 +335,8 @@ const emit = defineEmits<{
   (e: 'download-file', file: SftpFileItem, remotePath: string): void
   (e: 'upload-trigger', remoteDir: string): void
   (e: 'toast', msg: string, type: 'info' | 'success' | 'warning' | 'error'): void
+  (e: 'update:autoFollow', val: boolean): void
+  (e: 'manual-sync'): void
 }>()
 
 const viewMode = ref<'tree' | 'list'>('tree')
@@ -658,4 +709,26 @@ watch(
     }
   }
 )
+
+const syncing = ref(false)
+
+const toggleAutoFollow = () => {
+  const newVal = !props.autoFollow
+  emit('update:autoFollow', newVal)
+  emit('toast', newVal ? '已开启终端目录自动跟随' : '已关闭终端目录自动跟随', 'info')
+}
+
+const triggerManualSync = () => {
+  syncing.value = true
+  emit('manual-sync')
+  setTimeout(() => {
+    syncing.value = false
+  }, 600)
+}
+
+defineExpose({
+  jumpToPath,
+  getCurrentPath: () => currentPath.value,
+  refresh: refreshCurrent
+})
 </script>
