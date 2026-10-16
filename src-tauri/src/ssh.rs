@@ -365,16 +365,42 @@ fn run_probe_command(sess: &ssh2::Session, command: &str) -> Result<String, Stri
 }
 
 /// 远端工作目录探测脚本（必须在终端所属连接上执行）：
-/// 1. 取探测进程的父进程（本连接的 sshd 会话进程），在它的兄弟进程中找标准输入
-///    指向伪终端的那个 —— 即本会话的登录 shell，可精确锁定，不受其他会话/后台常驻进程影响；
-/// 2. 兜底：/dev/pts 活跃度启发式，但只认“stdin 指向 pts 的 shell”进程
-///    （老算法会选中 sshd 的家目录或挂在 pts 上的后台服务，导致工作区跳到无关目录）；
-/// 3. 兜底：本用户下所有交互 shell 进程（同样要求 stdin 指向 pts）；
-/// 4. 仍无法判断则降级为 HOME 或 /
+/// 1. 按 `SSH_CONNECTION` 的客户端端口认本连接：同一条连接下 shell 通道与 exec 通道
+///    携带完全相同的该变量，不同 tab 是不同 TCP 连接、端口不同，因此可精确区分是哪个会话，
+///    且不依赖 sshd 的进程树形状（登录 shell 被包装脚本再 fork 一层也能认对）；
+/// 2. 兜底：与探测进程同父、且 stdin 指向伪终端的兄弟进程（即本会话登录 shell）；
+/// 3. 兜底：/dev/pts 活跃度启发式，只认“stdin 指向 pts 的 shell”（老算法会选中 sshd 的
+///    家目录或挂在 pts 上的后台服务，导致工作区跳到无关目录）；
+/// 4. 兜底：本用户下所有交互 shell（同样要求 stdin 指向 pts）；
+/// 5. 仍无法判断则降级为 HOME 或 /
 const CWD_DETECT_SCRIPT: &str = r#"CWD=""
 
+SELF_PORT=$(tr '\0' '\n' < "/proc/$$/environ" 2>/dev/null | awk -F= '/^SSH_CONNECTION=/{split($2,f," "); print f[2]; exit}')
 SELF_PPID=$(awk '/^PPid:/{print $2}' "/proc/$$/status" 2>/dev/null)
-if [ -n "$SELF_PPID" ]; then
+
+if [ -n "$SELF_PORT" ]; then
+  for pid in $(ps -u "$(id -u 2>/dev/null || echo 0)" -o pid= 2>/dev/null); do
+    [ "$pid" = "$$" ] && continue
+    [ -d "/proc/$pid" ] || continue
+    case "$(readlink "/proc/$pid/fd/0" 2>/dev/null)" in
+      /dev/pts/*) ;;
+      *) continue ;;
+    esac
+    case "$(cat "/proc/$pid/comm" 2>/dev/null)" in
+      bash|zsh|sh|dash|ash|ksh|mksh|fish|csh|tcsh|nu|pwsh|xonsh) ;;
+      *) continue ;;
+    esac
+    pid_port=$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | awk -F= '/^SSH_CONNECTION=/{split($2,f," "); print f[2]; exit}')
+    [ "$pid_port" = "$SELF_PORT" ] || continue
+    target=$(readlink -f "/proc/$pid/cwd" 2>/dev/null)
+    if [ -n "$target" ] && [ -d "$target" ]; then
+      CWD="$target"
+      break
+    fi
+  done
+fi
+
+if [ -z "$CWD" ] && [ -n "$SELF_PPID" ]; then
   for pid in $(ps -eo pid=,ppid= 2>/dev/null | awk -v p="$SELF_PPID" '$2 == p {print $1}'); do
     [ "$pid" = "$$" ] && continue
     [ -d "/proc/$pid" ] || continue
@@ -396,7 +422,7 @@ if [ -z "$CWD" ]; then
       [ "$pid" = "$$" ] && continue
       [ -d "/proc/$pid" ] || continue
       case "$(cat "/proc/$pid/comm" 2>/dev/null)" in
-        bash|zsh|sh|dash|ash|ksh|mksh|fish|csh|tcsh) ;;
+        bash|zsh|sh|dash|ash|ksh|mksh|fish|csh|tcsh|nu|pwsh|xonsh) ;;
         *) continue ;;
       esac
       case "$(readlink "/proc/$pid/fd/0" 2>/dev/null)" in
@@ -417,7 +443,7 @@ if [ -z "$CWD" ]; then
     [ "$pid" = "$$" ] && continue
     [ -d "/proc/$pid" ] || continue
     case "$(cat "/proc/$pid/comm" 2>/dev/null)" in
-      bash|zsh|sh|dash|ash|ksh|mksh|fish|csh|tcsh) ;;
+      bash|zsh|sh|dash|ash|ksh|mksh|fish|csh|tcsh|nu|pwsh|xonsh) ;;
       *) continue ;;
     esac
     case "$(readlink "/proc/$pid/fd/0" 2>/dev/null)" in
