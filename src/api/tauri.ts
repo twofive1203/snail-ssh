@@ -208,7 +208,8 @@ export async function createSshSessionApi(
       }
     })
   }
-  return { sessionId: 'mock-session-' + Date.now() }
+  // 浏览器预览也需保证 sessionId 唯一，否则同一主机多开时 tab 会互相覆盖
+  return { sessionId: `mock-session-${Date.now()}-${Math.floor(Math.random() * 100000)}` }
 }
 
 // 真实连通性测试：TCP + 握手 + 主机密钥校验 + 认证，返回真实耗时（仅 Tauri 环境可用）

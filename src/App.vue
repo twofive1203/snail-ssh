@@ -114,7 +114,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, onBeforeUnmount } from 'vue'
 import TitleBar from '@/components/TitleBar.vue'
 import Sidebar from '@/components/Sidebar.vue'
 import HostManager from '@/components/HostManager.vue'
@@ -169,9 +169,13 @@ const demoTabs: TerminalTab[] = [
 const terminalTabs = ref<TerminalTab[]>(isTauri() ? [] : demoTabs)
 const activeTabIndex = ref(0)
 const currentSftpHost = ref<HostItem | undefined>(undefined)
-// 每个主机复用一个 SSH 会话，终端与 SFTP 共用同一个 sessionId
-const sessionByHost = new Map<string, string>()
 const currentSftpSessionId = ref<string>('')
+// 同一主机可多开：每次连接都新建独立会话，tab.id 即 sessionId
+// 为同一主机的多个 tab 编号，便于区分同名会话
+const tabSeqByHost = new Map<string, number>()
+// 该主机没有终端 tab 时，为其只开 SFTP 而建立的会话（切走时释放，避免连接泄露）
+let sftpOnlyHostId = ''
+let sftpOnlySessionId = ''
 
 // 传输队列只承载真实任务，启动时为空（避免展示无法对应真实连接的假进度）
 const transfersOpen = ref(false)
@@ -235,7 +239,7 @@ const loadHosts = async () => {
 }
 
 // ==========================================
-// SSH / SFTP 会话建立（同一主机复用同一连接）
+// SSH / SFTP 会话建立（同一主机允许并行多开会话）
 // ==========================================
 const probingHosts = new Set<string>()
 
@@ -291,14 +295,34 @@ const openSession = async (host: HostItem, cols = 80, rows = 24): Promise<string
   }
 }
 
-const ensureSession = async (host: HostItem): Promise<string | null> => {
-  if (!isTauri()) return `mock-${host.id}`
+// 释放仅为 SFTP 建立的专用会话
+const releaseSftpOnlySession = () => {
+  if (sftpOnlySessionId && isTauri()) {
+    closeSshSessionApi(sftpOnlySessionId).catch(() => {})
+  }
+  sftpOnlyHostId = ''
+  sftpOnlySessionId = ''
+}
 
-  const existing = sessionByHost.get(host.id)
-  if (existing && terminalTabs.value.some(t => t.id === existing)) return existing
+// SFTP 需要一份指向目标主机的会话：
+// 优先复用当前活动 tab（就是该主机时），其次该主机任一 tab，
+// 都没有时才建立一份仅供 SFTP 使用的会话
+const resolveSftpSession = async (host: HostItem): Promise<string | null> => {
+  const activeTab = terminalTabs.value[activeTabIndex.value]
+  if (activeTab && activeTab.hostId === host.id && activeTab.connected) {
+    return activeTab.id
+  }
+  const anyTab = terminalTabs.value.find(t => t.hostId === host.id && t.connected)
+  if (anyTab) return anyTab.id
 
+  if (sftpOnlySessionId && sftpOnlyHostId === host.id) return sftpOnlySessionId
+
+  releaseSftpOnlySession()
   const sessionId = await openSession(host)
-  if (sessionId) sessionByHost.set(host.id, sessionId)
+  if (sessionId) {
+    sftpOnlyHostId = host.id
+    sftpOnlySessionId = sessionId
+  }
   return sessionId
 }
 
@@ -330,40 +354,37 @@ const refreshHostMetrics = async (host: HostItem, sessionId: string) => {
   }
 }
 
-// SSH 直连
+// SSH 直连：每次都在新标签页中建立独立会话
 const handleConnectSsh = async (host: HostItem) => {
   activeView.value = 'terminal'
   triggerToast(`正在建立 SSH 会话至 ${host.name} (${host.host})...`, 'info')
 
-  const sessionId = await ensureSession(host)
+  const sessionId = await openSession(host)
   if (!sessionId) {
     activeView.value = 'hosts'
     return
   }
 
-  const existingIdx = terminalTabs.value.findIndex(t => t.hostId === host.id)
-  if (existingIdx >= 0) {
-    activeTabIndex.value = existingIdx
-  } else {
-    terminalTabs.value.push({
-      id: sessionId,
-      hostId: host.id,
-      title: host.name,
-      sub: `${host.username}@${host.host}`,
-      connected: true
-    })
-    activeTabIndex.value = terminalTabs.value.length - 1
-  }
+  const seq = (tabSeqByHost.get(host.id) || 0) + 1
+  tabSeqByHost.set(host.id, seq)
+  terminalTabs.value.push({
+    id: sessionId,
+    hostId: host.id,
+    title: seq > 1 ? `${host.name} (${seq})` : host.name,
+    sub: `${host.username}@${host.host}`,
+    connected: true
+  })
+  activeTabIndex.value = terminalTabs.value.length - 1
 
   triggerToast(`已连通 ${host.name} (SSH-2.0)`, 'success')
   refreshHostMetrics(host, sessionId)
 }
 
-// SFTP 直连：复用该主机已有的 SSH 会话
+// SFTP 直连：优先复用当前主机已有的会话，避免多余连接
 const handleConnectSftp = async (host: HostItem) => {
   currentSftpHost.value = host
 
-  const sessionId = await ensureSession(host)
+  const sessionId = await resolveSftpSession(host)
   if (!sessionId) return
 
   currentSftpSessionId.value = sessionId
@@ -387,9 +408,6 @@ const handleCloseTerminalTab = (index: number) => {
   if (isTauri() && tab.id.startsWith('ssh-')) {
     closeSshSessionApi(tab.id).catch(() => {})
   }
-  for (const [hostId, sessionId] of Array.from(sessionByHost.entries())) {
-    if (sessionId === tab.id) sessionByHost.delete(hostId)
-  }
   if (currentSftpSessionId.value === tab.id) currentSftpSessionId.value = ''
 
   terminalTabs.value.splice(index, 1)
@@ -401,31 +419,17 @@ const handleCloseTerminalTab = (index: number) => {
 }
 
 const handleAddTerminalTab = () => {
-  // 真实环境下不存在“凭空新建的本地 shell”，引导用户先选主机
-  if (isTauri()) {
-    activeView.value = 'hosts'
-    triggerToast('请选择一台服务器发起 SSH 连接', 'info')
+  // 在当前主机上再开一个独立会话（同主机多开）
+  const current = terminalTabs.value[activeTabIndex.value]
+  const host = current ? hosts.value.find(h => h.id === current.hostId) : undefined
+  if (host) {
+    handleConnectSsh(host)
     return
   }
 
-  const host = hosts.value[0] || {
-    id: 'custom',
-    name: 'shell',
-    host: 'localhost',
-    port: 22,
-    username: 'root',
-    authType: 'password',
-    group: 'staging',
-    tags: []
-  }
-  terminalTabs.value.push({
-    id: 'mock-tab-' + Date.now(),
-    hostId: host.id,
-    title: host.name,
-    sub: `${host.username}@${host.host}`,
-    connected: true
-  })
-  activeTabIndex.value = terminalTabs.value.length - 1
+  // 没有可参考的当前会话时，引导用户先选择主机
+  activeView.value = 'hosts'
+  triggerToast('请选择一台服务器发起 SSH 连接', 'info')
 }
 
 const handleJumpToCurrentSftp = () => {
@@ -656,5 +660,14 @@ onMounted(async () => {
   await loadHosts()
   setupGlobalKeybindings()
   triggerToast('SnailSSH 桌面客户端已就绪！支持 Ctrl+K 全局搜索', 'success')
+})
+
+// 退出前释放所有后端会话，避免连接泄漏
+onBeforeUnmount(() => {
+  if (!isTauri()) return
+  releaseSftpOnlySession()
+  for (const tab of terminalTabs.value) {
+    if (tab.id.startsWith('ssh-')) closeSshSessionApi(tab.id).catch(() => {})
+  }
 })
 </script>
