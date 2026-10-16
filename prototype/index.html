@@ -1,0 +1,823 @@
+<!DOCTYPE html>
+<html lang="zh-CN" class="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SnailSSH - 现代化跨平台 SSH & SFTP 终端套件</title>
+  <!-- Google Fonts: Inter & JetBrains Mono -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600&family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <!-- Tailwind CSS CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- Lucide Icons -->
+  <script src="https://unpkg.com/lucide@latest"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          fontFamily: {
+            sans: ['Inter', '-apple-system', 'BlinkMacSystemFont', 'Segoe UI', 'Roboto', 'sans-serif'],
+            mono: ['"JetBrains Mono"', '"Fira Code"', 'Consolas', 'monospace'],
+          },
+          colors: {
+            brand: {
+              50: '#eefcf5',
+              100: '#d7f7e6',
+              200: '#b2edd0',
+              300: '#7dddb3',
+              400: '#43c591',
+              500: '#10b981', // 祖母绿翡翠青
+              600: '#059669',
+              700: '#047857',
+              800: '#065f46',
+              900: '#064e3b',
+              accent: '#06b6d4',
+            },
+            surface: {
+              base: '#0c0e14',     // 超深邃主背景
+              sidebar: '#11141d',  // 侧边栏
+              card: '#161a26',     // 卡片底色
+              elevated: '#1d2333', // 浮动卡片/悬浮
+              border: '#262d40',   // 边框色
+              highlight: '#2f3850',// 选中/高亮
+              subtle: '#8892b0',   // 次要文本
+            }
+          },
+          boxShadow: {
+            'glow-emerald': '0 0 25px -5px rgba(16, 185, 129, 0.35)',
+            'glow-cyan': '0 0 25px -5px rgba(6, 182, 212, 0.35)',
+            'glow-card': '0 10px 30px -10px rgba(0, 0, 0, 0.5), 0 0 1px 1px rgba(255, 255, 255, 0.05)',
+            'glass': '0 8px 32px 0 rgba(0, 0, 0, 0.37)',
+          }
+        }
+      }
+    }
+  </script>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body class="bg-surface-base text-slate-100 font-sans antialiased overflow-hidden select-none h-screen w-screen flex flex-col">
+
+  <!-- 1. 现代化桌面客户端顶栏 (Window Header / TitleBar) -->
+  <header class="h-11 bg-surface-sidebar border-b border-surface-border flex items-center justify-between px-3 shrink-0 z-30 select-none">
+    <!-- 左侧：应用 LOGO & 操作系统风格窗口红黄绿微点 -->
+    <div class="flex items-center gap-3">
+      <!-- 仿 macOS 优雅圆点 (在 Windows/Linux 亦为精美装饰) -->
+      <div class="flex items-center gap-2 mr-1">
+        <span class="w-3 h-3 rounded-full bg-[#ff5f56] inline-block shadow-sm cursor-pointer hover:opacity-80 transition-opacity" title="关闭窗口"></span>
+        <span class="w-3 h-3 rounded-full bg-[#ffbd2e] inline-block shadow-sm cursor-pointer hover:opacity-80 transition-opacity" title="最小化"></span>
+        <span class="w-3 h-3 rounded-full bg-[#27c93f] inline-block shadow-sm cursor-pointer hover:opacity-80 transition-opacity" title="全屏缩放"></span>
+      </div>
+
+      <div class="h-4 w-[1px] bg-surface-border mx-1"></div>
+
+      <!-- App Brand -->
+      <div class="flex items-center gap-2">
+        <div class="w-6 h-6 rounded-lg bg-gradient-to-tr from-brand-600 to-brand-400 flex items-center justify-center shadow-glow-emerald">
+          <i data-lucide="terminal" class="w-3.5 h-3.5 text-white stroke-[2.5]"></i>
+        </div>
+        <span class="font-bold text-sm tracking-wide bg-gradient-to-r from-white via-slate-200 to-brand-300 bg-clip-text text-transparent">
+          SnailSSH
+        </span>
+        <span class="text-[10px] uppercase font-mono px-1.5 py-0.5 rounded bg-brand-500/10 text-brand-400 border border-brand-500/20 font-semibold tracking-wider">
+          v1.0.0-Beta
+        </span>
+      </div>
+    </div>
+
+    <!-- 中间：全局搜索与快捷命令入口 (Ctrl+K 呼出) -->
+    <div class="flex items-center">
+      <button onclick="toggleCommandPalette(true)" class="flex items-center gap-2.5 px-3 py-1.5 rounded-lg bg-surface-card border border-surface-border text-xs text-surface-subtle hover:text-white hover:border-brand-500/40 hover:bg-surface-elevated transition-all duration-200 w-80 justify-between group shadow-inner">
+        <span class="flex items-center gap-2">
+          <i data-lucide="search" class="w-3.5 h-3.5 text-slate-400 group-hover:text-brand-400 transition-colors"></i>
+          <span>快速搜索主机、命令、快捷操作...</span>
+        </span>
+        <kbd class="font-mono text-[10px] bg-surface-highlight text-slate-300 px-1.5 py-0.5 rounded border border-surface-border/80">Ctrl + K</kbd>
+      </button>
+    </div>
+
+    <!-- 右侧：环境状态、传输总览按钮、设置 -->
+    <div class="flex items-center gap-2 text-xs">
+      <!-- 传输任务指示悬浮胶囊 -->
+      <button onclick="toggleTransferDrawer()" class="flex items-center gap-2 px-2.5 py-1 rounded-md bg-surface-card border border-surface-border hover:border-brand-500/40 text-slate-300 hover:text-white transition-all text-xs">
+        <div class="relative flex items-center justify-center">
+          <i data-lucide="arrow-up-down" class="w-3.5 h-3.5 text-brand-400"></i>
+          <span class="absolute -top-1 -right-1 w-2 h-2 rounded-full bg-brand-500 animate-pulse"></span>
+        </div>
+        <span class="hidden md:inline font-mono text-[11px]">2 任务传输中</span>
+        <span class="text-brand-400 font-mono font-semibold text-[11px]">18.4 MB/s</span>
+      </button>
+
+      <!-- 快速新建主机按钮 -->
+      <button onclick="openNewHostModal()" class="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-brand-500 hover:bg-brand-600 text-slate-950 font-semibold transition-all shadow-glow-emerald active:scale-95 text-xs">
+        <i data-lucide="plus" class="w-3.5 h-3.5 stroke-[2.5]"></i>
+        <span>新建主机</span>
+      </button>
+
+      <div class="h-4 w-[1px] bg-surface-border mx-1"></div>
+
+      <!-- 系统设置 -->
+      <button onclick="openSettingsModal()" class="p-1.5 rounded-md hover:bg-surface-elevated text-surface-subtle hover:text-white transition-colors" title="系统设置">
+        <i data-lucide="settings" class="w-4 h-4"></i>
+      </button>
+    </div>
+  </header>
+
+  <!-- 2. 主体工作区容器 (侧边导航栏 + 主内容区) -->
+  <div class="flex flex-1 overflow-hidden relative">
+
+    <!-- 侧边导航栏 (Sidebar) -->
+    <aside class="w-60 bg-surface-sidebar border-r border-surface-border flex flex-col shrink-0 select-none">
+      <!-- 顶部视图切换菜单 -->
+      <div class="p-3 border-b border-surface-border space-y-1">
+        <div class="text-[11px] font-semibold text-slate-500 tracking-wider uppercase px-2 mb-1.5 font-mono">视图导航</div>
+        
+        <button onclick="switchView('hosts')" id="nav-hosts" class="nav-item active w-full flex items-center justify-between px-2.5 py-2 rounded-lg text-xs font-medium transition-all group">
+          <div class="flex items-center gap-2.5">
+            <i data-lucide="server" class="w-4 h-4 text-brand-400"></i>
+            <span>服务器管理</span>
+          </div>
+          <span class="text-[11px] font-mono px-1.5 py-0.2 rounded-full bg-surface-highlight text-slate-300 group-hover:text-white">6</span>
+        </button>
+
+        <button onclick="switchView('terminal')" id="nav-terminal" class="nav-item w-full flex items-center justify-between px-2.5 py-2 rounded-lg text-xs font-medium text-surface-subtle hover:text-slate-200 hover:bg-surface-card transition-all group">
+          <div class="flex items-center gap-2.5">
+            <i data-lucide="terminal-square" class="w-4 h-4 text-emerald-400"></i>
+            <span>SSH 终端</span>
+          </div>
+          <div class="flex items-center gap-1.5">
+            <span class="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-ping"></span>
+            <span class="text-[10px] font-mono text-emerald-400">2 在线</span>
+          </div>
+        </button>
+
+        <button onclick="switchView('sftp')" id="nav-sftp" class="nav-item w-full flex items-center justify-between px-2.5 py-2 rounded-lg text-xs font-medium text-surface-subtle hover:text-slate-200 hover:bg-surface-card transition-all group">
+          <div class="flex items-center gap-2.5">
+            <i data-lucide="folder-git-2" class="w-4 h-4 text-cyan-400"></i>
+            <span>SFTP 文件传输</span>
+          </div>
+          <span class="text-[10px] font-mono px-1.5 py-0.2 rounded bg-cyan-500/10 text-cyan-400 border border-cyan-500/20">双栏浏览</span>
+        </button>
+      </div>
+
+      <!-- 分组过滤器 (Host Groups) -->
+      <div class="flex-1 overflow-y-auto px-3 py-3 space-y-4 custom-scrollbar">
+        <div>
+          <div class="flex items-center justify-between px-2 mb-2">
+            <span class="text-[11px] font-semibold text-slate-500 tracking-wider uppercase font-mono">主机分组</span>
+            <button onclick="alert('分组管理功能已准备就绪，可随时添加新自定义标签分组')" class="text-slate-500 hover:text-brand-400 transition-colors p-0.5 rounded" title="添加分组">
+              <i data-lucide="folder-plus" class="w-3.5 h-3.5"></i>
+            </button>
+          </div>
+          <div class="space-y-0.5 text-xs">
+            <button onclick="filterGroup('all', this)" class="group-filter-btn active w-full flex items-center justify-between px-2.5 py-1.5 rounded-md text-slate-200 hover:bg-surface-card transition-colors">
+              <span class="flex items-center gap-2">
+                <i data-lucide="layers" class="w-3.5 h-3.5 text-slate-400"></i>
+                <span>全部服务器</span>
+              </span>
+              <span class="font-mono text-[11px] text-slate-500">6</span>
+            </button>
+            <button onclick="filterGroup('production', this)" class="group-filter-btn w-full flex items-center justify-between px-2.5 py-1.5 rounded-md text-surface-subtle hover:text-slate-200 hover:bg-surface-card transition-colors">
+              <span class="flex items-center gap-2">
+                <span class="w-2 h-2 rounded-full bg-rose-500 ring-2 ring-rose-500/20"></span>
+                <span>生产集群 (Prod)</span>
+              </span>
+              <span class="font-mono text-[11px] text-slate-500">2</span>
+            </button>
+            <button onclick="filterGroup('staging', this)" class="group-filter-btn w-full flex items-center justify-between px-2.5 py-1.5 rounded-md text-surface-subtle hover:text-slate-200 hover:bg-surface-card transition-colors">
+              <span class="flex items-center gap-2">
+                <span class="w-2 h-2 rounded-full bg-amber-500 ring-2 ring-amber-500/20"></span>
+                <span>测试环境 (Stage)</span>
+              </span>
+              <span class="font-mono text-[11px] text-slate-500">2</span>
+            </button>
+            <button onclick="filterGroup('cloud', this)" class="group-filter-btn w-full flex items-center justify-between px-2.5 py-1.5 rounded-md text-surface-subtle hover:text-slate-200 hover:bg-surface-card transition-colors">
+              <span class="flex items-center gap-2">
+                <span class="w-2 h-2 rounded-full bg-blue-500 ring-2 ring-blue-500/20"></span>
+                <span>个人 VPS & 实验机</span>
+              </span>
+              <span class="font-mono text-[11px] text-slate-500">2</span>
+            </button>
+          </div>
+        </div>
+
+        <!-- 凭据保险库 & 常用片段 -->
+        <div>
+          <div class="text-[11px] font-semibold text-slate-500 tracking-wider uppercase px-2 mb-2 font-mono">安全与扩展</div>
+          <div class="space-y-0.5 text-xs">
+            <button onclick="openKeyVaultModal()" class="w-full flex items-center justify-between px-2.5 py-1.5 rounded-md text-surface-subtle hover:text-slate-200 hover:bg-surface-card transition-colors">
+              <span class="flex items-center gap-2">
+                <i data-lucide="key-round" class="w-3.5 h-3.5 text-amber-400"></i>
+                <span>SSH 密钥保险箱</span>
+              </span>
+              <span class="font-mono text-[10px] text-slate-500">4 组密钥</span>
+            </button>
+            <button onclick="openSnippetsModal()" class="w-full flex items-center justify-between px-2.5 py-1.5 rounded-md text-surface-subtle hover:text-slate-200 hover:bg-surface-card transition-colors">
+              <span class="flex items-center gap-2">
+                <i data-lucide="code-2" class="w-3.5 h-3.5 text-purple-400"></i>
+                <span>命令代码片段</span>
+              </span>
+              <span class="font-mono text-[10px] text-slate-500">12 条</span>
+            </button>
+            <button onclick="openTunnelsModal()" class="w-full flex items-center justify-between px-2.5 py-1.5 rounded-md text-surface-subtle hover:text-slate-200 hover:bg-surface-card transition-colors">
+              <span class="flex items-center gap-2">
+                <i data-lucide="network" class="w-3.5 h-3.5 text-cyan-400"></i>
+                <span>端口转发 & 隧道</span>
+              </span>
+              <span class="font-mono text-[10px] text-slate-500">1 活跃</span>
+            </button>
+          </div>
+        </div>
+
+        <!-- 快速连接历史 (Recent) -->
+        <div>
+          <div class="text-[11px] font-semibold text-slate-500 tracking-wider uppercase px-2 mb-2 font-mono">快速直连历史</div>
+          <div class="space-y-1">
+            <div onclick="connectHost('prod-k8s-master-01')" class="p-2 rounded-lg bg-surface-card/60 hover:bg-surface-card border border-surface-border/50 hover:border-brand-500/30 cursor-pointer transition-all flex items-center justify-between">
+              <div class="truncate pr-1">
+                <div class="text-xs font-medium text-slate-200 truncate">prod-k8s-master-01</div>
+                <div class="text-[10px] font-mono text-slate-500">47.98.112.24:22</div>
+              </div>
+              <span class="w-2 h-2 rounded-full bg-emerald-400"></span>
+            </div>
+            <div onclick="connectHost('aliyun-hk-edge')" class="p-2 rounded-lg bg-surface-card/60 hover:bg-surface-card border border-surface-border/50 hover:border-brand-500/30 cursor-pointer transition-all flex items-center justify-between">
+              <div class="truncate pr-1">
+                <div class="text-xs font-medium text-slate-200 truncate">aliyun-hk-edge</div>
+                <div class="text-[10px] font-mono text-slate-500">43.154.201.89:2222</div>
+              </div>
+              <span class="w-2 h-2 rounded-full bg-emerald-400"></span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 侧边栏底部：当前运行环境与网络状态 -->
+      <div class="p-3 border-t border-surface-border bg-surface-card/30 flex items-center justify-between text-xs text-surface-subtle">
+        <div class="flex items-center gap-2">
+          <div class="w-2 h-2 rounded-full bg-emerald-500"></div>
+          <span class="font-mono text-[11px]">SSH 引擎: 就绪</span>
+        </div>
+        <span class="font-mono text-[11px] text-slate-500">Ping: 18ms</span>
+      </div>
+    </aside>
+
+    <!-- 主工作内容区域 (Main Content) -->
+    <main class="flex-1 flex flex-col overflow-hidden bg-surface-base relative">
+
+      <!-- ============================================== -->
+      <!-- VIEW 1: 服务器管理面板 (HOSTS MANAGER VIEW)   -->
+      <!-- ============================================== -->
+      <section id="view-hosts" class="view-panel flex-1 flex flex-col h-full overflow-hidden">
+        <!-- 顶部操作条 -->
+        <div class="h-14 px-6 border-b border-surface-border flex items-center justify-between shrink-0 bg-surface-card/20">
+          <div class="flex items-center gap-4">
+            <div>
+              <h1 class="text-sm font-bold text-white flex items-center gap-2">
+                <span>服务器列表</span>
+                <span class="text-xs px-2 py-0.5 rounded-full bg-surface-card border border-surface-border text-surface-subtle font-mono font-normal" id="host-count-badge">共 6 台主机</span>
+              </h1>
+              <p class="text-[11px] text-surface-subtle">统一管理集群、认证凭证及直连入口</p>
+            </div>
+          </div>
+
+          <!-- 搜索、视图切换、操作按键 -->
+          <div class="flex items-center gap-3">
+            <!-- 搜索框 -->
+            <div class="relative w-64">
+              <i data-lucide="search" class="w-3.5 h-3.5 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2"></i>
+              <input type="text" id="host-search-input" oninput="handleHostSearch(this.value)" placeholder="搜索主机名、IP、标签..." class="w-full bg-surface-card border border-surface-border rounded-lg pl-9 pr-3 py-1.5 text-xs text-slate-200 placeholder-slate-500 focus:outline-none focus:border-brand-500/60 focus:ring-1 focus:ring-brand-500/40 transition-all font-mono">
+            </div>
+
+            <!-- 卡片/表格切换 -->
+            <div class="flex items-center bg-surface-card border border-surface-border rounded-lg p-0.5">
+              <button onclick="setHostLayout('grid')" id="btn-layout-grid" class="p-1 rounded bg-surface-elevated text-white transition-colors" title="网格卡片视图">
+                <i data-lucide="layout-grid" class="w-3.5 h-3.5"></i>
+              </button>
+              <button onclick="setHostLayout('list')" id="btn-layout-list" class="p-1 rounded text-surface-subtle hover:text-white transition-colors" title="紧凑列表视图">
+                <i data-lucide="list" class="w-3.5 h-3.5"></i>
+              </button>
+            </div>
+
+            <!-- 批量导入/导出 -->
+            <button onclick="openImportModal()" class="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-surface-card hover:bg-surface-elevated border border-surface-border text-xs text-slate-300 hover:text-white transition-all">
+              <i data-lucide="file-up" class="w-3.5 h-3.5"></i>
+              <span>导入/导出</span>
+            </button>
+
+            <!-- 新建主机 -->
+            <button onclick="openNewHostModal()" class="flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg bg-brand-500 hover:bg-brand-600 text-slate-950 font-semibold text-xs transition-all shadow-glow-emerald">
+              <i data-lucide="plus" class="w-4 h-4 stroke-[2.5]"></i>
+              <span>新建服务器</span>
+            </button>
+          </div>
+        </div>
+
+        <!-- 服务器卡片列表区 -->
+        <div class="flex-1 overflow-y-auto p-6 custom-scrollbar" id="hosts-container">
+          <!-- 网格布局容器 -->
+          <div id="hosts-grid" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+            <!-- 动态生成或静态示范卡片由 JS / HTML 提供 -->
+          </div>
+        </div>
+      </section>
+
+      <!-- ============================================== -->
+      <!-- VIEW 2: SSH 终端视图 (SSH TERMINAL VIEW)      -->
+      <!-- ============================================== -->
+      <section id="view-terminal" class="view-panel hidden flex-1 flex-col h-full overflow-hidden bg-[#0c0e14]">
+        <!-- 终端标签页管理条 (Tab Bar) -->
+        <div class="h-10 bg-surface-sidebar border-b border-surface-border flex items-center justify-between px-2 shrink-0 select-none">
+          <div class="flex items-center gap-1 overflow-x-auto no-scrollbar flex-1 mr-2" id="terminal-tabs-container">
+            <!-- Tab 1: prod-k8s-master-01 -->
+            <div onclick="switchTerminalTab(0)" class="terminal-tab active group flex items-center gap-2 px-3 py-1.5 rounded-t-lg bg-surface-base border-t-2 border-brand-500 text-xs text-slate-200 cursor-pointer border-x border-surface-border/50">
+              <span class="w-2 h-2 rounded-full bg-emerald-400"></span>
+              <span class="font-mono font-medium">prod-k8s-master-01</span>
+              <span class="text-[10px] text-surface-subtle font-mono">root@47.98.112.24</span>
+              <button onclick="event.stopPropagation(); closeTerminalTab(0)" class="opacity-0 group-hover:opacity-100 p-0.5 rounded hover:bg-surface-elevated text-slate-400 hover:text-white transition-all ml-1">
+                <i data-lucide="x" class="w-3 h-3"></i>
+              </button>
+            </div>
+
+            <!-- Tab 2: aliyun-hk-edge -->
+            <div onclick="switchTerminalTab(1)" class="terminal-tab group flex items-center gap-2 px-3 py-1.5 rounded-t-lg bg-surface-card/40 hover:bg-surface-card text-xs text-surface-subtle hover:text-slate-300 cursor-pointer border-t-2 border-transparent transition-all">
+              <span class="w-2 h-2 rounded-full bg-emerald-400"></span>
+              <span class="font-mono font-medium">aliyun-hk-edge</span>
+              <span class="text-[10px] text-slate-500 font-mono">deploy@43.154.201.89</span>
+              <button onclick="event.stopPropagation(); closeTerminalTab(1)" class="opacity-0 group-hover:opacity-100 p-0.5 rounded hover:bg-surface-elevated text-slate-400 hover:text-white transition-all ml-1">
+                <i data-lucide="x" class="w-3 h-3"></i>
+              </button>
+            </div>
+
+            <!-- 添加新终端会话 Tab -->
+            <button onclick="addNewTerminalTab()" class="p-1 rounded-md text-surface-subtle hover:text-white hover:bg-surface-card transition-colors ml-1" title="打开新终端">
+              <i data-lucide="plus" class="w-4 h-4"></i>
+            </button>
+          </div>
+
+          <!-- 终端操作按钮组：分屏、一键到SFTP、命令代码片段、终端设置 -->
+          <div class="flex items-center gap-1 text-xs">
+            <!-- 一键切换到该主机的 SFTP -->
+            <button onclick="jumpToSftpCurrent()" class="flex items-center gap-1.5 px-2 py-1 rounded bg-cyan-500/10 text-cyan-400 border border-cyan-500/30 hover:bg-cyan-500/20 text-xs font-medium transition-all" title="打开此服务器的 SFTP 目录">
+              <i data-lucide="folder-git-2" class="w-3.5 h-3.5"></i>
+              <span class="hidden sm:inline">打开 SFTP</span>
+            </button>
+
+            <!-- 分屏按钮 -->
+            <button onclick="toggleSplitScreen()" class="p-1.5 rounded hover:bg-surface-elevated text-surface-subtle hover:text-white transition-colors" title="水平/垂直分屏">
+              <i data-lucide="columns-2" class="w-3.5 h-3.5"></i>
+            </button>
+
+            <!-- 清屏 -->
+            <button onclick="clearTerminalScreen()" class="p-1.5 rounded hover:bg-surface-elevated text-surface-subtle hover:text-white transition-colors" title="清除屏幕 (Ctrl+L)">
+              <i data-lucide="eraser" class="w-3.5 h-3.5"></i>
+            </button>
+
+            <!-- 广播输入 -->
+            <button onclick="alert('多会话同步广播模式已就绪，可同时向多个主机批量执行指令')" class="p-1.5 rounded hover:bg-surface-elevated text-surface-subtle hover:text-white transition-colors" title="多会话指令广播 (Broadcast)">
+              <i data-lucide="radio" class="w-3.5 h-3.5"></i>
+            </button>
+          </div>
+        </div>
+
+        <!-- 终端快捷命令片段工具栏 (Quick Snippets Bar) -->
+        <div class="h-8 bg-surface-card/40 border-b border-surface-border/60 px-3 flex items-center justify-between text-xs shrink-0 select-none">
+          <div class="flex items-center gap-2 overflow-x-auto no-scrollbar py-1">
+            <span class="text-[10px] font-mono text-slate-500 uppercase flex items-center gap-1">
+              <i data-lucide="zap" class="w-3 h-3 text-amber-400"></i>
+              <span>常用指令:</span>
+            </span>
+            <button onclick="sendSnippet('docker ps')" class="snippet-btn px-2 py-0.5 rounded bg-surface-card hover:bg-surface-elevated text-[11px] font-mono text-slate-300 hover:text-brand-300 border border-surface-border transition-colors">
+              docker ps
+            </button>
+            <button onclick="sendSnippet('free -h && df -h')" class="snippet-btn px-2 py-0.5 rounded bg-surface-card hover:bg-surface-elevated text-[11px] font-mono text-slate-300 hover:text-brand-300 border border-surface-border transition-colors">
+              free -h
+            </button>
+            <button onclick="sendSnippet('systemctl status nginx')" class="snippet-btn px-2 py-0.5 rounded bg-surface-card hover:bg-surface-elevated text-[11px] font-mono text-slate-300 hover:text-brand-300 border border-surface-border transition-colors">
+              systemctl status nginx
+            </button>
+            <button onclick="sendSnippet('netstat -tulpn')" class="snippet-btn px-2 py-0.5 rounded bg-surface-card hover:bg-surface-elevated text-[11px] font-mono text-slate-300 hover:text-brand-300 border border-surface-border transition-colors">
+              netstat -tulpn
+            </button>
+            <button onclick="sendSnippet('journalctl -u app.service -n 50 -f')" class="snippet-btn px-2 py-0.5 rounded bg-surface-card hover:bg-surface-elevated text-[11px] font-mono text-slate-300 hover:text-brand-300 border border-surface-border transition-colors">
+              查看日志
+            </button>
+          </div>
+          <div class="flex items-center gap-3 text-[11px] font-mono text-slate-500">
+            <span>UTF-8</span>
+            <span>xterm-256color</span>
+            <span>80x24</span>
+          </div>
+        </div>
+
+        <!-- 终端屏幕内容渲染区 (仿真实的 Warp / JetBrains 极客终端体验) -->
+        <div id="terminal-screen" class="flex-1 p-4 font-mono text-[13px] leading-relaxed overflow-y-auto custom-scrollbar select-text bg-[#0c0e14]">
+          <!-- 终端输出流由 JS 维护与互动 -->
+        </div>
+
+        <!-- 终端底部状态提示 -->
+        <div class="h-6 bg-surface-sidebar border-t border-surface-border px-3 flex items-center justify-between text-[11px] font-mono text-surface-subtle shrink-0">
+          <div class="flex items-center gap-3">
+            <span class="flex items-center gap-1.5 text-emerald-400">
+              <span class="w-1.5 h-1.5 rounded-full bg-emerald-400"></span>
+              <span>已连接 (SSH-2.0-OpenSSH_8.9p1)</span>
+            </span>
+            <span>编码: UTF-8</span>
+            <span>加密: chacha20-poly1305@openssh.com</span>
+          </div>
+          <div class="flex items-center gap-2">
+            <span>支持上下方向键检索历史命令，按 Enter 执行</span>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============================================== -->
+      <!-- VIEW 3: SFTP 文件管理器视图 (SFTP EXPLORER VIEW) -->
+      <!-- ============================================== -->
+      <section id="view-sftp" class="view-panel hidden flex-1 flex-col h-full overflow-hidden bg-surface-base">
+        <!-- SFTP 顶部工具控制栏 -->
+        <div class="h-12 border-b border-surface-border px-4 flex items-center justify-between shrink-0 bg-surface-card/30">
+          <!-- 目标主机选择器与当前路径面包屑 -->
+          <div class="flex items-center gap-3 flex-1 mr-4">
+            <!-- 主机选择切换下拉 -->
+            <div class="relative">
+              <button onclick="toggleSftpHostDropdown()" class="flex items-center gap-2 px-2.5 py-1 rounded-lg bg-surface-card border border-surface-border hover:border-brand-500/40 text-xs font-mono text-slate-200">
+                <span class="w-2 h-2 rounded-full bg-emerald-400"></span>
+                <span id="current-sftp-host-name">prod-k8s-master-01</span>
+                <i data-lucide="chevron-down" class="w-3 h-3 text-slate-400"></i>
+              </button>
+            </div>
+
+            <!-- 面包屑路径与快速输入跳转 -->
+            <div class="flex-1 flex items-center bg-surface-card border border-surface-border rounded-lg px-2.5 py-1 text-xs font-mono">
+              <i data-lucide="folder" class="w-3.5 h-3.5 text-amber-400 mr-2 shrink-0"></i>
+              <div id="sftp-breadcrumb" class="flex items-center gap-1 text-slate-300 overflow-x-auto no-scrollbar flex-1">
+                <!-- 面包屑节点动态渲染 -->
+              </div>
+              <button onclick="copyCurrentPath()" class="text-slate-500 hover:text-white p-0.5 rounded transition-colors ml-2" title="复制完整路径">
+                <i data-lucide="copy" class="w-3.5 h-3.5"></i>
+              </button>
+            </div>
+          </div>
+
+          <!-- SFTP 操作按钮：上传、下载、新建目录、刷新、隐藏文件开关 -->
+          <div class="flex items-center gap-2 text-xs">
+            <button onclick="triggerUploadFile()" class="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-brand-500 hover:bg-brand-600 text-slate-950 font-semibold transition-all shadow-glow-emerald">
+              <i data-lucide="upload" class="w-3.5 h-3.5 stroke-[2.5]"></i>
+              <span>上传文件</span>
+            </button>
+
+            <button onclick="openNewFolderModal()" class="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-surface-card hover:bg-surface-elevated border border-surface-border text-slate-300 hover:text-white transition-colors">
+              <i data-lucide="folder-plus" class="w-3.5 h-3.5"></i>
+              <span>新建文件夹</span>
+            </button>
+
+            <button onclick="refreshSftpList()" class="p-1.5 rounded-lg bg-surface-card hover:bg-surface-elevated border border-surface-border text-slate-300 hover:text-white transition-colors" title="刷新目录 (F5)">
+              <i data-lucide="refresh-cw" class="w-3.5 h-3.5" id="sftp-refresh-icon"></i>
+            </button>
+
+            <button onclick="toggleHiddenFiles()" id="btn-toggle-hidden" class="p-1.5 rounded-lg bg-surface-card hover:bg-surface-elevated border border-surface-border text-slate-300 hover:text-white transition-colors" title="显示/隐藏以点开头的文件">
+              <i data-lucide="eye" class="w-3.5 h-3.5"></i>
+            </button>
+
+            <button onclick="openInTerminalCurrentDir()" class="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-surface-card hover:bg-surface-elevated border border-surface-border text-slate-300 hover:text-white transition-colors" title="在此目录打开终端">
+              <i data-lucide="terminal" class="w-3.5 h-3.5 text-emerald-400"></i>
+              <span>在终端打开</span>
+            </button>
+          </div>
+        </div>
+
+        <!-- SFTP 表格区域 (高质感文件树状列表) -->
+        <div class="flex-1 overflow-y-auto custom-scrollbar select-none" id="sftp-table-container">
+          <table class="w-full text-left text-xs border-collapse">
+            <thead class="sticky top-0 bg-surface-sidebar border-b border-surface-border text-[11px] font-mono text-slate-400 uppercase tracking-wider z-10">
+              <tr>
+                <th class="py-2.5 px-4 font-medium w-12 text-center">
+                  <input type="checkbox" id="select-all-files" onchange="toggleSelectAllFiles(this)" class="rounded bg-surface-card border-surface-border text-brand-500 focus:ring-0">
+                </th>
+                <th class="py-2.5 px-4 font-medium">名称</th>
+                <th class="py-2.5 px-4 font-medium w-28 text-right">大小</th>
+                <th class="py-2.5 px-4 font-medium w-28">类型</th>
+                <th class="py-2.5 px-4 font-medium w-28 font-mono">权限 (chmod)</th>
+                <th class="py-2.5 px-4 font-medium w-28">用户/组</th>
+                <th class="py-2.5 px-4 font-medium w-40">修改时间</th>
+                <th class="py-2.5 px-4 font-medium w-24 text-center">操作</th>
+              </tr>
+            </thead>
+            <tbody id="sftp-file-rows" class="divide-y divide-surface-border/40 font-mono">
+              <!-- 动态文件行 -->
+            </tbody>
+          </table>
+        </div>
+
+        <!-- 底部快捷状态与磁盘容量指示 -->
+        <div class="h-8 bg-surface-sidebar border-t border-surface-border px-4 flex items-center justify-between text-xs text-surface-subtle shrink-0">
+          <div class="flex items-center gap-4">
+            <span id="sftp-status-text">14 项 (共 2.4 GB)</span>
+            <span class="text-slate-600">|</span>
+            <span id="sftp-selected-text">未选中项目</span>
+          </div>
+          <!-- 远端磁盘空间微条 -->
+          <div class="flex items-center gap-2">
+            <span class="text-[11px] font-mono text-slate-400">远端磁盘 /dev/vda1: 42.8 GB / 100 GB (42%)</span>
+            <div class="w-24 h-1.5 bg-surface-highlight rounded-full overflow-hidden">
+              <div class="h-full bg-brand-500 rounded-full" style="width: 42%;"></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+    </main>
+
+    <!-- ============================================== -->
+    <!-- 悬浮传输抽屉面板 (TRANSFER QUEUE DRAWER)       -->
+    <!-- ============================================== -->
+    <div id="transfer-drawer" class="absolute bottom-4 right-4 w-96 max-h-[460px] bg-surface-sidebar/95 backdrop-blur-xl border border-surface-border rounded-xl shadow-2xl flex flex-col z-40 transition-all duration-300 transform translate-y-4 opacity-0 pointer-events-none">
+      <!-- 抽屉头部 -->
+      <div class="p-3 border-b border-surface-border flex items-center justify-between shrink-0">
+        <div class="flex items-center gap-2">
+          <div class="w-2 h-2 rounded-full bg-brand-500 animate-pulse"></div>
+          <h3 class="text-xs font-bold text-white font-mono uppercase tracking-wide">传输任务队列 (Transfers)</h3>
+        </div>
+        <div class="flex items-center gap-2">
+          <button onclick="clearCompletedTransfers()" class="text-[11px] text-surface-subtle hover:text-white transition-colors" title="清除已完成">清除已完成</button>
+          <button onclick="toggleTransferDrawer(false)" class="p-1 rounded hover:bg-surface-elevated text-slate-400 hover:text-white">
+            <i data-lucide="x" class="w-3.5 h-3.5"></i>
+          </button>
+        </div>
+      </div>
+
+      <!-- 任务列表 -->
+      <div class="flex-1 overflow-y-auto p-3 space-y-2.5 custom-scrollbar" id="transfer-list-items">
+        <!-- 任务 1: 上传中 -->
+        <div class="p-2.5 rounded-lg bg-surface-card border border-surface-border/80 space-y-2">
+          <div class="flex items-center justify-between text-xs">
+            <div class="flex items-center gap-2 truncate pr-2">
+              <i data-lucide="arrow-up-circle" class="w-4 h-4 text-brand-400 shrink-0"></i>
+              <span class="font-medium text-slate-200 truncate">frontend-dist-v2.1.tar.gz</span>
+            </div>
+            <span class="font-mono text-[11px] text-brand-400 font-semibold shrink-0">78%</span>
+          </div>
+          <div class="w-full bg-surface-highlight h-1.5 rounded-full overflow-hidden">
+            <div class="bg-gradient-to-r from-brand-500 to-cyan-400 h-full rounded-full transition-all duration-300" style="width: 78%;"></div>
+          </div>
+          <div class="flex items-center justify-between text-[10px] font-mono text-slate-400">
+            <span>312 MB / 400 MB</span>
+            <span>14.2 MB/s · 剩余 6秒</span>
+          </div>
+        </div>
+
+        <!-- 任务 2: 下载中 -->
+        <div class="p-2.5 rounded-lg bg-surface-card border border-surface-border/80 space-y-2">
+          <div class="flex items-center justify-between text-xs">
+            <div class="flex items-center gap-2 truncate pr-2">
+              <i data-lucide="arrow-down-circle" class="w-4 h-4 text-cyan-400 shrink-0"></i>
+              <span class="font-medium text-slate-200 truncate">nginx-access-20250220.log</span>
+            </div>
+            <span class="font-mono text-[11px] text-cyan-400 font-semibold shrink-0">45%</span>
+          </div>
+          <div class="w-full bg-surface-highlight h-1.5 rounded-full overflow-hidden">
+            <div class="bg-cyan-500 h-full rounded-full transition-all duration-300" style="width: 45%;"></div>
+          </div>
+          <div class="flex items-center justify-between text-[10px] font-mono text-slate-400">
+            <span>45 MB / 100 MB</span>
+            <span>4.2 MB/s · 剩余 13秒</span>
+          </div>
+        </div>
+
+        <!-- 任务 3: 已完成 -->
+        <div class="p-2.5 rounded-lg bg-surface-card/40 border border-surface-border/40 space-y-1 opacity-70">
+          <div class="flex items-center justify-between text-xs">
+            <div class="flex items-center gap-2 truncate pr-2">
+              <i data-lucide="check-circle" class="w-4 h-4 text-emerald-400 shrink-0"></i>
+              <span class="font-medium text-slate-300 truncate">app-config-production.yaml</span>
+            </div>
+            <span class="font-mono text-[10px] text-emerald-400 font-semibold shrink-0">完成</span>
+          </div>
+          <div class="flex items-center justify-between text-[10px] font-mono text-slate-500">
+            <span>24 KB</span>
+            <span>已成功传输到 /etc/snail/</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- ============================================== -->
+  <!-- 弹窗 1: 新建/编辑服务器 (NEW/EDIT HOST MODAL)   -->
+  <!-- ============================================== -->
+  <div id="modal-new-host" class="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center p-4 hidden opacity-0 transition-opacity duration-200">
+    <div class="w-full max-w-xl bg-surface-sidebar border border-surface-border rounded-2xl shadow-2xl overflow-hidden flex flex-col transform scale-95 transition-transform duration-200" id="modal-new-host-box">
+      <!-- 弹窗顶栏 -->
+      <div class="px-6 py-4 border-b border-surface-border flex items-center justify-between bg-surface-card/30">
+        <div class="flex items-center gap-2.5">
+          <div class="w-8 h-8 rounded-lg bg-brand-500/10 border border-brand-500/20 flex items-center justify-center text-brand-400">
+            <i data-lucide="server" class="w-4 h-4"></i>
+          </div>
+          <div>
+            <h2 class="text-sm font-bold text-white" id="modal-host-title">配置 SSH 服务器</h2>
+            <p class="text-[11px] text-surface-subtle">填写连接凭证、认证方式及跳板机参数</p>
+          </div>
+        </div>
+        <button onclick="closeNewHostModal()" class="p-1.5 rounded-lg hover:bg-surface-elevated text-slate-400 hover:text-white transition-colors">
+          <i data-lucide="x" class="w-4 h-4"></i>
+        </button>
+      </div>
+
+      <!-- 表单内容 -->
+      <form id="form-new-host" onsubmit="handleSaveHost(event)" class="p-6 space-y-4 max-h-[75vh] overflow-y-auto custom-scrollbar">
+        <!-- 标签页切换：基础配置 / 高级跳板机 -->
+        <div class="flex border-b border-surface-border text-xs mb-3">
+          <button type="button" class="px-4 py-2 border-b-2 border-brand-500 text-brand-400 font-medium">常规设置</button>
+          <button type="button" onclick="alert('支持设置 Jump Server (ProxyJump 堡垒机)、SOCKS5 代理、Keepalive 频率等')" class="px-4 py-2 border-b-2 border-transparent text-slate-400 hover:text-slate-200">跳板机 & 代理</button>
+          <button type="button" onclick="alert('支持设置 X11 转发、启动脚本 (Startup Script)、环境变数')" class="px-4 py-2 border-b-2 border-transparent text-slate-400 hover:text-slate-200">高级终端</button>
+        </div>
+
+        <div class="grid grid-cols-2 gap-4">
+          <div class="space-y-1.5 col-span-2 sm:col-span-1">
+            <label class="text-xs font-medium text-slate-300">服务器别名 (Name) <span class="text-rose-400">*</span></label>
+            <input type="text" id="host-name" required placeholder="如: prod-k8s-master-01" class="w-full bg-surface-card border border-surface-border rounded-lg px-3 py-2 text-xs text-white focus:outline-none focus:border-brand-500 transition-colors font-mono">
+          </div>
+          <div class="space-y-1.5 col-span-2 sm:col-span-1">
+            <label class="text-xs font-medium text-slate-300">所属分组 (Group)</label>
+            <select id="host-group" class="w-full bg-surface-card border border-surface-border rounded-lg px-3 py-2 text-xs text-white focus:outline-none focus:border-brand-500 transition-colors font-mono">
+              <option value="production">生产集群 (Production)</option>
+              <option value="staging">测试环境 (Staging)</option>
+              <option value="cloud">个人 VPS & 实验机</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="grid grid-cols-3 gap-4">
+          <div class="col-span-2 space-y-1.5">
+            <label class="text-xs font-medium text-slate-300">主机地址 / IP (Host) <span class="text-rose-400">*</span></label>
+            <input type="text" id="host-ip" required placeholder="192.168.1.1 或 domain.com" class="w-full bg-surface-card border border-surface-border rounded-lg px-3 py-2 text-xs text-white focus:outline-none focus:border-brand-500 transition-colors font-mono">
+          </div>
+          <div class="col-span-1 space-y-1.5">
+            <label class="text-xs font-medium text-slate-300">SSH 端口</label>
+            <input type="number" id="host-port" value="22" required class="w-full bg-surface-card border border-surface-border rounded-lg px-3 py-2 text-xs text-white focus:outline-none focus:border-brand-500 transition-colors font-mono">
+          </div>
+        </div>
+
+        <!-- 认证方式 -->
+        <div class="space-y-3 pt-2">
+          <label class="text-xs font-medium text-slate-300 block">身份认证方式 (Authentication)</label>
+          <div class="grid grid-cols-3 gap-2">
+            <label class="flex items-center gap-2 p-2.5 rounded-lg bg-surface-card border border-surface-border hover:border-brand-500/50 cursor-pointer">
+              <input type="radio" name="auth-type" value="password" checked onchange="switchAuthType('password')" class="text-brand-500 focus:ring-0">
+              <span class="text-xs text-slate-200">密码认证</span>
+            </label>
+            <label class="flex items-center gap-2 p-2.5 rounded-lg bg-surface-card border border-surface-border hover:border-brand-500/50 cursor-pointer">
+              <input type="radio" name="auth-type" value="key" onchange="switchAuthType('key')" class="text-brand-500 focus:ring-0">
+              <span class="text-xs text-slate-200">私钥 (Key)</span>
+            </label>
+            <label class="flex items-center gap-2 p-2.5 rounded-lg bg-surface-card border border-surface-border hover:border-brand-500/50 cursor-pointer">
+              <input type="radio" name="auth-type" value="agent" onchange="switchAuthType('agent')" class="text-brand-500 focus:ring-0">
+              <span class="text-xs text-slate-200">SSH Agent</span>
+            </label>
+          </div>
+
+          <div class="space-y-1.5">
+            <label class="text-xs font-medium text-slate-300">登录用户名 (Username) <span class="text-rose-400">*</span></label>
+            <input type="text" id="host-user" value="root" required class="w-full bg-surface-card border border-surface-border rounded-lg px-3 py-2 text-xs text-white focus:outline-none focus:border-brand-500 transition-colors font-mono">
+          </div>
+
+          <div id="auth-password-field" class="space-y-1.5">
+            <label class="text-xs font-medium text-slate-300">登录密码 (Password)</label>
+            <input type="password" id="host-password" placeholder="••••••••••••" class="w-full bg-surface-card border border-surface-border rounded-lg px-3 py-2 text-xs text-white focus:outline-none focus:border-brand-500 transition-colors font-mono">
+          </div>
+
+          <div id="auth-key-field" class="space-y-1.5 hidden">
+            <div class="flex items-center justify-between">
+              <label class="text-xs font-medium text-slate-300">私钥凭证 (Private Key)</label>
+              <button type="button" class="text-[11px] text-brand-400 hover:underline">从密钥库挑选</button>
+            </div>
+            <textarea id="host-key" rows="3" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----..." class="w-full bg-surface-card border border-surface-border rounded-lg px-3 py-2 text-xs text-white focus:outline-none focus:border-brand-500 transition-colors font-mono"></textarea>
+          </div>
+        </div>
+
+        <!-- 标签设置 (Tags) -->
+        <div class="space-y-1.5">
+          <label class="text-xs font-medium text-slate-300">分类标签 (逗号分隔)</label>
+          <input type="text" id="host-tags" value="Ubuntu 22.04, k8s, master" placeholder="如: Web, Nginx, Aliyun" class="w-full bg-surface-card border border-surface-border rounded-lg px-3 py-2 text-xs text-white focus:outline-none focus:border-brand-500 transition-colors font-mono">
+        </div>
+
+        <!-- 底部按键 -->
+        <div class="pt-4 flex items-center justify-end gap-3 border-t border-surface-border">
+          <button type="button" onclick="closeNewHostModal()" class="px-4 py-2 rounded-lg bg-surface-card hover:bg-surface-elevated text-xs text-slate-300 hover:text-white transition-colors">
+            取消
+          </button>
+          <button type="button" onclick="testConnection()" class="px-4 py-2 rounded-lg bg-surface-elevated border border-surface-border hover:border-brand-500/50 text-xs text-brand-400 transition-colors">
+            测试连接
+          </button>
+          <button type="submit" class="px-5 py-2 rounded-lg bg-brand-500 hover:bg-brand-600 text-slate-950 font-semibold text-xs shadow-glow-emerald transition-all">
+            保存服务器
+          </button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- ============================================== -->
+  <!-- 弹窗 2: SFTP 在线文件编辑器 (INLINE CODE EDITOR)-->
+  <!-- ============================================== -->
+  <div id="modal-file-editor" class="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 flex items-center justify-center p-6 hidden opacity-0 transition-opacity duration-200">
+    <div class="w-full max-w-4xl h-[80vh] bg-surface-sidebar border border-surface-border rounded-2xl shadow-2xl flex flex-col overflow-hidden">
+      <!-- 编辑器顶栏 -->
+      <div class="h-12 border-b border-surface-border px-4 flex items-center justify-between bg-surface-card/50">
+        <div class="flex items-center gap-3">
+          <i data-lucide="file-code" class="w-4 h-4 text-brand-400"></i>
+          <div>
+            <div class="text-xs font-bold text-white font-mono flex items-center gap-2">
+              <span id="editor-file-path">/etc/nginx/nginx.conf</span>
+              <span class="text-[10px] px-1.5 py-0.2 rounded bg-amber-500/20 text-amber-300 font-normal">远程实时编辑</span>
+            </div>
+          </div>
+        </div>
+        <div class="flex items-center gap-2">
+          <button onclick="saveEditorContent()" class="flex items-center gap-1.5 px-3 py-1 rounded bg-brand-500 hover:bg-brand-600 text-slate-950 font-semibold text-xs transition-all shadow-glow-emerald">
+            <i data-lucide="save" class="w-3.5 h-3.5"></i>
+            <span>保存并远程同步</span>
+          </button>
+          <button onclick="closeFileEditor()" class="p-1 rounded hover:bg-surface-elevated text-slate-400 hover:text-white">
+            <i data-lucide="x" class="w-4 h-4"></i>
+          </button>
+        </div>
+      </div>
+      <!-- 编辑器文本区域 -->
+      <div class="flex-1 flex overflow-hidden">
+        <!-- 行号 -->
+        <div class="w-12 py-3 bg-surface-base text-right pr-3 font-mono text-xs text-slate-600 select-none border-r border-surface-border leading-6" id="editor-linenumbers">
+          1<br>2<br>3<br>4<br>5<br>6<br>7<br>8<br>9<br>10<br>11<br>12<br>13<br>14<br>15<br>16<br>17<br>18
+        </div>
+        <!-- 代码正文 -->
+        <textarea id="editor-textarea" spellcheck="false" class="flex-1 p-3 bg-[#0a0d14] text-slate-200 font-mono text-xs leading-6 resize-none focus:outline-none custom-scrollbar"></textarea>
+      </div>
+      <!-- 编辑器底部信息 -->
+      <div class="h-7 bg-surface-card border-t border-surface-border px-4 flex items-center justify-between text-[11px] font-mono text-surface-subtle">
+        <span>编码: UTF-8 | 换行: LF | 模式: Nginx Configuration</span>
+        <span id="editor-sync-status">就绪，修改后按 Ctrl+S 快速保存</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============================================== -->
+  <!-- 弹窗 3: 全局命令调色板 (COMMAND PALETTE Ctrl+K)-->
+  <!-- ============================================== -->
+  <div id="modal-command-palette" class="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-start justify-center pt-24 p-4 hidden opacity-0 transition-opacity duration-200" onclick="handlePaletteBackdropClick(event)">
+    <div class="w-full max-w-xl bg-surface-sidebar border border-surface-border rounded-xl shadow-2xl overflow-hidden flex flex-col" onclick="event.stopPropagation()">
+      <div class="p-3 border-b border-surface-border flex items-center gap-3 bg-surface-card/40">
+        <i data-lucide="search" class="w-4 h-4 text-brand-400"></i>
+        <input type="text" id="palette-input" oninput="filterPalette(this.value)" placeholder="输入指令、直连主机、快捷动作..." class="w-full bg-transparent border-none text-xs text-white placeholder-slate-500 focus:outline-none font-mono">
+        <kbd class="text-[10px] bg-surface-highlight text-slate-400 px-1.5 py-0.5 rounded border border-surface-border">ESC</kbd>
+      </div>
+      <div class="p-2 max-h-80 overflow-y-auto space-y-1 custom-scrollbar" id="palette-list">
+        <!-- 快速直连选项 -->
+        <div class="text-[10px] font-mono text-slate-500 uppercase px-2 py-1">快速直连主机</div>
+        <div onclick="selectPaletteAction('ssh-prod-01')" class="palette-item flex items-center justify-between px-3 py-2 rounded-lg hover:bg-brand-500/10 text-xs text-slate-200 hover:text-brand-300 cursor-pointer">
+          <span class="flex items-center gap-2">
+            <i data-lucide="terminal" class="w-3.5 h-3.5 text-emerald-400"></i>
+            <span>直连 prod-k8s-master-01 (47.98.112.24)</span>
+          </span>
+          <span class="text-[10px] font-mono text-slate-500">SSH 终端</span>
+        </div>
+        <div onclick="selectPaletteAction('sftp-prod-01')" class="palette-item flex items-center justify-between px-3 py-2 rounded-lg hover:bg-cyan-500/10 text-xs text-slate-200 hover:text-cyan-300 cursor-pointer">
+          <span class="flex items-center gap-2">
+            <i data-lucide="folder-git-2" class="w-3.5 h-3.5 text-cyan-400"></i>
+            <span>浏览 prod-k8s-master-01 远端文件</span>
+          </span>
+          <span class="text-[10px] font-mono text-slate-500">SFTP</span>
+        </div>
+        <div class="text-[10px] font-mono text-slate-500 uppercase px-2 py-1 mt-2">系统动作</div>
+        <div onclick="openNewHostModal(); toggleCommandPalette(false);" class="palette-item flex items-center justify-between px-3 py-2 rounded-lg hover:bg-surface-elevated text-xs text-slate-200 cursor-pointer">
+          <span class="flex items-center gap-2">
+            <i data-lucide="plus-circle" class="w-3.5 h-3.5 text-brand-400"></i>
+            <span>新建 SSH 服务器配置</span>
+          </span>
+          <kbd class="text-[10px] font-mono text-slate-500">Ctrl + N</kbd>
+        </div>
+        <div onclick="toggleTransferDrawer(true); toggleCommandPalette(false);" class="palette-item flex items-center justify-between px-3 py-2 rounded-lg hover:bg-surface-elevated text-xs text-slate-200 cursor-pointer">
+          <span class="flex items-center gap-2">
+            <i data-lucide="arrow-up-down" class="w-3.5 h-3.5 text-cyan-400"></i>
+            <span>查看当前传输队列进度</span>
+          </span>
+          <kbd class="text-[10px] font-mono text-slate-500">Ctrl + T</kbd>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Toast 提示容器 -->
+  <div id="toast-container" class="fixed top-4 right-4 z-50 flex flex-col gap-2 pointer-events-none"></div>
+
+  <!-- 引入逻辑脚本 -->
+  <script src="app.js"></script>
+  <script>
+    // 初始化 Lucide 图标
+    document.addEventListener("DOMContentLoaded", () => {
+      lucide.createIcons();
+    });
+  </script>
+</body>
+</html>

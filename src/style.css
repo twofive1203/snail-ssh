@@ -1,0 +1,68 @@
+/* 引入 @xterm/xterm 样式 */
+@import '@xterm/xterm/css/xterm.css';
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* 全局极简暗黑滚动条 */
+.custom-scrollbar::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+.custom-scrollbar::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.custom-scrollbar::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.12);
+  border-radius: 9999px;
+}
+
+.custom-scrollbar::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.25);
+}
+
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+.no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+/* 现代化精致边框光晕卡片 */
+.host-card {
+  position: relative;
+  transition: all 0.22s cubic-bezier(0.16, 1, 0.3, 1);
+  background: linear-gradient(135deg, rgba(22, 26, 38, 0.95) 0%, rgba(18, 21, 31, 0.85) 100%);
+  backdrop-filter: blur(12px);
+}
+
+.host-card:hover {
+  transform: translateY(-2px);
+  border-color: rgba(16, 185, 129, 0.45);
+  box-shadow: 0 12px 30px -10px rgba(0, 0, 0, 0.7), 0 0 16px -2px rgba(16, 185, 129, 0.25);
+}
+
+/* 终端容器美化 */
+.xterm-viewport::-webkit-scrollbar {
+  width: 8px;
+}
+.xterm-viewport::-webkit-scrollbar-track {
+  background: #0c0e14;
+}
+.xterm-viewport::-webkit-scrollbar-thumb {
+  background: #262d40;
+  border-radius: 4px;
+}
+.xterm-viewport::-webkit-scrollbar-thumb:hover {
+  background: #3a4561;
+}
+
+/* 键盘按键质感 */
+kbd {
+  font-family: "JetBrains Mono", monospace;
+  box-shadow: inset 0 -1px 0 rgba(0, 0, 0, 0.3);
+}
