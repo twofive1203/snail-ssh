@@ -49,6 +49,7 @@
         :active-tab-index="session.activeTerminalIndex"
         :sidebar-collapsed="isCollapsed"
         :active="!!isActive"
+        :host-key="terminalHostKey"
         @switch-tab="(idx) => emit('switch-terminal-tab', idx)"
         @close-tab="(idx) => emit('close-terminal-tab', idx)"
         @add-tab="emit('add-terminal-tab')"
@@ -110,6 +111,11 @@ const emit = defineEmits<{
 
 const terminalRef = ref<InstanceType<typeof TerminalView> | null>(null)
 const fileTreeRef = ref<InstanceType<typeof FileTree> | null>(null)
+
+// 命令历史按 "user@host:port" 归属：比 hostId 稳定，临时会话/重新导入资产后历史不丢
+const terminalHostKey = computed(
+  () => `${props.session.host.username}@${props.session.host.host}:${props.session.host.port}`
+)
 
 // 远端监控状态与数据
 const remoteMetrics = ref<RemoteSystemMetrics | null>(null)

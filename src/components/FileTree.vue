@@ -1,5 +1,10 @@
 <template>
-  <div class="h-full flex flex-col bg-surface-sidebar border-r border-surface-border overflow-hidden select-none">
+  <div
+    class="h-full flex flex-col bg-surface-sidebar border-r border-surface-border overflow-hidden select-none"
+    data-drop-target="sftp"
+    :data-remote-path="currentPath"
+    :data-session-id="sessionId"
+  >
     <!-- 1. 顶部工作区标头栏 (仿现代化标签与窗格控制) -->
     <div class="h-9 bg-surface-sidebar border-b border-surface-border px-3 flex items-center justify-between shrink-0">
       <div class="flex items-center gap-1.5">

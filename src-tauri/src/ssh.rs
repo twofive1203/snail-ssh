@@ -4,12 +4,14 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use ssh2::{CheckResult, KnownHostFileKind};
 use std::collections::HashMap;
+use std::fs;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter};
 use uuid::Uuid;
 
@@ -140,6 +142,257 @@ pub struct ActiveSession {
     sftp_session: Arc<Mutex<Option<Arc<Mutex<ssh2::Session>>>>>,
     config: SshConnectConfig,
     is_alive: Arc<AtomicBool>,
+    /// 会话日志槽：开着时读线程把脱敏后的输出 try_send 给专用 writer 线程
+    log_sink: Arc<Mutex<Option<LogSink>>>,
+}
+
+/// 会话日志的写入句柄：路径用于前端展示，tx 交给 writer 线程落盘。
+/// 直接 drop 即关闭 channel，writer 线程随之 flush 退出。
+struct LogSink {
+    path: PathBuf,
+    tx: SyncSender<String>,
+}
+
+/// 会话日志缓冲上限：写线程跟不上时丢弃而不是阻塞终端读线程
+const LOG_CHANNEL_CAPACITY: usize = 256;
+
+/// 落盘前脱敏的敏感键（小写匹配，要求词边界）
+const SECRET_KEYS: [&str; 9] = [
+    "password",
+    "passphrase",
+    "passwd",
+    "pwd",
+    "token",
+    "secret",
+    "api_key",
+    "apikey",
+    "access_key",
+];
+
+/// 把文件名中的非法字符替换掉（Windows 限制较严）
+fn sanitize_host(label: &str) -> String {
+    let cleaned: String = label
+        .chars()
+        .map(|c| {
+            if "/\\:*?\"<>|".contains(c) || c.is_control() {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    if cleaned.trim().is_empty() {
+        "unknown-host".to_string()
+    } else {
+        cleaned.chars().take(80).collect()
+    }
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Unix 时间戳 → UTC 的 `YYYYMMDD_HHMMSS`（不引入日期库）
+fn format_timestamp(secs: u64) -> String {
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    let (year, month, day) = civil_from_days(days);
+    format!(
+        "{:04}{:02}{:02}_{:02}{:02}{:02}",
+        year,
+        month,
+        day,
+        rem / 3600,
+        (rem % 3600) / 60,
+        rem % 60
+    )
+}
+
+/// Howard Hinnant 的 civil-from-days 算法
+fn civil_from_days(z: i64) -> (i64, u64, u64) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// 找到下一个敏感键的 (键起始, 值起始)；值起始越界或未构成键值对时跳过。
+/// 全部为线性扫描、长度有界，避免在读线程里触发正则回溯。
+fn find_next_secret(text: &str) -> Option<(usize, usize)> {
+    let mut best = find_next_key_secret(text);
+    if let Some(flag) = find_password_flag(text) {
+        if best.map_or(true, |(b, _)| flag.0 < b) {
+            best = Some(flag);
+        }
+    }
+    best
+}
+
+fn find_next_key_secret(text: &str) -> Option<(usize, usize)> {
+    let lower = text.to_lowercase();
+    let bytes = text.as_bytes();
+    let mut best: Option<(usize, usize)> = None;
+    for key in SECRET_KEYS {
+        let mut from = 0;
+        while let Some(pos) = lower[from..].find(key) {
+            let abs = from + pos;
+            let boundary_ok = abs == 0 || !bytes[abs - 1].is_ascii_alphanumeric();
+            if boundary_ok {
+                if let Some(value_start) = separator_value_start(text, abs + key.len()) {
+                    if best.map_or(true, |(b, _)| abs < b) {
+                        best = Some((abs, value_start));
+                    }
+                    break;
+                }
+            }
+            from = abs + key.len();
+            if from >= lower.len() {
+                break;
+            }
+        }
+    }
+    best
+}
+
+/// `-p<secret>` / `-p <secret>`：值为纯数字时视为端口号（`-p22`）不脱敏
+fn find_password_flag(text: &str) -> Option<(usize, usize)> {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i + 2 < bytes.len() {
+        if bytes[i] == b'-' && bytes[i + 1] == b'p' {
+            // 前缀也是 `-` 说明是 `--pretty` 这类长选项，跳过
+            let prev_ok = i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'-');
+            if prev_ok {
+                let mut value_start = i + 2;
+                while value_start < bytes.len()
+                    && (bytes[value_start] == b' ' || bytes[value_start] == b'\t')
+                {
+                    value_start += 1;
+                }
+                if value_start < bytes.len() {
+                    if bytes[value_start] == b'"' || bytes[value_start] == b'\'' {
+                        value_start += 1;
+                    }
+                    if value_start < bytes.len() {
+                        let end = value_start + value_end(&text[value_start..]);
+                        let value = &text[value_start..end];
+                        if !value.chars().all(|c| c.is_ascii_digit()) {
+                            return Some((i, value_start));
+                        }
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// 键后面必须是 `=` / `:` / 空白分隔，否则视为普通单词（如 passwordless）
+fn separator_value_start(text: &str, key_end: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut i = key_end;
+    if i >= bytes.len() {
+        return None;
+    }
+    if bytes[i].is_ascii_alphanumeric() {
+        return None;
+    }
+    while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
+        i += 1;
+    }
+    if i < bytes.len() && (bytes[i] == b'=' || bytes[i] == b':') {
+        i += 1;
+        while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
+            i += 1;
+        }
+    }
+    if i >= bytes.len() {
+        return None;
+    }
+    // 跳过成对的引号
+    if bytes[i] == b'"' || bytes[i] == b'\'' {
+        i += 1;
+    }
+    if i >= bytes.len() {
+        return None;
+    }
+    Some(i)
+}
+
+/// 值到下一个空白/分隔符为止
+fn value_end(value: &str) -> usize {
+    let bytes = value.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b' ' || b == b'\t' || b == b'\r' || b == b'\n' || b == b';' || b == b',' || b == b'&' {
+            break;
+        }
+        i += 1;
+    }
+    i.max(1)
+}
+
+/// 把 password/token/secret 之类的值替换为 `***`
+fn redact(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    loop {
+        match find_next_secret(rest) {
+            Some((_, value_start)) => {
+                out.push_str(&rest[..value_start]);
+                let end = value_start + value_end(&rest[value_start..]);
+                out.push_str("***");
+                rest = &rest[end..];
+            }
+            None => {
+                out.push_str(rest);
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// 读线程取当前日志 sender（不持锁 send）
+fn current_log_tx(sink: &Arc<Mutex<Option<LogSink>>>) -> Option<SyncSender<String>> {
+    sink.lock().as_ref().map(|s| s.tx.clone())
+}
+
+/// 读线程落盘入口：二进制输出跳过，缓冲满/断开时丢弃，绝不阻塞终端。
+fn push_log(
+    tx: &SyncSender<String>,
+    text: &str,
+    backpressure_warned: &mut bool,
+    binary_warned: &mut bool,
+) {
+    if text.contains('\0') {
+        if !*binary_warned {
+            *binary_warned = true;
+            eprintln!("[snail-ssh] 会话日志跳过含二进制数据的输出片段");
+        }
+        return;
+    }
+    match tx.try_send(redact(text)) {
+        Ok(()) => {}
+        Err(TrySendError::Full(_)) => {
+            if !*backpressure_warned {
+                *backpressure_warned = true;
+                eprintln!("[snail-ssh] 会话日志写入跟不上输出，已丢弃部分内容");
+            }
+        }
+        Err(TrySendError::Disconnected(_)) => {}
+    }
 }
 
 #[derive(Clone)]
@@ -184,10 +437,12 @@ impl SshManager {
         let session_id = format!("ssh-{}", Uuid::new_v4());
         let channel_arc = Arc::new(Mutex::new(channel));
         let is_alive = Arc::new(AtomicBool::new(true));
+        let log_sink: Arc<Mutex<Option<LogSink>>> = Arc::new(Mutex::new(None));
 
         // 后台读取远端输出并广播给前端（非阻塞读 + 短轮询）
         let channel_reader = Arc::clone(&channel_arc);
         let is_alive_reader = Arc::clone(&is_alive);
+        let log_sink_reader = Arc::clone(&log_sink);
         let app = app_handle.clone();
         let stdout_event = format!("ssh-stdout-{}", session_id);
         let closed_event = format!("ssh-closed-{}", session_id);
@@ -196,6 +451,8 @@ impl SshManager {
             let mut buf = [0u8; 16 * 1024];
             let mut pending: Vec<u8> = Vec::new();
             let mut exit_reason: Option<&str> = None;
+            let mut log_backpressure_warned = false;
+            let mut log_binary_warned = false;
 
             while is_alive_reader.load(Ordering::Relaxed) {
                 let read_result = {
@@ -211,7 +468,17 @@ impl SshManager {
                         // 按 UTF-8 边界解码，避免多字节字符被分片截断出现乱码
                         let text = decode_stream(&mut pending, &buf[..n]);
                         if !text.is_empty() {
-                            let _ = app.emit(&stdout_event, text);
+                            // 先 emit（保持原行为与顺序不变），再异步落盘；
+                            // 未开启日志时不 clone，避免无谓分配
+                            match current_log_tx(&log_sink_reader) {
+                                Some(tx) => {
+                                    let _ = app.emit(&stdout_event, text.clone());
+                                    push_log(&tx, &text, &mut log_backpressure_warned, &mut log_binary_warned);
+                                }
+                                None => {
+                                    let _ = app.emit(&stdout_event, text);
+                                }
+                            }
                         }
                     }
                     Ok((_, eof)) => {
@@ -232,7 +499,11 @@ impl SshManager {
             }
 
             if !pending.is_empty() {
-                let _ = app.emit(&stdout_event, String::from_utf8_lossy(&pending).to_string());
+                let tail = String::from_utf8_lossy(&pending).to_string();
+                let _ = app.emit(&stdout_event, tail.clone());
+                if let Some(tx) = current_log_tx(&log_sink_reader) {
+                    push_log(&tx, &tail, &mut log_backpressure_warned, &mut log_binary_warned);
+                }
             }
             if let Some(reason) = exit_reason {
                 is_alive_reader.store(false, Ordering::Relaxed);
@@ -246,6 +517,7 @@ impl SshManager {
             sftp_session: Arc::new(Mutex::new(None)),
             config,
             is_alive,
+            log_sink,
         });
         self.sessions.lock().insert(session_id.clone(), active);
         Ok(session_id)
@@ -315,12 +587,75 @@ impl SshManager {
         let active = self.sessions.lock().remove(session_id);
         if let Some(active) = active {
             active.is_alive.store(false, Ordering::Relaxed);
+            // 显式 drop 日志槽：关闭 channel 让 writer 线程退出并 flush，避免尾部内容丢失
+            active.log_sink.lock().take();
             // 尽力关闭通道；SFTP 会话随 Arc 释放（进行中的传输结束后自动断开）
             if let Some(mut ch) = active.channel.try_lock() {
                 let _ = wait_retry(|| ch.close(), Duration::from_secs(2));
             }
         }
         Ok(())
+    }
+
+    /// 开/关会话日志；开启返回日志文件路径，关闭返回被关闭文件的路径（原本未开启则为 None）。
+    pub fn set_session_logging(
+        &self,
+        session_id: &str,
+        enabled: bool,
+        host_label: &str,
+    ) -> Result<Option<String>, String> {
+        let active = self.get_active(session_id)?;
+
+        if !enabled {
+            let removed = active.log_sink.lock().take();
+            return Ok(removed.map(|sink| sink.path.to_string_lossy().to_string()));
+        }
+
+        // 已在记录则幂等返回原路径
+        if let Some(existing) = active.log_sink.lock().as_ref() {
+            return Ok(Some(existing.path.to_string_lossy().to_string()));
+        }
+
+        let dir = crate::storage::app_data_dir()
+            .join("logs")
+            .join(sanitize_host(host_label));
+        fs::create_dir_all(&dir).map_err(|e| format!("创建日志目录失败: {}", e))?;
+
+        let short_id: String = session_id.trim_start_matches("ssh-").chars().take(8).collect();
+        let started = now_secs();
+        let path = dir.join(format!("{}_{}.log", format_timestamp(started), short_id));
+        let file = fs::File::create(&path).map_err(|e| format!("创建日志文件失败: {}", e))?;
+
+        let (tx, rx) = sync_channel::<String>(LOG_CHANNEL_CAPACITY);
+        let header = format!(
+            "# SnailSSH session log (credentials redacted): {} started {} UTC\n",
+            host_label,
+            format_timestamp(started)
+        );
+        std::thread::spawn(move || {
+            let mut file = file;
+            let _ = file.write_all(header.as_bytes());
+            while let Ok(chunk) = rx.recv() {
+                if file.write_all(chunk.as_bytes()).is_err() {
+                    break;
+                }
+            }
+            let _ = file.flush();
+        });
+
+        *active.log_sink.lock() = Some(LogSink { path: path.clone(), tx });
+        Ok(Some(path.to_string_lossy().to_string()))
+    }
+
+    /// 查询当前日志路径（未开启返回 None）
+    pub fn get_session_log_path(&self, session_id: &str) -> Result<Option<String>, String> {
+        let active = self.get_active(session_id)?;
+        let path = active
+            .log_sink
+            .lock()
+            .as_ref()
+            .map(|sink| sink.path.to_string_lossy().to_string());
+        Ok(path)
     }
 
     /// 获取（必要时懒加载）该会话专属的 SFTP 连接，与终端 Shell 互不干扰
@@ -381,6 +716,17 @@ impl SshManager {
         }
     }
 
+    /// 在会话连接上执行一次性命令并读回输出。
+    /// 供远端历史拉取、脚本执行、探测等复用；通道开在终端自己那条连接上。
+    pub fn exec_command(&self, session_id: &str, command: &str) -> Result<String, String> {
+        let active = self.get_active(session_id)?;
+        if !active.is_alive.load(Ordering::Relaxed) {
+            return Err("会话已断开".into());
+        }
+        let sess = active.session.lock();
+        run_probe_command(&sess, command)
+    }
+
     /// 采集远端主机实时系统指标（MobaXterm 风格底部监控条），复用终端连接瞬态 exec
     pub fn get_remote_metrics(&self, session_id: &str) -> Result<RemoteSystemMetrics, String> {
         let active = self.get_active(session_id)?;
@@ -406,9 +752,9 @@ impl SshManager {
 /// 会话可能处于非阻塞模式，因此按 EAGAIN 轮询并在超时后返回已读到的内容。
 fn run_probe_command(sess: &ssh2::Session, command: &str) -> Result<String, String> {
     let mut channel = wait_retry(|| sess.channel_session(), PTY_WAIT_TIMEOUT)
-        .map_err(|e| format!("打开工作目录探测通道失败: {}", e))?;
+        .map_err(|e| format!("打开命令通道失败: {}", e))?;
     wait_retry(|| channel.exec(command), PTY_WAIT_TIMEOUT)
-        .map_err(|e| format!("执行工作目录探测脚本失败: {}", e))?;
+        .map_err(|e| format!("执行命令失败: {}", e))?;
 
     let mut output: Vec<u8> = Vec::new();
     let mut buf = [0u8; 4096];
@@ -423,7 +769,7 @@ fn run_probe_command(sess: &ssh2::Session, command: &str) -> Result<String, Stri
                 }
                 std::thread::sleep(IO_POLL_INTERVAL);
             }
-            Err(e) => return Err(format!("读取工作目录失败: {}", e)),
+            Err(e) => return Err(format!("读取命令输出失败: {}", e)),
         }
         if start.elapsed() >= CWD_PROBE_TIMEOUT {
             break;
@@ -1010,6 +1356,28 @@ fn parse_remote_metrics(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redact_masks_common_credential_forms() {
+        assert_eq!(redact("export DB_PASSWORD=supersecret"), "export DB_PASSWORD=***");
+        assert_eq!(redact("mysql -p s3cret -u root"), "mysql -p *** -u root");
+        assert_eq!(redact("Authorization: token abc123"), "Authorization: token ***");
+        assert_eq!(redact("api_key=deadbeef&"), "api_key=***&");
+    }
+
+    #[test]
+    fn redact_keeps_non_secret_text() {
+        // 普通单词不应被误伤
+        assert_eq!(redact("passwordless login is fine"), "passwordless login is fine");
+        assert_eq!(redact("ls -al /var/log"), "ls -al /var/log");
+    }
+
+    #[test]
+    fn sanitize_host_replaces_invalid_filename_chars() {
+        assert_eq!(sanitize_host("C:\\temp/foo"), "C__temp_foo");
+        assert_eq!(sanitize_host("   "), "unknown-host");
+        assert_eq!(sanitize_host("root@10.0.0.1"), "root@10.0.0.1");
+    }
 
     #[test]
     fn fingerprint_matches_openssh_format_for_empty_input() {

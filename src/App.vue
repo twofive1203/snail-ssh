@@ -118,6 +118,26 @@
     <!-- 弹窗 4: 应用内确认 / 文本输入（替代原生 confirm / prompt） -->
     <DialogHost />
 
+    <!-- 拖拽上传：全屏目标高亮 + 跟随鼠标的提示标签（pointer-events-none 不干扰命中判定） -->
+    <div
+      v-if="dragActive && dragTargetDir"
+      class="fixed inset-0 z-[55] pointer-events-none border-2 border-brand-500/70 bg-brand-500/5"
+    ></div>
+    <div
+      v-if="dragActive"
+      class="fixed z-[60] pointer-events-none"
+      :style="{ left: dragCursor.x + 'px', top: dragCursor.y + 'px' }"
+    >
+      <div
+        class="px-3 py-1.5 rounded-lg text-xs font-medium shadow-2xl border whitespace-nowrap"
+        :class="dragTargetDir
+          ? 'bg-brand-500 text-white border-brand-400'
+          : 'bg-surface-sidebar/95 text-slate-300 border-surface-border'"
+      >
+        {{ dragTargetDir ? `释放以上传到 ${dragTargetDir}` : '请拖拽到左侧文件树区域' }}
+      </div>
+    </div>
+
     <!-- 全局 Toast 提示组件 -->
     <Toast :messages="toastList" @dismiss="dismissToast" />
   </div>
@@ -137,7 +157,7 @@ import DialogHost from '@/components/DialogHost.vue'
 import Toast from '@/components/Toast.vue'
 import { confirmDialog, promptDialog, dialogState } from '@/composables/useDialog'
 import { useRecentHosts, MAX_RECENT_DISPLAY } from '@/composables/useRecentHosts'
-import type { HostItem, HostSession, SftpFileItem, TransferTask, ToastMessage } from '@/types'
+import type { FileDragDropEvent, HostItem, HostSession, SftpFileItem, TransferTask, ToastMessage } from '@/types'
 import {
   getHostsApi,
   saveHostApi,
@@ -145,11 +165,12 @@ import {
   createSshSessionApi,
   closeSshSessionApi,
   probeHostInfoApi,
-  sftpUploadFileApi,
+  sftpUploadPathApi,
   sftpDownloadFileApi,
   sftpDownloadDirApi,
   onSftpProgress,
-  pickLocalFile,
+  onFileDragDrop,
+  pickLocalFiles,
   pickSavePath,
   isTauri
 } from '@/api/tauri'
@@ -739,6 +760,17 @@ const handleDownloadFile = async (session: HostSession, file: SftpFileItem, remo
   }
 }
 
+/** 批量入队上传：先一次性建好所有任务卡片，再顺序执行（同一 SFTP 会话不并发混用） */
+const enqueueUploadPaths = async (localPaths: string[], sessionId: string, remoteDir: string) => {
+  const jobs = localPaths.map(localPath => {
+    const name = localPath.split(/[/\\]/).filter(Boolean).pop() || 'file'
+    return { localPath, task: createTransferTask(`上传: ${name}`, 'upload') }
+  })
+  for (const job of jobs) {
+    await runTransfer(job.task, (taskId) => sftpUploadPathApi(sessionId, job.localPath, remoteDir, taskId))
+  }
+}
+
 const handleUploadTrigger = async (session: HostSession, remoteDir: string) => {
   const sessionId = session.sftpSessionId || session.id
   if (!isTauri()) {
@@ -746,15 +778,66 @@ const handleUploadTrigger = async (session: HostSession, remoteDir: string) => {
     return
   }
 
-  const localPath = await pickLocalFile()
-  if (!localPath) return
+  const localPaths = await pickLocalFiles()
+  if (localPaths.length === 0) return
+  await enqueueUploadPaths(localPaths, sessionId, remoteDir)
+}
 
-  const fileName = localPath.split(/[/\\]/).pop() || 'file'
-  const fullRemote = remoteDir === '/' ? `/${fileName}` : `${remoteDir}/${fileName}`
-  const task = createTransferTask(`上传: ${fileName}`, 'upload')
-  await runTransfer(task, (taskId) =>
-    sftpUploadFileApi(sessionId, localPath, fullRemote, taskId)
-  )
+// ==========================================
+// OS 级拖拽上传（Tauri webview 拖放事件）
+// ==========================================
+const dragActive = ref(false)
+const dragTargetDir = ref<string | null>(null)
+const dragCursor = reactive({ x: 0, y: 0 })
+let dragUnlisten: (() => void) | null = null
+let lastDragOverAt = 0
+
+/** 用 elementFromPoint 命中最内层带 data-drop-target 的元素（遮罩必须 pointer-events-none） */
+const resolveDropTarget = (x: number, y: number): { dir: string | null; sessionId: string } => {
+  const el = document.elementFromPoint(x, y) as HTMLElement | null
+  const target = el && typeof el.closest === 'function'
+    ? (el.closest('[data-drop-target="sftp"]') as HTMLElement | null)
+    : null
+  if (!target) return { dir: null, sessionId: '' }
+  return {
+    dir: target.getAttribute('data-remote-path') || '/',
+    sessionId: target.getAttribute('data-session-id') || ''
+  }
+}
+
+const handleFileDragEvent = (e: FileDragDropEvent) => {
+  if (e.type === 'leave') {
+    dragActive.value = false
+    dragTargetDir.value = null
+    return
+  }
+
+  if (e.type === 'drop') {
+    dragActive.value = false
+    const { dir, sessionId } = resolveDropTarget(e.x, e.y)
+    dragTargetDir.value = null
+    if (!dir || !sessionId) {
+      triggerToast('请拖拽到左侧文件树或 SFTP 列表区域', 'warning')
+      return
+    }
+    void enqueueUploadPaths(e.paths, sessionId, dir)
+    return
+  }
+
+  dragCursor.x = e.x
+  dragCursor.y = e.y
+  dragActive.value = true
+
+  if (e.type === 'enter') {
+    dragTargetDir.value = resolveDropTarget(e.x, e.y).dir
+    return
+  }
+
+  // Windows 上经过子元素会高频触发 over，节流避免 elementFromPoint 抖动
+  const now = Date.now()
+  if (now - lastDragOverAt < 50) return
+  lastDragOverAt = now
+  dragTargetDir.value = resolveDropTarget(e.x, e.y).dir
 }
 
 const handleRemoveTask = (taskId: string) => {
@@ -811,10 +894,14 @@ const setupGlobalKeybindings = () => {
 onMounted(async () => {
   await loadHosts()
   setupGlobalKeybindings()
+  if (isTauri()) {
+    dragUnlisten = await onFileDragDrop(handleFileDragEvent)
+  }
   triggerToast('SnailSSH 桌面客户端已就绪！支持 Ctrl+K 全局搜索', 'success')
 })
 
 onBeforeUnmount(() => {
+  dragUnlisten?.()
   if (!isTauri()) return
   for (const s of sessions.value) {
     for (const tab of s.terminalTabs) {

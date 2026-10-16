@@ -33,6 +33,21 @@ export interface TerminalTab {
   autoFollowTerminal?: boolean
 }
 
+/** 命令历史条目（与后端 history.rs 的 HistoryEntry 对应） */
+export interface CommandHistoryEntry {
+  cmd: string
+  count: number
+  lastUsedAt: number
+}
+
+/** OS 级文件拖放事件（Tauri webview 提供，坐标为 CSS 像素） */
+export interface FileDragDropEvent {
+  type: 'enter' | 'over' | 'drop' | 'leave'
+  paths: string[]
+  x: number
+  y: number
+}
+
 /** 右键菜单项：divider 为 true 时渲染成分隔线，其余字段忽略 */
 export interface ContextMenuItem {
   key?: string
@@ -63,7 +78,8 @@ export interface SftpProgressPayload {
   taskId: string
   progress: number
   speed: string
-  status: 'running' | 'completed' | 'failed'
+  /** scanning 仅在目录上传枚举阶段出现（进度百分比尚不可知） */
+  status: 'running' | 'completed' | 'failed' | 'scanning'
   transferred: number
   total: number
 }

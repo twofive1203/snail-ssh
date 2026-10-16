@@ -1,5 +1,10 @@
 <template>
-  <section class="flex-1 flex flex-col h-full overflow-hidden bg-surface-base">
+  <section
+    class="flex-1 flex flex-col h-full overflow-hidden bg-surface-base"
+    data-drop-target="sftp"
+    :data-remote-path="currentPath"
+    :data-session-id="activeSessionId"
+  >
     <!-- SFTP 顶部工具控制栏 -->
     <div class="h-12 border-b border-surface-border px-4 flex items-center justify-between shrink-0 bg-surface-card/30">
       <!-- 目标主机选择器与当前路径面包屑 -->

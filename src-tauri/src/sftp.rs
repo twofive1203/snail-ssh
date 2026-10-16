@@ -591,6 +591,183 @@ fn collect_download_entries(
     Ok(())
 }
 
+/// 待上传的单个文件（本地路径 -> 远端路径）
+struct UploadEntry {
+    local: PathBuf,
+    remote: PathBuf,
+}
+
+/// 统一上传入口：按本地元数据自动分派单文件 / 目录，前端无需判断类型。
+/// `remote_dir` 为目标父目录，文件或目录都以自身的 basename 落进去。
+pub fn sftp_upload_path(
+    session_arc: Arc<Mutex<ssh2::Session>>,
+    local_path: &str,
+    remote_dir: &str,
+    task_id: &str,
+    app_handle: AppHandle,
+) -> Result<(), String> {
+    let meta = fs::metadata(local_path).map_err(|e| format!("读取本地路径失败: {}", e))?;
+    if meta.is_dir() {
+        return sftp_upload_dir(session_arc, local_path, remote_dir, task_id, app_handle);
+    }
+    let name = Path::new(local_path)
+        .file_name()
+        .ok_or_else(|| "无法确定本地文件名".to_string())?;
+    let remote_path = Path::new(remote_dir).join(name);
+    sftp_upload_file(
+        session_arc,
+        local_path,
+        &remote_path.to_string_lossy(),
+        task_id,
+        app_handle,
+    )
+}
+
+/// 目录递归上传：保留本地目录结构，进度按实际会传输的字节总数统计。
+pub fn sftp_upload_dir(
+    session_arc: Arc<Mutex<ssh2::Session>>,
+    local_path: &str,
+    remote_dir: &str,
+    task_id: &str,
+    app_handle: AppHandle,
+) -> Result<(), String> {
+    let local_root = Path::new(local_path);
+    let base_name = local_root
+        .file_name()
+        .ok_or_else(|| "无法确定本地目录名称".to_string())?;
+    let remote_root = Path::new(remote_dir).join(base_name);
+
+    let sess = session_arc.lock();
+    let sftp = sess.sftp().map_err(|e| format!("初始化 SFTP 失败: {}", e))?;
+
+    // 大目录枚举可能耗时：先发一条 scanning 事件，避免用户误以为卡死
+    let _ = app_handle.emit(
+        &format!("sftp-progress-{}", task_id),
+        TransferProgressPayload {
+            task_id: task_id.to_string(),
+            progress: 0,
+            speed: "扫描本地目录...".into(),
+            status: "scanning".into(),
+            transferred: 0,
+            total: 0,
+        },
+    );
+
+    // 先枚举待上传文件并统计总字节数，否则进度条无法给出百分比
+    let mut entries = Vec::new();
+    let mut total = 0u64;
+    collect_upload_entries(local_root, &remote_root, &mut entries, &mut total)?;
+
+    ensure_remote_dir(&sftp, &remote_root)?;
+
+    let mut reporter = ProgressReporter::new(task_id, total);
+    let mut buf = vec![0u8; TRANSFER_CHUNK_SIZE];
+
+    for entry in &entries {
+        if let Some(parent) = entry.remote.parent() {
+            ensure_remote_dir(&sftp, parent)?;
+        }
+        let mut local_file =
+            File::open(&entry.local).map_err(|e| format!("打开本地文件失败: {}", e))?;
+        let mut remote_file = sftp
+            .create(&entry.remote)
+            .map_err(|e| format!("创建远程文件失败: {}", e))?;
+
+        loop {
+            let n = local_file
+                .read(&mut buf)
+                .map_err(|e| format!("读取本地文件失败: {}", e))?;
+            if n == 0 {
+                break;
+            }
+            remote_file
+                .write_all(&buf[..n])
+                .map_err(|e| format!("传输中断: {}", e))?;
+            reporter.advance(n as u64);
+            reporter.report(&app_handle, "running", false);
+        }
+    }
+
+    reporter.report(&app_handle, "completed", true);
+    Ok(())
+}
+
+/// 递归枚举本地目录下需要上传的普通文件。
+/// 软链接策略与下载保持对称：只跟随指向普通文件的软链接，目录软链接跳过（防递归成环）。
+fn collect_upload_entries(
+    local: &Path,
+    remote: &Path,
+    out: &mut Vec<UploadEntry>,
+    total: &mut u64,
+) -> Result<(), String> {
+    let meta = fs::symlink_metadata(local).map_err(|e| format!("读取本地信息失败: {}", e))?;
+    let file_type = meta.file_type();
+
+    if file_type.is_symlink() {
+        match fs::metadata(local) {
+            Ok(target) if target.is_file() => {
+                *total += target.len();
+                out.push(UploadEntry {
+                    local: local.to_path_buf(),
+                    remote: remote.to_path_buf(),
+                });
+            }
+            Ok(_) => eprintln!("[snail-ssh] 跳过目录软链接: {}", local.display()),
+            Err(e) => eprintln!(
+                "[snail-ssh] 软链接无法解析，已跳过 {}: {}",
+                local.display(),
+                e
+            ),
+        }
+        return Ok(());
+    }
+
+    if file_type.is_dir() {
+        let entries = fs::read_dir(local).map_err(|e| format!("读取本地目录失败: {}", e))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("读取本地目录失败: {}", e))?;
+            collect_upload_entries(&entry.path(), &remote.join(entry.file_name()), out, total)?;
+        }
+        return Ok(());
+    }
+
+    if file_type.is_file() {
+        *total += meta.len();
+        out.push(UploadEntry {
+            local: local.to_path_buf(),
+            remote: remote.to_path_buf(),
+        });
+        return Ok(());
+    }
+
+    eprintln!("[snail-ssh] 跳过特殊文件: {}", local.display());
+    Ok(())
+}
+
+/// 逐级创建远端目录（ssh2 没有 mkdir -p），已存在则忽略。
+fn ensure_remote_dir(sftp: &ssh2::Sftp, dir: &Path) -> Result<(), String> {
+    let mut current = PathBuf::new();
+    for component in dir.components() {
+        match component {
+            std::path::Component::RootDir => current.push("/"),
+            std::path::Component::Normal(seg) => {
+                current.push(seg);
+                if sftp.stat(&current).map(|s| s.is_dir()).unwrap_or(false) {
+                    continue;
+                }
+                if let Err(e) = sftp.mkdir(&current, 0o755) {
+                    // 并发或目录已存在时忽略该错误
+                    if !sftp.stat(&current).map(|s| s.is_dir()).unwrap_or(false) {
+                        return Err(format!("创建远端目录失败 {}: {}", current.display(), e));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 fn format_file_size(bytes: u64) -> String {
     if bytes < 1024 {
         format!("{} B", bytes)

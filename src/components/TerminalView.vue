@@ -37,6 +37,16 @@
 
       <!-- 终端操作按钮组：展开文件树、查找、清屏 -->
       <div class="flex items-center gap-1 text-xs">
+        <!-- 会话日志录制指示 -->
+        <span
+          v-if="currentLogging"
+          class="flex items-center gap-1 px-1.5 py-0.5 rounded bg-rose-500/15 text-rose-400 border border-rose-500/30 text-[10px] font-mono shrink-0 select-none"
+          :title="currentLogPath ? `正在记录会话日志: ${currentLogPath}` : '正在记录会话日志'"
+        >
+          <span class="w-1.5 h-1.5 rounded-full bg-rose-500 animate-pulse"></span>
+          REC
+        </span>
+
         <button
           v-if="sidebarCollapsed"
           @click="$emit('toggle-sidebar')"
@@ -123,7 +133,10 @@
     </div>
 
     <!-- 真实 xterm.js 容器：每个标签页一个独立实例，切换不丢回显 -->
-    <div class="flex-1 w-full h-full relative overflow-hidden bg-[#0c0e14] p-2">
+    <div
+      class="flex-1 w-full h-full relative overflow-hidden bg-[#0c0e14] p-2"
+      :class="suggestBarVisible ? 'pb-9' : ''"
+    >
       <!-- 终端内搜索条 (Ctrl+F)：贴在容器右上角，不抢占终端焦点 -->
       <div
         v-if="searchOpen"
@@ -209,6 +222,15 @@
         :style="{ display: tab.id === currentTabId ? 'block' : 'none' }"
         @contextmenu.prevent="openTermMenu($event)"
       ></div>
+
+      <!-- 命令历史联想补全条：贴底浮动，容器动态预留底部高度避免遮挡最后一行 -->
+      <CommandSuggestBar
+        :candidates="suggestCandidates"
+        :active-index="suggestIndex"
+        :visible="suggestBarVisible"
+        @accept="handleSuggestionAccept"
+        @hover="handleSuggestionHover"
+      />
     </div>
 
     <!-- 终端状态栏 -->
@@ -219,6 +241,7 @@
           <span>{{ currentTab?.connected ? 'SSH 协议就绪 (OpenSSH 2.0 / Pty)' : '会话未连接' }}</span>
         </span>
         <span>编码: UTF-8</span>
+        <span :class="currentLogging ? 'text-rose-400' : ''">{{ currentLogging ? '日志: 记录中' : '日志: 已关闭' }}</span>
       </div>
       <div>
         <span>快捷键: Ctrl+C 中断 | Ctrl+L 清屏</span>
@@ -238,12 +261,13 @@ import {
   X, Plus, FolderGit2, Eraser, Zap, Terminal as TerminalIcon,
   CopyPlus, Globe, User, Terminal, PenLine, RefreshCw, XCircle, ChevronsRight,
   Search, ChevronUp, ChevronDown, CaseSensitive, WholeWord, Regex,
-  Copy, ClipboardPaste, TextSelect, Highlighter
+  Copy, ClipboardPaste, TextSelect, Highlighter, FolderOpen, CircleDot, CircleStop
 } from 'lucide-vue-next'
 import ContextMenu from '@/components/ContextMenu.vue'
+import CommandSuggestBar from '@/components/CommandSuggestBar.vue'
 import { dialogState } from '@/composables/useDialog'
 import { useTerminalHighlight, HIGHLIGHT_STORAGE_KEY, type TerminalHighlight } from '@/composables/useTerminalHighlight'
-import type { ContextMenuItem, TerminalTab } from '@/types'
+import type { CommandHistoryEntry, ContextMenuItem, TerminalTab } from '@/types'
 import {
   writeSshSessionApi,
   resizeSshSessionApi,
@@ -251,6 +275,13 @@ import {
   setMockTerminalCwd,
   onSshStdout,
   onSshClosed,
+  getCommandHistoryApi,
+  pushCommandHistoryApi,
+  importCommandHistoryApi,
+  execSshCommandApi,
+  setSessionLoggingApi,
+  getLogDirApi,
+  revealInFileManagerApi,
   isTauri
 } from '@/api/tauri'
 
@@ -261,10 +292,13 @@ const props = withDefaults(
     sidebarCollapsed?: boolean
     /** 该终端所属的会话工作区是否为当前活动工作区（用于全局快捷键只在一个实例上生效） */
     active?: boolean
+    /** 命令历史的主机键："user@host:port"，比 hostId 稳定，临时会话/重新导入资产后历史不丢 */
+    hostKey?: string
   }>(),
   {
     sidebarCollapsed: false,
-    active: false
+    active: false,
+    hostKey: ''
   }
 )
 
@@ -294,6 +328,8 @@ interface TerminalSession {
   highlight: TerminalHighlight
   container: HTMLDivElement
   inputBuffer: string
+  /** 本地维护的当前输入行（仅用于命令历史/联想，绝不参与回显） */
+  lineBuffer: string
   unlisten: Array<() => void>
   writeFailed: boolean
   /** 右键按下瞬间的选区快照（右键可能清空选区，需提前捕获） */
@@ -350,6 +386,265 @@ const setContainer = (tabId: string, el: any) => {
   }
 }
 
+// ==========================================
+// 命令历史 / 联想补全
+// ==========================================
+/** 每主机历史缓存：候选计算只查内存，仅建连/提交/导入时才走后端 IPC */
+const historyCache = new Map<string, CommandHistoryEntry[]>()
+/** 已拉过远端 ~/.bash_history 的主机，避免每次开 Tab 重复拉取 */
+const remoteHistoryBootstrapped = new Set<string>()
+const REMOTE_HISTORY_KEY = 'snail_ssh_import_remote_history'
+
+const suggestCandidates = ref<string[]>([])
+const suggestIndex = ref(0)
+const suggestTabId = ref('')
+
+const suggestBarVisible = computed(() =>
+  suggestTabId.value === currentTabId.value && suggestCandidates.value.length > 0
+)
+
+const hostKeyFor = (tab: TerminalTab): string => props.hostKey || tab.hostId
+
+/** 候选条仅在可见时接管按键，不可见时一概透传 */
+const hasSuggestions = (tabId: string) => suggestTabId.value === tabId && suggestCandidates.value.length > 0
+
+const closeSuggestions = () => {
+  suggestCandidates.value = []
+  suggestIndex.value = 0
+  suggestTabId.value = ''
+}
+
+/** 内置子命令词表（不做远端 --help 探测，避免拖慢输入） */
+const SUBCOMMAND_WORDS: Record<string, string[]> = {
+  docker: ['ps', 'ps -a', 'images', 'logs -f', 'exec -it', 'compose up -d', 'compose down', 'system prune -f'],
+  systemctl: ['status', 'start', 'stop', 'restart', 'enable', 'disable', 'daemon-reload'],
+  git: ['status', 'pull', 'push', 'log --oneline', 'diff', 'checkout', 'branch -a', 'commit -m "']
+}
+
+const staticCandidates = (input: string): string[] => {
+  const matched = input.match(/^(\w+)\s+(\S*)$/)
+  if (!matched) return []
+  const words = SUBCOMMAND_WORDS[matched[1]]
+  if (!words) return []
+  const frag = matched[2].toLowerCase()
+  return words
+    .filter(w => w.toLowerCase().startsWith(frag) && `${matched[1]} ${w}` !== input.trim())
+    .map(w => `${matched[1]} ${w}`)
+}
+
+const computeCandidates = (hostKey: string, input: string): string[] => {
+  const needle = input.trim()
+  if (needle.length < 2) return []
+  const lowerNeedle = needle.toLowerCase()
+  const prefix: string[] = []
+  const substr: string[] = []
+  for (const entry of historyCache.get(hostKey) || []) {
+    if (entry.cmd === needle) continue
+    const lower = entry.cmd.toLowerCase()
+    if (lower.startsWith(lowerNeedle)) prefix.push(entry.cmd)
+    else if (lower.includes(lowerNeedle)) substr.push(entry.cmd)
+  }
+  // 前缀匹配优先，其次子串匹配；内置动词放最前
+  return Array.from(new Set([...staticCandidates(needle), ...prefix, ...substr])).slice(0, 8)
+}
+
+const updateSuggestions = (tab: TerminalTab, lineBuffer: string) => {
+  const candidates = computeCandidates(hostKeyFor(tab), lineBuffer)
+  if (candidates.length === 0) {
+    if (suggestTabId.value === tab.id) closeSuggestions()
+    return
+  }
+  suggestCandidates.value = candidates
+  suggestIndex.value = 0
+  suggestTabId.value = tab.id
+}
+
+const refreshHistory = async (hostKey: string) => {
+  try {
+    historyCache.set(hostKey, await getCommandHistoryApi(hostKey))
+  } catch (e) {
+    console.warn('加载命令历史失败:', e)
+  }
+}
+
+const recordCommand = async (tab: TerminalTab, cmd: string) => {
+  const key = hostKeyFor(tab)
+  try {
+    historyCache.set(key, await pushCommandHistoryApi(key, cmd))
+  } catch {
+    // 历史记录失败不影响终端使用
+  }
+}
+
+/** 会话建立后拉取远端 ~/.bash_history 作为词库（localStorage 置 '0' 可关闭） */
+const bootstrapRemoteHistory = async (tab: TerminalTab, sessionId: string) => {
+  if (!isTauri()) return
+  try {
+    if (localStorage.getItem(REMOTE_HISTORY_KEY) === '0') return
+  } catch {
+    // localStorage 不可用时按默认开启处理
+  }
+  const key = hostKeyFor(tab)
+  if (remoteHistoryBootstrapped.has(key)) return
+  remoteHistoryBootstrapped.add(key)
+  try {
+    const raw = await execSshCommandApi(sessionId, 'cat ~/.bash_history 2>/dev/null | tail -n 200')
+    const cmds = raw.split(/\r?\n/).map((l: string) => l.replace(/\u0000/g, '')).filter((l: string) => l.trim())
+    if (cmds.length > 0) {
+      await importCommandHistoryApi(key, cmds)
+      await refreshHistory(key)
+    }
+  } catch {
+    // 远端历史拉取失败不影响会话
+  }
+}
+
+/** 用退格抹掉远端已回显的输入，再写入完整候选（不依赖远端 shell 的补全能力） */
+const applySuggestion = (cmd: string) => {
+  const tabId = suggestTabId.value
+  const session = sessions.get(tabId)
+  if (!session || !cmd) return
+  writeToSession(tabId, '\x7f'.repeat(session.lineBuffer.length) + cmd)
+  session.lineBuffer = cmd
+  closeSuggestions()
+}
+
+const handleSuggestionAccept = (cmd: string) => applySuggestion(cmd)
+const handleSuggestionHover = (index: number) => { suggestIndex.value = index }
+
+const moveSuggestion = (delta: number) => {
+  const total = suggestCandidates.value.length
+  if (total === 0) return
+  suggestIndex.value = (suggestIndex.value + delta + total) % total
+}
+
+/** 终端控制序列（方向键/功能键/鼠标/bracketed paste/OSC 标题等）不参与输入行缓冲 */
+const stripTerminalSequences = (input: string): string =>
+  input
+    .replace(/\x1b\][\s\S]*?(?:\x07|\x1b\\)/g, '')
+    .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '')
+    .replace(/\x1bO[0-9A-Za-z]/g, '')
+    .replace(/\x1b[@-Z\\-_]/g, '')
+
+const handleLineBufferInput = (tab: TerminalTab, session: TerminalSession, rawData: string) => {
+  const data = stripTerminalSequences(rawData)
+  if (!data) return
+  let dirty = false
+  for (const ch of data) {
+    // 粘贴多行文本会一次进来一整段：必须逐行拆开，否则会记成一条巨串
+    if (ch === '\r' || ch === '\n') {
+      const cmd = session.lineBuffer
+      session.lineBuffer = ''
+      dirty = true
+      if (cmd.trim()) void recordCommand(tab, cmd)
+      continue
+    }
+    if (ch === '\x7f' || ch === '\b') {
+      session.lineBuffer = session.lineBuffer.slice(0, -1)
+      dirty = true
+      continue
+    }
+    if (ch === '\x15' || ch === '\x03') {
+      session.lineBuffer = ''
+      dirty = true
+      continue
+    }
+    if (ch >= ' ') {
+      session.lineBuffer += ch
+      dirty = true
+    }
+  }
+  if (dirty) updateSuggestions(tab, session.lineBuffer)
+}
+
+// ==========================================
+// 会话日志（REC 指示 + 开/关 + 打开目录）
+// ==========================================
+const LOG_AUTO_KEY = 'snail_ssh_session_log_auto'
+const loggingPaths = ref<Record<string, string>>({})
+const currentLogPath = computed(() => loggingPaths.value[currentTabId.value] || '')
+const currentLogging = computed(() => !!loggingPaths.value[currentTabId.value])
+const isTabLogging = (tabId: string) => !!loggingPaths.value[tabId]
+
+const readLogAuto = (): boolean => {
+  try {
+    return localStorage.getItem(LOG_AUTO_KEY) === '1'
+  } catch {
+    return false
+  }
+}
+const writeLogAuto = (on: boolean) => {
+  try {
+    localStorage.setItem(LOG_AUTO_KEY, on ? '1' : '0')
+  } catch {
+    // localStorage 不可用时不影响本次会话
+  }
+}
+
+const setTabLogPath = (tabId: string, path: string | null) => {
+  const next = { ...loggingPaths.value }
+  if (path) next[tabId] = path
+  else delete next[tabId]
+  loggingPaths.value = next
+}
+
+const logHostLabel = (tab: TerminalTab) => props.hostKey || tab.sub || tab.title
+
+const enableSessionLog = async (tab: TerminalTab): Promise<string | null> => {
+  const path = await setSessionLoggingApi(tab.id, true, logHostLabel(tab))
+  setTabLogPath(tab.id, path)
+  return path
+}
+
+const stopSessionLog = async (tab: TerminalTab): Promise<string | null> => {
+  const path = await setSessionLoggingApi(tab.id, false, logHostLabel(tab))
+  setTabLogPath(tab.id, null)
+  return path
+}
+
+const toggleSessionLog = async (tabId: string) => {
+  const tab = props.tabs.find(t => t.id === tabId)
+  if (!tab) return
+  if (!isTauri()) {
+    emitToast('浏览器预览模式不支持会话日志', 'warning')
+    return
+  }
+  if (isTabLogging(tabId)) {
+    try {
+      const path = await stopSessionLog(tab)
+      writeLogAuto(false)
+      emitToast(`已停止记录会话日志（凭据已脱敏，可能与屏幕内容不一致）: ${path || ''}`, 'info')
+    } catch (e: any) {
+      emitToast(`停止会话日志失败: ${e?.message || e}`, 'error')
+    }
+  } else {
+    try {
+      const path = await enableSessionLog(tab)
+      writeLogAuto(true)
+      emitToast(`已开始记录会话日志（凭据已脱敏，内容可能与屏幕不一致）: ${path || ''}`, 'success')
+    } catch (e: any) {
+      emitToast(`开始会话日志失败: ${e?.message || e}`, 'error')
+    }
+  }
+}
+
+const openLogDir = async () => {
+  if (!isTauri()) {
+    emitToast('浏览器预览模式不支持打开日志目录', 'warning')
+    return
+  }
+  try {
+    const dir = await getLogDirApi()
+    if (!dir) {
+      emitToast('日志目录不可用', 'warning')
+      return
+    }
+    await revealInFileManagerApi(dir)
+  } catch (e: any) {
+    emitToast(`打开日志目录失败: ${e?.message || e}`, 'error')
+  }
+}
+
 const createSession = (tab: TerminalTab, container: HTMLDivElement): TerminalSession => {
   const term = new Xterm({
     fontFamily: '"JetBrains Mono", "Fira Code", monospace',
@@ -373,7 +668,7 @@ const createSession = (tab: TerminalTab, container: HTMLDivElement): TerminalSes
   const session: TerminalSession = {
     term, fit, search,
     highlight: useTerminalHighlight(term, { onToast: (msg, type) => emit('toast', msg, type ?? 'info') }),
-    container, inputBuffer: '', unlisten: [], writeFailed: false, rightClickSelection: ''
+    container, inputBuffer: '', lineBuffer: '', unlisten: [], writeFailed: false, rightClickSelection: ''
   }
 
   term.open(container)
@@ -414,6 +709,7 @@ const createSession = (tab: TerminalTab, container: HTMLDivElement): TerminalSes
     if (data.includes('\r')) {
       emit('terminal-enter', tab.id)
     }
+    handleLineBufferInput(tab, session, data)
     writeToSession(tab.id, data)
   })
 
@@ -441,6 +737,26 @@ const createSession = (tab: TerminalTab, container: HTMLDivElement): TerminalSes
       if (tab.id === currentTabId.value) openSearch()
       return false
     }
+
+    // 命令补全接管：仅在候选条可见时截获 Tab / Esc / ↑ / ↓，
+    // 不可见时一概透传——绝不接管裸 ↑/↓，否则 vim/less/man 全部失效
+    if (hasSuggestions(tab.id)) {
+      if (key === 'Tab' && !e.ctrlKey && !e.altKey && !e.metaKey) {
+        e.preventDefault()
+        applySuggestion(suggestCandidates.value[suggestIndex.value])
+        return false
+      }
+      if (key === 'Escape') {
+        e.preventDefault()
+        closeSuggestions()
+        return false
+      }
+      if ((key === 'ArrowUp' || key === 'ArrowDown') && !e.ctrlKey && !e.altKey && !e.metaKey && !e.shiftKey) {
+        e.preventDefault()
+        moveSuggestion(key === 'ArrowDown' ? 1 : -1)
+        return false
+      }
+    }
     return true
   })
 
@@ -462,15 +778,27 @@ const createSession = (tab: TerminalTab, container: HTMLDivElement): TerminalSes
 }
 
 const bindSessionEvents = async (tab: TerminalTab, session: TerminalSession) => {
-  if (!isTauri()) return
-  const unlistenStdout = await onSshStdout(tab.id, (chunk) => {
-    session.term.write(chunk)
-  })
-  const unlistenClosed = await onSshClosed(tab.id, (reason) => {
-    session.term.write(`\r\n\x1b[33m[会话结束] ${reason}\x1b[0m\r\n`)
-    emit('session-closed', tab.id, reason)
-  })
-  session.unlisten.push(unlistenStdout, unlistenClosed)
+  if (isTauri()) {
+    const unlistenStdout = await onSshStdout(tab.id, (chunk) => {
+      session.term.write(chunk)
+    })
+    const unlistenClosed = await onSshClosed(tab.id, (reason) => {
+      session.term.write(`\r\n\x1b[33m[会话结束] ${reason}\x1b[0m\r\n`)
+      setTabLogPath(tab.id, null)
+      emit('session-closed', tab.id, reason)
+    })
+    session.unlisten.push(unlistenStdout, unlistenClosed)
+  }
+
+  // 预载历史（浏览器预览走 localStorage 降级），真实会话再补齐远端 bash_history
+  const hostKey = hostKeyFor(tab)
+  if (!historyCache.has(hostKey)) await refreshHistory(hostKey)
+  void bootstrapRemoteHistory(tab, tab.id)
+
+  // 记忆上次的日志开关：开启过则新会话自动开始记录
+  if (isTauri() && readLogAuto() && !isTabLogging(tab.id)) {
+    enableSessionLog(tab).catch(e => console.warn('自动开启会话日志失败:', e))
+  }
 }
 
 /** 按标签页同步 xterm 实例：新增则创建，移除则销毁 */
@@ -483,6 +811,8 @@ const syncSessions = async () => {
     session.highlight.dispose()
     session.term.dispose()
     sessions.delete(tabId)
+    if (suggestTabId.value === tabId) closeSuggestions()
+    if (loggingPaths.value[tabId]) setTabLogPath(tabId, null)
   }
 
   for (const tab of props.tabs) {
@@ -583,6 +913,8 @@ const onSearchEnter = (e: KeyboardEvent) => {
 const openSearch = () => {
   const session = currentSession.value
   if (!session) return
+  // 搜索条打开时不应再弹出/接受命令候选
+  closeSuggestions()
   searchOpen.value = true
   nextTick(() => {
     // 搜索输入框独立于 xterm，不抢终端按键
@@ -738,6 +1070,9 @@ const tabMenuItems = computed<ContextMenuItem[]>(() => {
     { divider: true },
     { key: 'rename', label: '重命名标签', icon: PenLine },
     { key: 'reconnect', label: '重新连接', icon: RefreshCw, disabled: tab.connected },
+    { divider: true },
+    { key: 'toggle-log', label: isTabLogging(tab.id) ? '停止记录会话日志' : '开始记录会话日志', icon: isTabLogging(tab.id) ? CircleStop : CircleDot },
+    { key: 'open-log-dir', label: '打开日志目录', icon: FolderOpen },
     { key: 'sftp', label: '打开 SFTP', icon: FolderGit2 },
     { key: 'clear', label: '清除屏幕', icon: Eraser },
     { divider: true },
@@ -758,6 +1093,8 @@ const handleTabMenuSelect = (item: ContextMenuItem) => {
     case 'copy-ssh': emit('copy-tab-info', index, 'ssh-command'); break
     case 'rename': emit('rename-tab', index); break
     case 'reconnect': emit('reconnect-tab', index); break
+    case 'toggle-log': void toggleSessionLog(tab.id); break
+    case 'open-log-dir': void openLogDir(); break
     case 'sftp': emit('open-tab-sftp', index); break
     case 'clear': clearTerminal(tab.id); break
     case 'close': emit('close-tab', index); break
@@ -898,6 +1235,13 @@ watch(() => props.tabs.map(t => t.id).join('|'), () => { syncSessions() })
 // 切换标签页 -> 重新计算尺寸（隐藏时无法 fit），并关闭搜索条避免作用域错乱
 watch(() => props.activeTabIndex, async () => {
   if (searchOpen.value) closeSearch()
+  closeSuggestions()
+  await nextTick()
+  fitActive()
+})
+
+// 候选条占用底部一行高度，显隐后必须重新 fit，否则 xterm 行列数会与实际不符
+watch(suggestBarVisible, async () => {
   await nextTick()
   fitActive()
 })

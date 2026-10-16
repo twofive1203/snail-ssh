@@ -1,8 +1,11 @@
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { open as openDialog, save as saveDialog } from '@tauri-apps/plugin-dialog'
+import { getCurrentWebview } from '@tauri-apps/api/webview'
 import type {
+  CommandHistoryEntry,
   ConnectionTestResult,
+  FileDragDropEvent,
   HostItem,
   HostProbeResult,
   RemoteSystemMetrics,
@@ -324,12 +327,178 @@ export async function onSshClosed(sessionId: string, callback: (reason: string) 
 }
 
 // ==========================================
+// 命令历史 (命令补全 + 联想)
+// ==========================================
+const HISTORY_MOCK_KEY = 'snail_ssh_history'
+
+/** 与后端 history.rs 保持一致的敏感命令过滤（仅浏览器预览降级使用） */
+function isSensitiveCommand(cmd: string): boolean {
+  const lower = cmd.toLowerCase()
+  if (lower.includes('password') || lower.includes('passwd') || lower.includes('token=') || lower.includes('--token')) {
+    return true
+  }
+  const tokens = lower.split(/\s+/)
+  const looksLikeSecret = (v: string) => v.length > 0 && !/^\d+$/.test(v)
+  return tokens.some((token, i) => {
+    if (token.startsWith('--') || !token.startsWith('-p')) return false
+    const value = token.slice(2)
+    return value ? looksLikeSecret(value) : looksLikeSecret(tokens[i + 1] ?? '')
+  })
+}
+
+function shouldRecordCommand(cmd: string): boolean {
+  return cmd.trim().length > 0 && cmd.length <= 4096 && !cmd.startsWith(' ') && !isSensitiveCommand(cmd)
+}
+
+function readMockHistoryMap(): Record<string, CommandHistoryEntry[]> {
+  try {
+    const raw = localStorage.getItem(HISTORY_MOCK_KEY)
+    return raw ? JSON.parse(raw) || {} : {}
+  } catch {
+    return {}
+  }
+}
+
+function writeMockHistoryMap(map: Record<string, CommandHistoryEntry[]>): void {
+  try {
+    localStorage.setItem(HISTORY_MOCK_KEY, JSON.stringify(map))
+  } catch {
+    // localStorage 不可用时仅本次内存生效
+  }
+}
+
+function sortHistory(list: CommandHistoryEntry[]): CommandHistoryEntry[] {
+  return [...list].sort((a, b) => b.count - a.count || b.lastUsedAt - a.lastUsedAt)
+}
+
+export async function getCommandHistoryApi(hostKey: string): Promise<CommandHistoryEntry[]> {
+  if (isTauri()) {
+    return await invoke<CommandHistoryEntry[]>('get_command_history', { hostKey })
+  }
+  return sortHistory(readMockHistoryMap()[hostKey] || [])
+}
+
+export async function pushCommandHistoryApi(hostKey: string, cmd: string): Promise<CommandHistoryEntry[]> {
+  if (isTauri()) {
+    return await invoke<CommandHistoryEntry[]>('push_command_history', { hostKey, cmd })
+  }
+  const map = readMockHistoryMap()
+  const list = map[hostKey] || (map[hostKey] = [])
+  if (shouldRecordCommand(cmd)) {
+    const trimmed = cmd.trim()
+    const existing = list.find(e => e.cmd === trimmed)
+    if (existing) {
+      existing.count += 1
+      existing.lastUsedAt = Date.now()
+    } else {
+      list.push({ cmd: trimmed, count: 1, lastUsedAt: Date.now() })
+    }
+  }
+  writeMockHistoryMap(map)
+  return sortHistory(list)
+}
+
+/** 批量导入远端 ~/.bash_history：仅插入不存在的项，不累加频次 */
+export async function importCommandHistoryApi(hostKey: string, cmds: string[]): Promise<void> {
+  if (isTauri()) {
+    await invoke('import_command_history', { hostKey, cmds })
+    return
+  }
+  const map = readMockHistoryMap()
+  const list = map[hostKey] || (map[hostKey] = [])
+  const now = Date.now()
+  for (const raw of cmds) {
+    if (!shouldRecordCommand(raw)) continue
+    const cmd = raw.trim()
+    if (!list.some(e => e.cmd === cmd)) list.push({ cmd, count: 1, lastUsedAt: now })
+  }
+  writeMockHistoryMap(map)
+}
+
+export async function clearCommandHistoryApi(hostKey?: string): Promise<void> {
+  if (isTauri()) {
+    await invoke('clear_command_history', { hostKey: hostKey ?? null })
+    return
+  }
+  if (hostKey) {
+    const map = readMockHistoryMap()
+    delete map[hostKey]
+    writeMockHistoryMap(map)
+  } else {
+    writeMockHistoryMap({})
+  }
+}
+
+/** 在会话连接上执行一次性命令（远端历史拉取等；浏览器预览返回空串） */
+export async function execSshCommandApi(sessionId: string, command: string): Promise<string> {
+  if (!isTauri()) return ''
+  return await invoke<string>('exec_ssh_command', { sessionId, command })
+}
+
+// ==========================================
+// 会话日志
+// ==========================================
+/** 开/关会话日志；开启或关闭均返回日志文件路径（后端会话不存在时抛错） */
+export async function setSessionLoggingApi(sessionId: string, enabled: boolean, hostLabel: string): Promise<string | null> {
+  if (!isTauri()) return null
+  return await invoke<string | null>('set_session_logging', { sessionId, enabled, hostLabel })
+}
+
+export async function getSessionLogPathApi(sessionId: string): Promise<string | null> {
+  if (!isTauri()) return null
+  return await invoke<string | null>('get_session_log_path', { sessionId })
+}
+
+/** 日志根目录 `~/.snail-ssh/logs`（不存在时后端会创建） */
+export async function getLogDirApi(): Promise<string | null> {
+  if (!isTauri()) return null
+  return await invoke<string>('get_log_dir')
+}
+
+/** 在系统文件管理器中打开路径（仅限应用数据目录内） */
+export async function revealInFileManagerApi(path: string): Promise<void> {
+  if (!isTauri()) return
+  await invoke('reveal_in_file_manager', { path })
+}
+
+// ==========================================
 // 本地文件选择 / 保存路径选择 (Tauri Dialog)
 // ==========================================
 export async function pickLocalFile(): Promise<string | null> {
   if (!isTauri()) return null
   const selected = await openDialog({ multiple: false, directory: false })
   return typeof selected === 'string' ? selected : null
+}
+
+/** 多选本地文件（拖拽上传之外的批量入口） */
+export async function pickLocalFiles(): Promise<string[]> {
+  if (!isTauri()) return []
+  const selected = await openDialog({ multiple: true, directory: false })
+  if (Array.isArray(selected)) return selected
+  return typeof selected === 'string' ? [selected] : []
+}
+
+// ==========================================
+// OS 级文件拖放（拖拽上传）
+// ==========================================
+/** 监听 webview 级文件拖放；坐标由物理像素换算为 CSS 像素，便于 elementFromPoint 命中 */
+export async function onFileDragDrop(handler: (e: FileDragDropEvent) => void): Promise<UnlistenFn> {
+  if (!isTauri()) return () => {}
+  const webview = getCurrentWebview()
+  return await webview.onDragDropEvent((event) => {
+    const payload = event.payload
+    if (payload.type === 'leave') {
+      handler({ type: 'leave', paths: [], x: 0, y: 0 })
+      return
+    }
+    const ratio = window.devicePixelRatio || 1
+    handler({
+      type: payload.type,
+      paths: payload.type === 'over' ? [] : payload.paths,
+      x: payload.position.x / ratio,
+      y: payload.position.y / ratio
+    })
+  })
 }
 
 export async function pickSavePath(defaultFileName: string): Promise<string | null> {
@@ -476,6 +645,13 @@ export async function sftpStatApi(sessionId: string, path: string): Promise<Sftp
 export async function sftpUploadFileApi(sessionId: string, localPath: string, remotePath: string, taskId: string): Promise<void> {
   if (isTauri()) {
     await invoke('sftp_upload_file', { sessionId, localPath, remotePath, taskId })
+  }
+}
+
+/** 统一上传入口：文件/目录都由后端按元数据分派，`remoteDir` 为目标父目录 */
+export async function sftpUploadPathApi(sessionId: string, localPath: string, remoteDir: string, taskId: string): Promise<void> {
+  if (isTauri()) {
+    await invoke('sftp_upload_path', { sessionId, localPath, remoteDir, taskId })
   }
 }
 

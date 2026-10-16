@@ -174,14 +174,19 @@ fn delete_secrets(host_id: &str) {
     }
 }
 
-fn get_config_file_path() -> PathBuf {
+/// 应用数据目录 `~/.snail-ssh`：主机配置、命令历史等本地文件都落在这里。
+pub(crate) fn app_data_dir() -> PathBuf {
     let base_dir = dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".snail-ssh");
     if !base_dir.exists() {
         let _ = fs::create_dir_all(&base_dir);
     }
-    base_dir.join("hosts.json")
+    base_dir
+}
+
+fn get_config_file_path() -> PathBuf {
+    app_data_dir().join("hosts.json")
 }
 
 pub fn load_hosts() -> Vec<HostItem> {

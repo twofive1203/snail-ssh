@@ -1,7 +1,9 @@
+mod history;
 mod sftp;
 mod ssh;
 mod storage;
 
+use history::HistoryEntry;
 use serde::{Deserialize, Serialize};
 use sftp::SftpFileItem;
 use ssh::{ConnectionTestResult, HostProbeResult, RemoteSystemMetrics, SshConnectConfig, SshManager};
@@ -42,6 +44,29 @@ fn save_host(host: HostItem) -> Result<(), String> {
 #[tauri::command]
 fn delete_host(id: String) -> Result<(), String> {
     storage::delete_host(&id)
+}
+
+// ==========================================
+// 命令历史
+// ==========================================
+#[tauri::command]
+fn get_command_history(host_key: String) -> Vec<HistoryEntry> {
+    history::load_history(&host_key)
+}
+
+#[tauri::command]
+fn push_command_history(host_key: String, cmd: String) -> Result<Vec<HistoryEntry>, String> {
+    history::push_history(&host_key, &cmd)
+}
+
+#[tauri::command]
+fn import_command_history(host_key: String, cmds: Vec<String>) -> Result<(), String> {
+    history::import_history(&host_key, cmds)
+}
+
+#[tauri::command]
+fn clear_command_history(host_key: Option<String>) -> Result<(), String> {
+    history::clear_history(host_key.as_deref())
 }
 
 // ==========================================
@@ -120,6 +145,88 @@ async fn get_ssh_session_cwd(
 ) -> Result<String, String> {
     let manager = ssh_manager.inner().clone();
     run_blocking(move || manager.get_session_cwd(&session_id)).await
+}
+
+#[tauri::command]
+async fn exec_ssh_command(
+    session_id: String,
+    command: String,
+    ssh_manager: State<'_, SshManager>,
+) -> Result<String, String> {
+    let manager = ssh_manager.inner().clone();
+    run_blocking(move || manager.exec_command(&session_id, &command)).await
+}
+
+// ==========================================
+// 会话日志
+// ==========================================
+#[tauri::command]
+async fn set_session_logging(
+    session_id: String,
+    enabled: bool,
+    host_label: String,
+    ssh_manager: State<'_, SshManager>,
+) -> Result<Option<String>, String> {
+    let manager = ssh_manager.inner().clone();
+    run_blocking(move || manager.set_session_logging(&session_id, enabled, &host_label)).await
+}
+
+#[tauri::command]
+async fn get_session_log_path(
+    session_id: String,
+    ssh_manager: State<'_, SshManager>,
+) -> Result<Option<String>, String> {
+    let manager = ssh_manager.inner().clone();
+    run_blocking(move || manager.get_session_log_path(&session_id)).await
+}
+
+#[tauri::command]
+async fn get_log_dir() -> Result<String, String> {
+    run_blocking(|| {
+        let dir = storage::app_data_dir().join("logs");
+        std::fs::create_dir_all(&dir).map_err(|e| format!("创建日志目录失败: {}", e))?;
+        Ok(dir.to_string_lossy().to_string())
+    })
+    .await
+}
+
+/// 在系统文件管理器中打开路径。仅允许应用数据目录（`~/.snail-ssh/`）下的路径，
+/// 防止前端被任意传参变成“打开任意路径”。
+fn reveal_path(path: &str) -> Result<(), String> {
+    let target = std::path::PathBuf::from(path);
+    if !target.exists() {
+        return Err("路径不存在".into());
+    }
+    let base = storage::app_data_dir()
+        .canonicalize()
+        .map_err(|e| e.to_string())?;
+    let canonical = target.canonicalize().map_err(|e| e.to_string())?;
+    if !canonical.starts_with(&base) {
+        return Err("仅允许打开应用数据目录内的路径".into());
+    }
+
+    let mut cmd = {
+        #[cfg(target_os = "windows")]
+        {
+            std::process::Command::new("explorer")
+        }
+        #[cfg(target_os = "macos")]
+        {
+            std::process::Command::new("open")
+        }
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            std::process::Command::new("xdg-open")
+        }
+    };
+    cmd.arg(&canonical);
+    cmd.spawn().map_err(|e| format!("无法打开文件管理器: {}", e))?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn reveal_in_file_manager(path: String) -> Result<(), String> {
+    run_blocking(move || reveal_path(&path)).await
 }
 
 #[tauri::command]
@@ -311,6 +418,23 @@ async fn sftp_upload_file(
 }
 
 #[tauri::command]
+async fn sftp_upload_path(
+    session_id: String,
+    local_path: String,
+    remote_dir: String,
+    task_id: String,
+    ssh_manager: State<'_, SshManager>,
+    app_handle: AppHandle,
+) -> Result<(), String> {
+    let manager = ssh_manager.inner().clone();
+    run_blocking(move || {
+        let session = manager.get_sftp_session(&session_id)?;
+        sftp::sftp_upload_path(session, &local_path, &remote_dir, &task_id, app_handle)
+    })
+    .await
+}
+
+#[tauri::command]
 async fn sftp_download_file(
     session_id: String,
     remote_path: String,
@@ -368,7 +492,16 @@ pub fn run() {
             test_ssh_connection,
             probe_host_info,
             get_ssh_session_cwd,
+            exec_ssh_command,
+            set_session_logging,
+            get_session_log_path,
+            get_log_dir,
+            reveal_in_file_manager,
             get_remote_metrics,
+            get_command_history,
+            push_command_history,
+            import_command_history,
+            clear_command_history,
             sftp_home_dir,
             sftp_read_dir,
             sftp_read_file,
@@ -381,6 +514,7 @@ pub fn run() {
             sftp_touch,
             sftp_stat,
             sftp_upload_file,
+            sftp_upload_path,
             sftp_download_file,
             sftp_download_dir,
         ])
