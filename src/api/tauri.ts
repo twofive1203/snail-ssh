@@ -429,6 +429,12 @@ export async function clearCommandHistoryApi(hostKey?: string): Promise<void> {
   }
 }
 
+/** 取走建连时扣下的 shell 首屏输出（Last login / MOTD / 首个提示符；只返回一次） */
+export async function takeSshSessionBannerApi(sessionId: string): Promise<string> {
+  if (!isTauri()) return ''
+  return await invoke<string>('take_ssh_session_banner', { sessionId })
+}
+
 /** 在会话连接上执行一次性命令（远端历史拉取等；浏览器预览返回空串） */
 export async function execSshCommandApi(sessionId: string, command: string): Promise<string> {
   if (!isTauri()) return ''

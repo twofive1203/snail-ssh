@@ -279,6 +279,7 @@ import {
   pushCommandHistoryApi,
   importCommandHistoryApi,
   execSshCommandApi,
+  takeSshSessionBannerApi,
   setSessionLoggingApi,
   getLogDirApi,
   revealInFileManagerApi,
@@ -334,6 +335,8 @@ interface TerminalSession {
   writeFailed: boolean
   /** 右键按下瞬间的选区快照（右键可能清空选区，需提前捕获） */
   rightClickSelection: string
+  /** 远端 shell 是否已经自己打印过 Last login（用于避免客户端重复补打） */
+  sawLastLogin: boolean
 }
 
 const snippets = [
@@ -668,7 +671,8 @@ const createSession = (tab: TerminalTab, container: HTMLDivElement): TerminalSes
   const session: TerminalSession = {
     term, fit, search,
     highlight: useTerminalHighlight(term, { onToast: (msg, type) => emit('toast', msg, type ?? 'info') }),
-    container, inputBuffer: '', lineBuffer: '', unlisten: [], writeFailed: false, rightClickSelection: ''
+    container, inputBuffer: '', lineBuffer: '', unlisten: [], writeFailed: false, rightClickSelection: '',
+    sawLastLogin: false
   }
 
   term.open(container)
@@ -777,10 +781,68 @@ const createSession = (tab: TerminalTab, container: HTMLDivElement): TerminalSes
   return session
 }
 
+/** sshd 自己打印的“上次登录”行（不同发行版 PAM 文案不同） */
+const LAST_LOGIN_RE = /last login|上次登录|最后一次登录/i
+/** 首屏判定后额外观察的窗口，兜住晚到的 sshd 输出，避免重复补打 */
+const LAST_LOGIN_WATCH_MS = 300
+
+/**
+ * 把 `LC_ALL=C lastlog -u <user>` 的输出还原成 sshd 风格的 Last login 行。
+ * 示例：`root  pts/0  192.168.1.5  Fri Oct 16 16:25:59 +0800 2026`
+ * 解析不出来（无记录 / Never logged in / 命令不存在）返回 null。
+ */
+const formatRemoteLastLogin = (raw: string): string | null => {
+  for (const line of raw.split(/\r?\n/)) {
+    const text = line.trim()
+    if (!text || /^username\b/i.test(text) || /never logged in/i.test(text)) continue
+    const matched = text.match(
+      /^(\S+)\s+([\s\S]*?)([A-Z][a-z]{2}\s+[A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})(?:\s+[+-]\d{4})?\s+(\d{4})/
+    )
+    if (!matched) continue
+    const time = `${matched[3]} ${matched[4]}`.replace(/\s+/g, ' ')
+    // 时间之前依次是 user / 端口 / 来源地址；本地登录没有来源，端口列也可能为空
+    const from = matched[2]
+      .trim()
+      .split(/\s+/)
+      .filter(p => p && !/^(pts\/|tty)/.test(p))
+      .pop() || ''
+    return `Last login: ${time}${from ? ` from ${from}` : ''}`
+  }
+  return null
+}
+
+/**
+ * 远端 sshd 默认会自己打印 Last login；只有它没打印时才由客户端补一行——
+ * 数据取自远端 lastlog（真实记录），取不到就什么都不显示，绝不伪造。
+ */
+const announceLastLoginIfMissing = async (tab: TerminalTab, session: TerminalSession, banner: string) => {
+  if (LAST_LOGIN_RE.test(banner)) return
+  await new Promise(resolve => setTimeout(resolve, LAST_LOGIN_WATCH_MS))
+  // 期间已看到远端输出，或用户已经开始输入（补打会插进命令行中间）则放弃
+  if (session.sawLastLogin || session.lineBuffer.length > 0) return
+  try {
+    const raw = await execSshCommandApi(tab.id, 'LC_ALL=C lastlog -u "$(id -un)" 2>/dev/null')
+    const line = formatRemoteLastLogin(raw)
+    if (!line || sessions.get(tab.id) !== session || session.sawLastLogin) return
+    session.term.write(`\x1b[90m${line}\x1b[0m\r\n`)
+  } catch {
+    // 远端没有 lastlog / 会话已关闭：不显示即可，不陪一个假时间
+  }
+}
+
 const bindSessionEvents = async (tab: TerminalTab, session: TerminalSession) => {
   if (isTauri()) {
+    // 建连时的首屏（Last login / MOTD / 首个提示符）已被后端扣下，否则会在前端注册监听前丢失。
+    // 顺序必须是「先注册监听 → 再取回首屏 → 最后放行实时输出」，否则提示符会跑到 MOTD 前面
+    const pendingChunks: string[] = []
+    let live = false
     const unlistenStdout = await onSshStdout(tab.id, (chunk) => {
-      session.term.write(chunk)
+      if (LAST_LOGIN_RE.test(chunk)) session.sawLastLogin = true
+      if (live) {
+        session.term.write(chunk)
+        return
+      }
+      pendingChunks.push(chunk)
     })
     const unlistenClosed = await onSshClosed(tab.id, (reason) => {
       session.term.write(`\r\n\x1b[33m[会话结束] ${reason}\x1b[0m\r\n`)
@@ -788,6 +850,20 @@ const bindSessionEvents = async (tab: TerminalTab, session: TerminalSession) => 
       emit('session-closed', tab.id, reason)
     })
     session.unlisten.push(unlistenStdout, unlistenClosed)
+
+    let banner = ''
+    try {
+      banner = await takeSshSessionBannerApi(tab.id)
+    } catch (e) {
+      console.warn('取回会话首屏失败:', e)
+    }
+    if (LAST_LOGIN_RE.test(banner)) session.sawLastLogin = true
+    if (banner) session.term.write(banner)
+    live = true
+    for (const chunk of pendingChunks) session.term.write(chunk)
+    pendingChunks.length = 0
+
+    void announceLastLoginIfMissing(tab, session, banner)
   }
 
   // 预载历史（浏览器预览走 localStorage 降级），真实会话再补齐远端 bash_history

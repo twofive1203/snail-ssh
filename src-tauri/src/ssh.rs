@@ -27,6 +27,15 @@ const SFTP_IO_TIMEOUT_MS: u32 = 30_000;
 /// 工作目录探测的整体超时，避免远端命令挂住时阻塞自动跟随
 const CWD_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Shell 启动后的首屏输出（Last login / MOTD / 首个提示符）抓取窗口。
+/// 这几行由远端在 shell 刚起来时立刻发出，而前端要等 Vue 渲染完才注册 stdout 监听，
+/// 若仍走事件广播会在注册前被丢弃（表现为看不到欢迎信息），因此建会话时先同步扣下。
+/// 已经读到数据后，静默这么久即认为首屏结束；始终没有数据时只等这么久。
+const BANNER_QUIET_GAP: Duration = Duration::from_millis(60);
+const BANNER_FIRST_BYTE_TIMEOUT: Duration = Duration::from_millis(400);
+/// 首屏抓取的总上限，避免远端持续刷输出导致建连迟迟不返回
+const BANNER_MAX_WAIT: Duration = Duration::from_millis(800);
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SshConnectConfig {
     pub host: String,
@@ -142,6 +151,8 @@ pub struct ActiveSession {
     sftp_session: Arc<Mutex<Option<Arc<Mutex<ssh2::Session>>>>>,
     config: SshConnectConfig,
     is_alive: Arc<AtomicBool>,
+    /// 建连时扣下的首屏输出，等前端注册好监听后由 take_initial_output 取走（只取一次）
+    banner: Arc<Mutex<String>>,
     /// 会话日志槽：开着时读线程把脱敏后的输出 try_send 给专用 writer 线程
     log_sink: Arc<Mutex<Option<LogSink>>>,
 }
@@ -434,6 +445,10 @@ impl SshManager {
         wait_retry(|| channel.shell(), PTY_WAIT_TIMEOUT)
             .map_err(|e| format!("启动 Shell 失败: {}", e))?;
 
+        // 先同步扣下首屏（Last login / MOTD / 首个提示符）：此时前端还没注册监听，
+        // 交给下面的读线程 emit 只会被丢掉。读取量极小且带超时，不影响建连耗时。
+        let banner = read_initial_output(&mut channel).unwrap_or_default();
+
         let session_id = format!("ssh-{}", Uuid::new_v4());
         let channel_arc = Arc::new(Mutex::new(channel));
         let is_alive = Arc::new(AtomicBool::new(true));
@@ -517,6 +532,7 @@ impl SshManager {
             sftp_session: Arc::new(Mutex::new(None)),
             config,
             is_alive,
+            banner: Arc::new(Mutex::new(banner)),
             log_sink,
         });
         self.sessions.lock().insert(session_id.clone(), active);
@@ -716,6 +732,14 @@ impl SshManager {
         }
     }
 
+    /// 取走建连时扣下的首屏输出（Last login / MOTD / 首个提示符）。
+    /// 只返回一次，重复调用得到空串，避免前端重复写入造成重影。
+    pub fn take_initial_output(&self, session_id: &str) -> Result<String, String> {
+        let active = self.get_active(session_id)?;
+        let mut banner = active.banner.lock();
+        Ok(std::mem::take(&mut *banner))
+    }
+
     /// 在会话连接上执行一次性命令并读回输出。
     /// 供远端历史拉取、脚本执行、探测等复用；通道开在终端自己那条连接上。
     pub fn exec_command(&self, session_id: &str, command: &str) -> Result<String, String> {
@@ -746,6 +770,52 @@ impl SshManager {
 
         Ok(metrics)
     }
+}
+
+/// 建连时同步扣下 shell 首屏输出。
+/// 会话已切非阻塞，因此按 EAGAIN 轮询；读到数据后静默 `BANNER_QUIET_GAP` 即收工，
+/// 始终没有数据（远端既不打印 Last login 也无 MOTD）则按 `BANNER_FIRST_BYTE_TIMEOUT` 收工。
+fn read_initial_output(channel: &mut ssh2::Channel) -> Result<String, String> {
+    let mut out = String::new();
+    let mut pending: Vec<u8> = Vec::new();
+    let mut buf = [0u8; 8192];
+    let start = Instant::now();
+    let mut last_data: Option<Instant> = None;
+
+    loop {
+        match channel.read(&mut buf) {
+            Ok(0) => {
+                // libssh2 非阻塞模式下 0 字节可能是 EOF，也可能只是本次没读到
+                if channel.eof() {
+                    break;
+                }
+            }
+            Ok(n) => {
+                out.push_str(&decode_stream(&mut pending, &buf[..n]));
+                last_data = Some(Instant::now());
+                continue;
+            }
+            Err(e) if e.kind() == ErrorKind::WouldBlock => {}
+            Err(e) => return Err(format!("读取会话首屏输出失败: {}", e)),
+        }
+
+        let now = Instant::now();
+        let waited = now.duration_since(start);
+        let finished = match last_data {
+            Some(t) => now.duration_since(t) >= BANNER_QUIET_GAP || waited >= BANNER_MAX_WAIT,
+            None => waited >= BANNER_FIRST_BYTE_TIMEOUT,
+        };
+        if finished {
+            break;
+        }
+        std::thread::sleep(IO_POLL_INTERVAL);
+    }
+
+    // 收尾时残留在缓冲区里的多字节序列按宽松解码补上，避免丢掉末尾字符
+    if !pending.is_empty() {
+        out.push_str(&String::from_utf8_lossy(&pending));
+    }
+    Ok(out)
 }
 
 /// 在指定连接上开一个瞬态 exec 通道执行脚本并读回输出。

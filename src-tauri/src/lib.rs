@@ -184,6 +184,17 @@ async fn get_ssh_session_cwd(
     run_blocking(move || manager.get_session_cwd(&session_id)).await
 }
 
+/// 取走建连时扣下的 shell 首屏输出（Last login / MOTD / 首个提示符）。
+/// 前端必须先注册 stdout 监听再调用，否则取回的首屏会与实时输出乱序。
+#[tauri::command]
+async fn take_ssh_session_banner(
+    session_id: String,
+    ssh_manager: State<'_, SshManager>,
+) -> Result<String, String> {
+    let manager = ssh_manager.inner().clone();
+    run_blocking(move || manager.take_initial_output(&session_id)).await
+}
+
 #[tauri::command]
 async fn exec_ssh_command(
     session_id: String,
@@ -558,6 +569,7 @@ pub fn run() {
             test_ssh_connection,
             probe_host_info,
             get_ssh_session_cwd,
+            take_ssh_session_banner,
             exec_ssh_command,
             set_session_logging,
             get_session_log_path,
