@@ -194,8 +194,7 @@ const demoSession: HostSession = {
   currentPath: '/root',
   sidebarCollapsed: false,
   sidebarWidth: 280,
-  viewMode: 'tree',
-  autoFollowTerminal: false
+  viewMode: 'tree'
 }
 
 const sessions = ref<HostSession[]>(isTauri() ? [] : [demoSession])
@@ -395,8 +394,7 @@ const handleConnectSsh = async (host: HostItem) => {
     currentPath: '/root',
     sidebarCollapsed: false,
     sidebarWidth: 280,
-    viewMode: 'tree',
-    autoFollowTerminal: false
+    viewMode: 'tree'
   }
 
   sessions.value.push(newSession)

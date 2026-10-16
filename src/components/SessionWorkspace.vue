@@ -15,9 +15,9 @@
         :host="session.host"
         :session-id="session.sftpSessionId || session.id"
         :refresh-signal="refreshSignal"
-        :auto-follow="session.autoFollowTerminal || false"
+        :auto-follow="activeFollow"
         :terminal-cwd="currentActiveTabCwd"
-        @update:auto-follow="(val) => session.autoFollowTerminal = val"
+        @update:auto-follow="setActiveFollow"
         @manual-sync="handleManualSync"
         @toggle-collapse="toggleCollapse"
         @open-in-terminal="handleOpenInTerminal"
@@ -103,12 +103,27 @@ const currentActiveTabCwd = computed(() => {
   return props.session.terminalTabs[props.session.activeTerminalIndex]?.cwd || ''
 })
 
+const activeTerminalTab = computed(() => props.session.terminalTabs[props.session.activeTerminalIndex])
+
+// 自动跟随挂在当前终端标签页上，同一会话内各标签页可独立开关
+const activeFollow = computed(() => activeTerminalTab.value?.autoFollowTerminal ?? false)
+
+// 文件树工具栏的开关只作用于当前标签页；打开时立即按该标签页目录同步一次
+const setActiveFollow = (val: boolean) => {
+  const tab = activeTerminalTab.value
+  if (!tab) return
+  tab.autoFollowTerminal = val
+  if (val) {
+    nextTick(() => performAutoSync())
+  }
+}
+
 let enterDebounceTimer: any = null
 
 const handleTerminalCwdChange = (tabId: string, cwd: string) => {
-  const activeTab = props.session.terminalTabs[props.session.activeTerminalIndex]
-  if (activeTab && activeTab.id === tabId) {
-    if (props.session.autoFollowTerminal) {
+  const tab = activeTerminalTab.value
+  if (tab && tab.id === tabId) {
+    if (tab.autoFollowTerminal) {
       const current = fileTreeRef.value?.getCurrentPath()
       if (current !== cwd) {
         fileTreeRef.value?.jumpToPath(cwd)
@@ -118,9 +133,8 @@ const handleTerminalCwdChange = (tabId: string, cwd: string) => {
 }
 
 const handleTerminalEnter = (tabId: string) => {
-  if (!props.session.autoFollowTerminal) return
-  const activeTab = props.session.terminalTabs[props.session.activeTerminalIndex]
-  if (!activeTab || activeTab.id !== tabId) return
+  const tab = activeTerminalTab.value
+  if (!tab || !tab.autoFollowTerminal || tab.id !== tabId) return
 
   clearTimeout(enterDebounceTimer)
   enterDebounceTimer = setTimeout(async () => {
@@ -166,18 +180,10 @@ const handleManualSync = async () => {
 watch(
   () => props.session.activeTerminalIndex,
   () => {
-    if (props.session.autoFollowTerminal) {
-      nextTick(() => {
-        performAutoSync()
-      })
-    }
-  }
-)
-
-watch(
-  () => props.session.autoFollowTerminal,
-  (enabled) => {
-    if (enabled) {
+    // 丢弃上一次回车遗留的防抖任务，避免切到新标签页后用它的目录误跳
+    clearTimeout(enterDebounceTimer)
+    enterDebounceTimer = null
+    if (activeFollow.value) {
       nextTick(() => {
         performAutoSync()
       })

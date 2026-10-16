@@ -29,6 +29,8 @@ export interface TerminalTab {
   sub: string
   connected: boolean
   cwd?: string
+  /** 是否让左侧文件工作区跟随本标签页的终端目录（Tab 维度，默认关闭） */
+  autoFollowTerminal?: boolean
 }
 
 /** 右键菜单项：divider 为 true 时渲染成分隔线，其余字段忽略 */
@@ -129,7 +131,6 @@ export interface HostSession {
   sidebarCollapsed: boolean
   sidebarWidth: number
   viewMode: 'tree' | 'list'
-  autoFollowTerminal?: boolean
 }
 
 export interface ToastMessage {
