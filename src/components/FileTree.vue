@@ -225,12 +225,12 @@
 
     <!-- 5. 底部目录跟随工具栏 -->
     <div class="h-8 bg-surface-card/40 border-t border-surface-border/60 px-2 flex items-center justify-between shrink-0 select-none">
-      <div class="flex items-center gap-1.5">
+      <div class="flex items-center gap-1.5 shrink-0">
         <!-- 自动跟随开关按钮 -->
         <button
           @click="toggleAutoFollow"
           :class="autoFollow ? 'bg-brand-500/15 text-emerald-400 border-brand-500/40 hover:bg-brand-500/25' : 'bg-surface-card text-slate-400 border-surface-border hover:text-white hover:bg-surface-elevated'"
-          class="flex items-center gap-1.5 px-2 py-1 rounded-md border text-[11px] font-mono transition-all group"
+          class="flex items-center gap-1.5 px-2 py-1 rounded-md border text-[11px] font-mono transition-all group shrink-0 whitespace-nowrap"
           :title="autoFollow ? '自动跟随：开启中（终端切目录，工作区自动进入）' : '自动跟随：已关闭（点击开启）'"
         >
           <span
@@ -245,7 +245,7 @@
         <button
           @click="triggerManualSync"
           :disabled="syncing"
-          class="flex items-center gap-1 px-2 py-1 rounded-md bg-surface-card hover:bg-surface-elevated border border-surface-border text-slate-300 hover:text-white text-[11px] font-mono transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+          class="flex items-center gap-1 px-2 py-1 rounded-md bg-surface-card hover:bg-surface-elevated border border-surface-border text-slate-300 hover:text-white text-[11px] font-mono transition-all disabled:opacity-50 disabled:cursor-not-allowed shrink-0 whitespace-nowrap"
           title="手动跟随：点击立即进入终端所在目录"
         >
           <Locate class="w-3 h-3 text-cyan-400" :class="{ 'animate-spin': syncing }" />
@@ -256,7 +256,7 @@
         <button
           @click="toggleRemoteMonitor"
           :class="remoteMonitorOpen ? 'bg-brand-500/15 text-emerald-400 border-brand-500/40 hover:bg-brand-500/25' : 'bg-surface-card text-slate-300 hover:text-white hover:bg-surface-elevated border-surface-border'"
-          class="flex items-center gap-1 px-2 py-1 rounded-md border text-[11px] font-mono transition-all group shrink-0"
+          class="flex items-center gap-1 px-2 py-1 rounded-md border text-[11px] font-mono transition-all group shrink-0 whitespace-nowrap"
           :title="remoteMonitorOpen ? '远程监控：开启中（点击收起监控栏）' : '远程监控：已关闭（点击展开服务器资源监控）'"
         >
           <span
@@ -271,7 +271,7 @@
       <!-- 右侧当前终端路径预览提示 -->
       <div
         v-if="terminalCwd"
-        class="text-[10px] font-mono text-slate-500 truncate max-w-[100px] hover:text-slate-300 transition-colors"
+        class="text-[10px] font-mono text-slate-500 truncate min-w-0 shrink pl-1 hover:text-slate-300 transition-colors"
         :title="`当前终端路径: ${terminalCwd}`"
       >
         终端: {{ terminalCwd }}
@@ -364,13 +364,12 @@ const emit = defineEmits<{
   (e: 'upload-trigger', remoteDir: string): void
   (e: 'toast', msg: string, type: 'info' | 'success' | 'warning' | 'error'): void
   (e: 'update:autoFollow', val: boolean): void
-  (e: 'update:remoteMonitorOpen', val: boolean): void
   (e: 'toggle-remote-monitor'): void
   (e: 'manual-sync'): void
 }>()
 
+// 只上报一次翻转意图；父组件负责改状态，避免重复取反回到原点
 const toggleRemoteMonitor = () => {
-  emit('update:remoteMonitorOpen', !props.remoteMonitorOpen)
   emit('toggle-remote-monitor')
 }
 

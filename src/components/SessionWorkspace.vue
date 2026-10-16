@@ -19,7 +19,6 @@
         :remote-monitor-open="session.remoteMonitorOpen || false"
         :terminal-cwd="currentActiveTabCwd"
         @update:auto-follow="setActiveFollow"
-        @update:remote-monitor-open="(val) => session.remoteMonitorOpen = val"
         @toggle-remote-monitor="handleToggleRemoteMonitor"
         @manual-sync="handleManualSync"
         @toggle-collapse="toggleCollapse"
