@@ -21,6 +21,23 @@
       </div>
 
       <div class="p-2 max-h-80 overflow-y-auto space-y-1 custom-scrollbar">
+        <!-- 最近连接（仅在输入为空时展示，按最近使用时间倒序） -->
+        <template v-if="!query.trim() && recents.length > 0">
+          <div class="text-[10px] font-mono text-slate-500 uppercase px-2 py-1">最近连接</div>
+          <div
+            v-for="h in recents"
+            :key="'recent-' + h.id"
+            @click="$emit('select-host', h); $emit('close')"
+            class="flex items-center justify-between px-3 py-2 rounded-lg hover:bg-brand-500/10 text-xs text-slate-200 hover:text-brand-300 cursor-pointer"
+          >
+            <span class="flex items-center gap-2">
+              <History class="w-3.5 h-3.5 text-amber-400" />
+              <span>最近 {{ h.name }} ({{ h.host }}:{{ h.port }})</span>
+            </span>
+            <span class="text-[10px] font-mono text-slate-500">SSH 终端</span>
+          </div>
+        </template>
+
         <!-- 主机直连 -->
         <div class="text-[10px] font-mono text-slate-500 uppercase px-2 py-1">快速直连服务器</div>
         <div
@@ -50,6 +67,17 @@
         </div>
 
         <div
+          @click="$emit('action', 'quick-connect'); $emit('close')"
+          class="flex items-center justify-between px-3 py-2 rounded-lg hover:bg-surface-elevated text-xs text-slate-200 cursor-pointer"
+        >
+          <span class="flex items-center gap-2">
+            <Zap class="w-3.5 h-3.5 text-amber-400" />
+            <span>快速连接（临时会话，不保存）</span>
+          </span>
+          <kbd class="text-[10px] font-mono text-slate-500">Ctrl + Shift + N</kbd>
+        </div>
+
+        <div
           @click="$emit('action', 'toggle-transfers'); $emit('close')"
           class="flex items-center justify-between px-3 py-2 rounded-lg hover:bg-surface-elevated text-xs text-slate-200 cursor-pointer"
         >
@@ -66,12 +94,14 @@
 
 <script setup lang="ts">
 import { ref, computed, watch, nextTick, onMounted, onBeforeUnmount } from 'vue'
-import { Search, Terminal, PlusCircle, ArrowUpDown } from 'lucide-vue-next'
+import { Search, Terminal, PlusCircle, ArrowUpDown, History, Zap } from 'lucide-vue-next'
 import type { HostItem } from '@/types'
 
 const props = defineProps<{
   open: boolean
   hosts: HostItem[]
+  /** 最近使用的主机（已过滤掉被删除的），输入为空时优先展示 */
+  recents?: HostItem[]
 }>()
 
 const emit = defineEmits<{
@@ -82,6 +112,8 @@ const emit = defineEmits<{
 
 const query = ref('')
 const inputRef = ref<HTMLInputElement | null>(null)
+
+const recents = computed(() => props.recents ?? [])
 
 const filteredHosts = computed(() => {
   const q = query.value.trim().toLowerCase()

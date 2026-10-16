@@ -144,6 +144,9 @@
             </div>
             <span class="w-2 h-2 rounded-full bg-emerald-400"></span>
           </div>
+          <div v-if="recentHosts.length === 0" class="px-2.5 py-1.5 text-[11px] text-slate-500">
+            暂无最近连接
+          </div>
         </div>
       </div>
     </div>

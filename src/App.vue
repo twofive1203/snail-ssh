@@ -26,7 +26,7 @@
           :total-hosts="hosts.length"
           :active-sessions-count="sessions.length"
           :group-counts="groupCounts"
-          :recent-hosts="hosts.slice(0, 2)"
+          :recent-hosts="recentHostItems"
           @switch-view="handleSidebarSwitchView"
           @filter-group="val => selectedGroup = val"
           @connect-host="handleConnectSsh"
@@ -85,12 +85,14 @@
       />
     </div>
 
-    <!-- 弹窗 1: 新建/编辑服务器 -->
+    <!-- 弹窗 1: 新建/编辑服务器 / 快速连接 -->
     <HostModal
-      :open="hostModalOpen"
+      :open="hostModalVisible"
       :host-data="editingHost"
-      @close="hostModalOpen = false"
+      :mode="hostModalMode"
+      @close="closeHostModal"
       @save="handleSaveHost"
+      @connect-quick="handleQuickConnect"
       @toast="triggerToast"
     />
 
@@ -107,6 +109,7 @@
     <CommandPalette
       :open="paletteOpen"
       :hosts="hosts"
+      :recents="recentHostItems"
       @close="paletteOpen = false"
       @select-host="handleConnectSsh"
       @action="handlePaletteAction"
@@ -133,6 +136,7 @@ import EditorModal from '@/components/EditorModal.vue'
 import DialogHost from '@/components/DialogHost.vue'
 import Toast from '@/components/Toast.vue'
 import { confirmDialog, promptDialog, dialogState } from '@/composables/useDialog'
+import { useRecentHosts, MAX_RECENT_DISPLAY } from '@/composables/useRecentHosts'
 import type { HostItem, HostSession, SftpFileItem, TransferTask, ToastMessage } from '@/types'
 import {
   getHostsApi,
@@ -207,6 +211,7 @@ const sftpRefreshSignal = ref(0)
 // 弹窗状态
 const paletteOpen = ref(false)
 const hostModalOpen = ref(false)
+const quickConnectOpen = ref(false)
 const editingHost = ref<HostItem | null>(null)
 const editorOpen = ref(false)
 const editingFilePath = ref('')
@@ -232,6 +237,24 @@ const groupCounts = computed(() => {
   })
   return counts
 })
+
+// ==========================================
+// 快速连接 & 最近连接
+// ==========================================
+const { recents, touchRecent } = useRecentHosts()
+
+/** 最近连接中已被删除的主机需要过滤掉，且只展示前 N 条 */
+const recentHostItems = computed<HostItem[]>(() =>
+  recents.value
+    .map(r => hosts.value.find(h => h.id === r.hostId))
+    .filter((h): h is HostItem => !!h)
+    .slice(0, MAX_RECENT_DISPLAY)
+)
+
+const hostModalVisible = computed(() => hostModalOpen.value || quickConnectOpen.value)
+const hostModalMode = computed<'edit' | 'new' | 'quick'>(() =>
+  quickConnectOpen.value ? 'quick' : editingHost.value ? 'edit' : 'new'
+)
 
 // 动作方法
 const triggerToast = (text: string, type: 'info' | 'success' | 'warning' | 'error' = 'info') => {
@@ -346,7 +369,9 @@ const refreshHostMetrics = async (host: HostItem, sessionId: string) => {
       updatedAt: '刚刚'
     }
     const idx = hosts.value.findIndex(h => h.id === host.id)
-    if (idx >= 0) hosts.value[idx] = updated
+    if (idx < 0) return
+    // 先更新本地列表再落盘，避免把快速连接的临时主机写进 hosts.json
+    hosts.value[idx] = updated
     await saveHostApi(updated)
   } catch (e) {
     console.warn('probe_host_info failed:', e)
@@ -402,8 +427,18 @@ const handleConnectSsh = async (host: HostItem) => {
   sessions.value.push(newSession)
   activeSessionId.value = newSession.id
 
+  // 仅记录已入库主机的最近使用时间（临时主机不入列表）
+  if (hosts.value.some(h => h.id === host.id)) touchRecent(host)
+
   triggerToast(`已连通 ${host.name}，文件树与终端就绪`, 'success')
   refreshHostMetrics(host, sessionId)
+}
+
+// 快速连接：不落库，直接建立临时会话
+const handleQuickConnect = async (host: HostItem) => {
+  quickConnectOpen.value = false
+  editingHost.value = null
+  await handleConnectSsh(host)
 }
 
 // 关闭整个主机会话
@@ -538,18 +573,31 @@ const handleCloseTerminalTabsAfter = (session: HostSession, index: number) => {
 // 主机增删改查
 const openNewHostModal = () => {
   editingHost.value = null
+  quickConnectOpen.value = false
   hostModalOpen.value = true
+}
+
+const openQuickConnect = () => {
+  editingHost.value = null
+  hostModalOpen.value = false
+  quickConnectOpen.value = true
+}
+
+const closeHostModal = () => {
+  hostModalOpen.value = false
+  quickConnectOpen.value = false
 }
 
 const handleEditHost = (host: HostItem) => {
   editingHost.value = host
+  quickConnectOpen.value = false
   hostModalOpen.value = true
 }
 
 const handleSaveHost = async (host: HostItem) => {
   await saveHostApi(host)
   await loadHosts()
-  hostModalOpen.value = false
+  closeHostModal()
   triggerToast(`已保存服务器: ${host.name}`, 'success')
 }
 
@@ -722,6 +770,7 @@ const handleClearCompletedTasks = () => {
 
 const handlePaletteAction = (act: string) => {
   if (act === 'new-host') openNewHostModal()
+  if (act === 'quick-connect') openQuickConnect()
   if (act === 'toggle-transfers') transfersOpen.value = !transfersOpen.value
 }
 
@@ -747,6 +796,10 @@ const setupGlobalKeybindings = () => {
     if (key === 'n' && !e.shiftKey) {
       e.preventDefault()
       openNewHostModal()
+    }
+    if (key === 'n' && e.shiftKey) {
+      e.preventDefault()
+      openQuickConnect()
     }
     if (key === 't') {
       e.preventDefault()

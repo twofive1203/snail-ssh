@@ -14,8 +14,10 @@
             <Server class="w-4 h-4" />
           </div>
           <div>
-            <h2 class="text-sm font-bold text-white">{{ isEditing ? '编辑 SSH 服务器' : '配置新建服务器' }}</h2>
-            <p class="text-[11px] text-surface-subtle">填写连接凭证与认证方式，密码/私钥会存入系统钥匙串</p>
+            <h2 class="text-sm font-bold text-white">{{ isQuick ? '快速连接' : isEditing ? '编辑 SSH 服务器' : '配置新建服务器' }}</h2>
+            <p class="text-[11px] text-surface-subtle">
+              {{ isQuick ? '临时会话不会保存到资产列表，密码 / 私钥仅保存在内存中' : '填写连接凭证与认证方式，密码/私钥会存入系统钥匙串' }}
+            </p>
           </div>
         </div>
         <button @click="$emit('close')" class="p-1.5 rounded-lg hover:bg-surface-elevated text-slate-400 hover:text-white transition-colors">
@@ -35,7 +37,7 @@
         </div>
 
         <div class="grid grid-cols-2 gap-4">
-          <div class="space-y-1.5 col-span-2 sm:col-span-1">
+          <div class="space-y-1.5" :class="isQuick ? 'col-span-2' : 'col-span-2 sm:col-span-1'">
             <label class="text-xs font-medium text-slate-300">服务器别名 (Name) <span class="text-rose-400">*</span></label>
             <input
               v-model="form.name"
@@ -45,7 +47,7 @@
               class="w-full bg-surface-card border border-surface-border rounded-lg px-3 py-2 text-xs text-white focus:outline-none focus:border-brand-500 transition-colors font-mono"
             />
           </div>
-          <div class="space-y-1.5 col-span-2 sm:col-span-1">
+          <div v-if="!isQuick" class="space-y-1.5 col-span-2 sm:col-span-1">
             <label class="text-xs font-medium text-slate-300">所属分组 (Group)</label>
             <select
               v-model="form.group"
@@ -148,8 +150,8 @@
           </div>
         </div>
 
-        <!-- 标签设置 -->
-        <div class="space-y-1.5">
+        <!-- 标签设置（快速连接不需要归类） -->
+        <div v-if="!isQuick" class="space-y-1.5">
           <label class="text-xs font-medium text-slate-300">分类标签 (英文逗号分隔)</label>
           <input
             v-model="tagInput"
@@ -180,7 +182,7 @@
             type="submit"
             class="px-5 py-2 rounded-lg bg-brand-500 hover:bg-brand-600 text-slate-950 font-semibold text-xs shadow-glow-emerald transition-all"
           >
-            保存配置
+            {{ isQuick ? '连接' : '保存配置' }}
           </button>
         </div>
       </form>
@@ -189,7 +191,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, watch, onMounted, onBeforeUnmount } from 'vue'
+import { ref, watch, computed, onMounted, onBeforeUnmount } from 'vue'
 import { Server, X } from 'lucide-vue-next'
 import type { HostItem, AuthType } from '@/types'
 import { testSshConnectionApi, isTauri } from '@/api/tauri'
@@ -198,15 +200,19 @@ import { confirmDialog, dialogState } from '@/composables/useDialog'
 const props = defineProps<{
   open: boolean
   hostData?: HostItem | null
+  /** edit=编辑已有主机，new=新建入库，quick=快速连接（不落盘） */
+  mode?: 'edit' | 'new' | 'quick'
 }>()
 
 const emit = defineEmits<{
   (e: 'close'): void
   (e: 'save', host: HostItem): void
+  (e: 'connect-quick', host: HostItem): void
   (e: 'toast', msg: string, type: 'info' | 'success' | 'warning' | 'error'): void
 }>()
 
 const isEditing = ref(false)
+const isQuick = computed(() => props.mode === 'quick')
 const tagInput = ref('')
 const testing = ref(false)
 
@@ -236,6 +242,24 @@ const form = ref<{
 
 watch(() => props.open, (val) => {
   if (val) {
+    if (isQuick.value) {
+      // 快速连接：始终以空白表单开始，不复用已入库主机
+      isEditing.value = false
+      form.value = {
+        id: 'quick-' + Date.now(),
+        name: '',
+        host: '',
+        port: 22,
+        username: 'root',
+        authType: 'password',
+        password: '',
+        privateKey: '',
+        passphrase: '',
+        group: 'production'
+      }
+      tagInput.value = ''
+      return
+    }
     if (props.hostData) {
       isEditing.value = true
       form.value = { ...props.hostData }
@@ -366,6 +390,11 @@ const handleSubmit = () => {
     ...form.value,
     ...metrics,
     tags
+  }
+  if (isQuick.value) {
+    // 临时主机必须带唯一 id，否则会被 handleConnectSsh 当成已有会话去重
+    emit('connect-quick', { ...item, id: 'quick-' + Date.now() })
+    return
   }
   emit('save', item)
 }
