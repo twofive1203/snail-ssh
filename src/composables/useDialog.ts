@@ -29,6 +29,8 @@ export interface DialogOptions {
   cancelText?: string
   variant?: DialogVariant
   input?: DialogInputOptions
+  /** 只展示信息（如「属性」），隐藏取消按钮 */
+  hideCancel?: boolean
 }
 
 interface DialogState {
@@ -42,6 +44,7 @@ interface DialogState {
   variant: DialogVariant
   input: DialogInputOptions | null
   value: string
+  hideCancel: boolean
   resolve: ((value: any) => void) | null
 }
 
@@ -56,6 +59,7 @@ export const dialogState = reactive<DialogState>({
   variant: 'default',
   input: null,
   value: '',
+  hideCancel: false,
   resolve: null
 })
 
@@ -77,6 +81,7 @@ function openDialog(mode: 'confirm' | 'prompt', options: DialogOptions): Promise
     dialogState.variant = options.variant || 'default'
     dialogState.input = options.input || null
     dialogState.value = options.input?.value ?? ''
+    dialogState.hideCancel = options.hideCancel ?? false
     dialogState.resolve = resolve
     dialogState.open = true
   })

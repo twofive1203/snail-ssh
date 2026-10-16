@@ -437,6 +437,42 @@ export async function sftpRemoveFileApi(sessionId: string, path: string): Promis
   }
 }
 
+// 重命名 / 移动：overwrite=false 时目标已存在会报错，由调用方决定是否重试覆盖
+export async function sftpRenameApi(sessionId: string, from: string, to: string, overwrite = false): Promise<void> {
+  if (isTauri()) {
+    await invoke('sftp_rename', { sessionId, from, to, overwrite })
+  }
+}
+
+// 修改权限位（八进制数值，如 0o755）
+export async function sftpChmodApi(sessionId: string, path: string, mode: number): Promise<void> {
+  if (isTauri()) {
+    await invoke('sftp_chmod', { sessionId, path, mode })
+  }
+}
+
+// 修改属主 / 属组（数字 id，未传的项不变）
+export async function sftpChownApi(sessionId: string, path: string, uid?: number, gid?: number): Promise<void> {
+  if (isTauri()) {
+    await invoke('sftp_chown', { sessionId, path, uid, gid })
+  }
+}
+
+// 新建空白文件（已存在则报错）
+export async function sftpTouchApi(sessionId: string, path: string): Promise<void> {
+  if (isTauri()) {
+    await invoke('sftp_touch', { sessionId, path })
+  }
+}
+
+// 单条目属性（供属性弹窗与冲突检测复用）
+export async function sftpStatApi(sessionId: string, path: string): Promise<SftpFileItem | null> {
+  if (isTauri()) {
+    return await invoke<SftpFileItem>('sftp_stat', { sessionId, path })
+  }
+  return null
+}
+
 export async function sftpUploadFileApi(sessionId: string, localPath: string, remotePath: string, taskId: string): Promise<void> {
   if (isTauri()) {
     await invoke('sftp_upload_file', { sessionId, localPath, remotePath, taskId })

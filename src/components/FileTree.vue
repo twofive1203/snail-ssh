@@ -326,6 +326,9 @@ import {
   Trash2,
   FilePlus,
   Compass,
+  Lock,
+  Users,
+  Info,
   Locate,
   Activity
 } from 'lucide-vue-next'
@@ -336,7 +339,12 @@ import {
   sftpReadDirApi,
   sftpHomeDirApi,
   sftpMkdirApi,
-  sftpRemoveFileApi
+  sftpRemoveFileApi,
+  sftpTouchApi,
+  sftpRenameApi,
+  sftpChmodApi,
+  sftpChownApi,
+  sftpStatApi
 } from '@/api/tauri'
 import { confirmDialog, promptDialog } from '@/composables/useDialog'
 
@@ -445,6 +453,10 @@ const contextMenuItems = computed<ContextMenuItem[]>(() => {
   items.push({ key: 'new-folder-child', label: '在此新建子目录', icon: FolderPlus })
   items.push({ divider: true })
   items.push({ key: 'rename', label: '重命名', icon: Compass })
+  items.push({ key: 'chmod', label: '修改权限', icon: Lock })
+  items.push({ key: 'chown', label: '修改属主/属组', icon: Users })
+  items.push({ key: 'props', label: '属性', icon: Info })
+  items.push({ divider: true })
   items.push({ key: 'delete', label: '删除', icon: Trash2, danger: true })
   items.push({ divider: true })
   items.push({ key: 'refresh', label: '刷新', icon: RefreshCw })
@@ -456,6 +468,32 @@ const joinPath = (dir: string, name: string) => {
   if (dir === '/') return `/${name}`
   return `${dir.replace(/\/+$/, '')}/${name}`
 }
+
+/** 从绝对路径反推父目录（用 lastIndexOf 而非字符串替换） */
+const parentDirOf = (p: string) => {
+  const idx = p.lastIndexOf('/')
+  return idx <= 0 ? '/' : p.slice(0, idx)
+}
+
+/** 从 "-rw-r--r-- (644)" 中提取八进制位，供属性/权限弹窗做默认值 */
+const currentOctal = (permissions: string) => {
+  const m = permissions.match(/\((\d{3,4})\)/)
+  return m ? m[1] : '644'
+}
+
+/** FileTreeNode -> SftpFileItem，供下载/属性复用 */
+const toSftpItem = (node: FileTreeNode): SftpFileItem => ({
+  name: node.name,
+  isDir: node.isDir,
+  size: node.size,
+  sizeBytes: node.sizeBytes,
+  permissions: node.permissions,
+  owner: node.owner,
+  group: node.group,
+  modifiedTime: node.modifiedTime,
+  editable: node.editable,
+  isHidden: node.isHidden
+})
 
 // 加载指定目录下的子项
 const fetchDirChildren = async (dirPath: string): Promise<FileTreeNode[]> => {
@@ -637,6 +675,167 @@ const createNewFolder = async () => {
   }
 }
 
+/** 新建空白文件（空区域菜单） */
+const createNewFile = async () => {
+  if (!props.sessionId) return
+  const targetDir = selectedNode.value?.isDir ? selectedNode.value.path : currentPath.value
+  const name = await promptDialog({
+    title: '新建空白文件',
+    message: `在 ${targetDir} 下创建新文件：`,
+    input: {
+      label: '文件名',
+      placeholder: '例如: app.log, config.yaml',
+      required: true
+    },
+    confirmText: '创建'
+  })
+  if (!name || !name.trim()) return
+  const fileName = name.trim()
+  if (fileName.includes('/')) {
+    emit('toast', '文件名不能包含 "/"', 'warning')
+    return
+  }
+  try {
+    await sftpTouchApi(props.sessionId, joinPath(targetDir, fileName))
+    emit('toast', `文件「${fileName}」创建成功`, 'success')
+    await refreshCurrent()
+  } catch (err: any) {
+    emit('toast', `创建失败: ${err?.message || err}`, 'error')
+  }
+}
+
+/** 重命名（目标已存在时先询问是否覆盖） */
+const renameNode = async (node: FileTreeNode) => {
+  if (!props.sessionId) return
+  const input = await promptDialog({
+    title: node.isDir ? '重命名目录' : '重命名文件',
+    message: `为 ${node.name} 输入新名称：`,
+    detail: node.path,
+    input: { label: '新名称', value: node.name, placeholder: node.name, required: true },
+    confirmText: '重命名'
+  })
+  if (!input) return
+  const newName = input.trim()
+  if (!newName || newName === node.name) return
+  if (newName.includes('/') || newName === '.' || newName === '..') {
+    emit('toast', '名称无效（不能包含 "/"）', 'warning')
+    return
+  }
+
+  const target = joinPath(parentDirOf(node.path), newName)
+  let overwrite = false
+  const existing = await sftpStatApi(props.sessionId, target).catch(() => null)
+  if (existing) {
+    overwrite = await confirmDialog({
+      title: '目标已存在',
+      variant: 'warning',
+      message: `${newName} 已存在，确定要覆盖吗？`,
+      detail: target,
+      confirmText: '覆盖',
+      cancelText: '取消'
+    })
+    if (!overwrite) return
+  }
+
+  try {
+    await sftpRenameApi(props.sessionId, node.path, target, overwrite)
+    emit('toast', `已重命名为 ${newName}`, 'success')
+    await refreshCurrent()
+  } catch (err: any) {
+    emit('toast', `重命名失败: ${err?.message || err}`, 'error')
+  }
+}
+
+/** 修改权限位（八进制 3~4 位） */
+const changePermissions = async (node: FileTreeNode) => {
+  if (!props.sessionId) return
+  const input = await promptDialog({
+    title: '修改权限',
+    message: `修改 ${node.name} 的权限位（八进制）：`,
+    detail: `${node.path}\n当前: ${node.permissions}`,
+    input: {
+      label: '权限（3~4 位八进制）',
+      value: currentOctal(node.permissions),
+      placeholder: '755',
+      required: true
+    },
+    confirmText: '应用'
+  })
+  if (!input) return
+  const mode = input.trim()
+  if (!/^[0-7]{3,4}$/.test(mode)) {
+    emit('toast', '权限格式不正确，请输入 3~4 位八进制（如 644、0755）', 'warning')
+    return
+  }
+  try {
+    await sftpChmodApi(props.sessionId, node.path, parseInt(mode, 8))
+    emit('toast', `已修改 ${node.name} 权限为 ${mode}`, 'success')
+    await refreshCurrent()
+  } catch (err: any) {
+    emit('toast', `修改权限失败: ${err?.message || err}`, 'error')
+  }
+}
+
+/** 修改属主 / 属组（数字 id，格式 uid:gid） */
+const changeOwnership = async (node: FileTreeNode) => {
+  if (!props.sessionId) return
+  const input = await promptDialog({
+    title: '修改属主 / 属组',
+    message: `修改 ${node.name} 的属主/属组（数字 id）：`,
+    detail: `${node.path}\n当前: uid=${node.owner} gid=${node.group}\n格式 uid:gid，留空表示不修改该项`,
+    input: { label: 'uid:gid', value: '', placeholder: '例如 1000:1000', required: true },
+    confirmText: '应用'
+  })
+  if (input === null) return
+
+  const [uidStr, gidStr] = input.trim().split(':')
+  const parseId = (s?: string): number | undefined | 'invalid' => {
+    if (s === undefined || s.trim() === '') return undefined
+    return /^\d+$/.test(s.trim()) ? Number(s.trim()) : 'invalid'
+  }
+  const uid = parseId(uidStr)
+  const gid = parseId(gidStr)
+  if (uid === 'invalid' || gid === 'invalid') {
+    emit('toast', 'uid / gid 必须是数字', 'warning')
+    return
+  }
+  if (uid === undefined && gid === undefined) {
+    emit('toast', '未填写 uid 或 gid', 'warning')
+    return
+  }
+
+  try {
+    await sftpChownApi(props.sessionId, node.path, uid, gid)
+    emit('toast', `已更新 ${node.name} 的属主/属组`, 'success')
+    await refreshCurrent()
+  } catch (err: any) {
+    emit('toast', `修改属主失败: ${err?.message || err}`, 'error')
+  }
+}
+
+/** 属性查看（优先取远端最新 stat，失败时用列表缓存） */
+const showProperties = async (node: FileTreeNode) => {
+  const remote = props.sessionId
+    ? await sftpStatApi(props.sessionId, node.path).catch(() => null)
+    : null
+  const item = remote ?? toSftpItem(node)
+  await confirmDialog({
+    title: '文件属性',
+    message: item.name,
+    detail: [
+      `路径: ${node.path}`,
+      `类型: ${item.isDir ? '目录' : '普通文件'}`,
+      `大小: ${item.size}（${item.sizeBytes} 字节）`,
+      `权限: ${item.permissions}`,
+      `属主: uid=${item.owner}`,
+      `属组: gid=${item.group}`,
+      `修改时间: ${item.modifiedTime}`
+    ].join('\n'),
+    confirmText: '关闭',
+    hideCancel: true
+  })
+}
+
 // 右键处理
 const handleNodeContextMenu = (evt: MouseEvent, node: FileTreeNode) => {
   evt.stopPropagation()
@@ -699,6 +898,21 @@ const handleContextMenuSelect = async (item: ContextMenuItem) => {
     case 'new-folder':
     case 'new-folder-child':
       await createNewFolder()
+      break
+    case 'new-file':
+      await createNewFile()
+      break
+    case 'rename':
+      if (node) await renameNode(node)
+      break
+    case 'chmod':
+      if (node) await changePermissions(node)
+      break
+    case 'chown':
+      if (node) await changeOwnership(node)
+      break
+    case 'props':
+      if (node) await showProperties(node)
       break
     case 'delete':
       if (node && props.sessionId) {

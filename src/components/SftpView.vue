@@ -32,10 +32,22 @@
           </div>
         </div>
 
-        <!-- 面包屑路径 -->
+        <!-- 面包屑路径 / 路径直输 -->
         <div class="flex-1 flex items-center bg-surface-card border border-surface-border rounded-lg px-2.5 py-1 text-xs font-mono">
           <Folder class="w-3.5 h-3.5 text-amber-400 mr-2 shrink-0" />
-          <div class="flex items-center gap-1 text-slate-300 overflow-x-auto no-scrollbar flex-1">
+          <input
+            v-if="editingPath"
+            ref="pathInputRef"
+            v-model="pathBuffer"
+            type="text"
+            spellcheck="false"
+            placeholder="/var/log 或 ~"
+            class="flex-1 bg-transparent text-slate-200 outline-none font-mono"
+            @keydown.enter.prevent="submitPath"
+            @keydown.esc.prevent="editingPath = false"
+            @blur="editingPath = false"
+          />
+          <div v-else class="flex items-center gap-1 text-slate-300 overflow-x-auto no-scrollbar flex-1">
             <span
               @click="navigateTo('/')"
               class="hover:text-white cursor-pointer px-1 py-0.5 rounded hover:bg-surface-elevated font-semibold"
@@ -53,7 +65,10 @@
               </span>
             </template>
           </div>
-          <button @click="copyPath" class="text-slate-500 hover:text-white p-0.5 rounded transition-colors ml-2" title="复制完整路径">
+          <button @click="startEditPath" class="text-slate-500 hover:text-white p-0.5 rounded transition-colors ml-2 shrink-0" title="直接输入绝对路径跳转">
+            <PenLine class="w-3.5 h-3.5" />
+          </button>
+          <button @click="copyPath" class="text-slate-500 hover:text-white p-0.5 rounded transition-colors ml-1 shrink-0" title="复制完整路径">
             <Copy class="w-3.5 h-3.5" />
           </button>
         </div>
@@ -75,6 +90,14 @@
         >
           <FolderPlus class="w-3.5 h-3.5" />
           <span>新建文件夹</span>
+        </button>
+
+        <button
+          @click="createNewFile"
+          class="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-surface-card hover:bg-surface-elevated border border-surface-border text-slate-300 hover:text-white transition-colors"
+        >
+          <FilePlus class="w-3.5 h-3.5" />
+          <span>新建文件</span>
         </button>
 
         <button
@@ -135,6 +158,26 @@
       </div>
     </div>
 
+    <!-- 名称过滤 -->
+    <div class="h-10 px-4 flex items-center gap-2 border-b border-surface-border bg-surface-base shrink-0">
+      <Search class="w-3.5 h-3.5 text-slate-500 shrink-0" />
+      <input
+        v-model="filterText"
+        type="text"
+        spellcheck="false"
+        placeholder="按名称过滤当前目录"
+        class="w-56 bg-surface-card border border-surface-border rounded-lg px-2.5 py-1 text-xs text-slate-200 placeholder:text-slate-600 outline-none focus:border-brand-500 font-mono"
+      />
+      <span v-if="filterText" class="text-[11px] font-mono text-slate-500">{{ visibleFiles.length }} 项匹配</span>
+      <button
+        v-if="filterText"
+        @click="filterText = ''"
+        class="text-[11px] text-slate-500 hover:text-white px-1.5 py-0.5 rounded hover:bg-surface-elevated transition-colors"
+      >
+        清除
+      </button>
+    </div>
+
     <!-- SFTP 表格区域 -->
     <div class="flex-1 overflow-y-auto custom-scrollbar select-none">
       <table class="w-full text-left text-xs border-collapse">
@@ -162,6 +205,7 @@
             :key="file.name"
             @click="handleFileClick(file)"
             @dblclick="handleFileDoubleClick(file)"
+            @contextmenu.prevent="openFileMenu($event, file)"
             class="sftp-row hover:bg-surface-card/60 transition-colors group cursor-pointer"
             :class="{ 'bg-brand-500/10': selectedFileNames.has(file.name) }"
             :title="file.name === '..' ? '返回上级目录' : file.isDir ? '双击进入目录' : file.editable ? '双击在线编辑' : '双击下载到本地'"
@@ -256,14 +300,34 @@
         </span>
       </div>
     </div>
+    <!-- 文件行右键菜单 -->
+    <ContextMenu
+      :open="fileMenu.open"
+      :x="fileMenu.x"
+      :y="fileMenu.y"
+      :items="fileMenuItems"
+      @select="handleFileMenuSelect"
+      @close="fileMenu.open = false"
+    />
   </section>
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted, watch } from 'vue'
-import type { HostItem, RemoteFileRef, SftpFileItem } from '@/types'
-import { sftpReadDirApi, sftpMkdirApi, sftpRemoveFileApi, sftpHomeDirApi } from '@/api/tauri'
+import { ref, computed, onMounted, watch, nextTick } from 'vue'
+import type { ContextMenuItem, HostItem, RemoteFileRef, SftpFileItem } from '@/types'
+import {
+  sftpReadDirApi,
+  sftpMkdirApi,
+  sftpRemoveFileApi,
+  sftpHomeDirApi,
+  sftpTouchApi,
+  sftpRenameApi,
+  sftpChmodApi,
+  sftpChownApi,
+  sftpStatApi
+} from '@/api/tauri'
 import { confirmDialog, promptDialog } from '@/composables/useDialog'
+import ContextMenu from '@/components/ContextMenu.vue'
 import {
   Folder,
   FolderOpen,
@@ -282,7 +346,14 @@ import {
   FileText,
   Archive,
   ShieldCheck,
-  File
+  File,
+  Search,
+  PenLine,
+  Compass,
+  Lock,
+  Users,
+  Info,
+  FilePlus
 } from 'lucide-vue-next'
 
 const props = defineProps<{
@@ -310,20 +381,37 @@ const files = ref<SftpFileItem[]>([])
 const loading = ref(false)
 const showHidden = ref(false)
 const selectedFileNames = ref<Set<string>>(new Set())
+const filterText = ref('')
+
+// 路径直输
+const editingPath = ref(false)
+const pathBuffer = ref('/')
+const pathInputRef = ref<HTMLInputElement | null>(null)
 
 const joinPath = (dir: string, name: string) => (dir === '/' ? `/${name}` : `${dir}/${name}`)
+
+/** 从 "-rw-r--r-- (644)" 中提取八进制位 */
+const currentOctal = (permissions: string) => {
+  const m = permissions.match(/\((\d{3,4})\)/)
+  return m ? m[1] : '644'
+}
 
 const pathSegments = computed(() => {
   return currentPath.value.split('/').filter(Boolean)
 })
 
 const visibleFiles = computed(() => {
-  return files.value.filter(f => showHidden.value || !f.isHidden)
+  const q = filterText.value.trim().toLowerCase()
+  return files.value.filter(f => {
+    if (!showHidden.value && f.isHidden) return false
+    if (!q) return true
+    return f.name.toLowerCase().includes(q)
+  })
 })
 
-// 当前选中的非 ".." 项
+// 当前选中的非 ".." 项（基于全量列表，避免过滤时丢失已选项）
 const selectedFiles = computed(() =>
-  visibleFiles.value.filter(f => f.name !== '..' && selectedFileNames.value.has(f.name))
+  files.value.filter(f => f.name !== '..' && selectedFileNames.value.has(f.name))
 )
 
 // 除 ".." 外是否有真实条目，用于空目录空状态
@@ -368,6 +456,36 @@ const loadFiles = async () => {
 const navigateTo = (path: string) => {
   currentPath.value = path
   loadFiles()
+}
+
+/** 路径直输：支持 ~ 与 ~/xxx 自动展开为家目录 */
+const startEditPath = () => {
+  pathBuffer.value = currentPath.value
+  editingPath.value = true
+  nextTick(() => {
+    pathInputRef.value?.focus()
+    pathInputRef.value?.select()
+  })
+}
+
+const submitPath = async () => {
+  editingPath.value = false
+  const input = pathBuffer.value.trim()
+  if (!input) return
+
+  let target = input
+  if ((input === '~' || input.startsWith('~/')) && props.activeSessionId) {
+    const home = await sftpHomeDirApi(props.activeSessionId).catch(() => '')
+    if (home) {
+      target = input === '~' ? home : `${home.replace(/\/+$/, '')}/${input.slice(2)}`
+    }
+  }
+
+  if (!target.startsWith('/')) {
+    emit('toast', '请输入以 / 开头的绝对路径（支持 ~ 表示家目录）', 'warning')
+    return
+  }
+  navigateTo(target)
 }
 
 const navigateToSegment = (idx: number) => {
@@ -555,6 +673,208 @@ const getFileIconColor = (file: SftpFileItem) => {
   if (file.name.endsWith('.log')) return 'text-blue-400'
   if (file.name.endsWith('.tar.gz')) return 'text-purple-400'
   return 'text-slate-400'
+}
+
+// ==========================================
+// 文件行右键菜单（重命名 / 权限 / 属主 / 属性）
+// ==========================================
+const fileMenu = ref({ open: false, x: 0, y: 0, target: null as SftpFileItem | null })
+
+const openFileMenu = (event: MouseEvent, file: SftpFileItem) => {
+  if (file.name === '..') return
+  fileMenu.value = { open: true, x: event.clientX, y: event.clientY, target: file }
+}
+
+const fileMenuItems = computed<ContextMenuItem[]>(() => {
+  const file = fileMenu.value.target
+  if (!file) return []
+  const items: ContextMenuItem[] = []
+  items.push({ key: 'download', label: file.isDir ? '下载整个目录' : '下载到本地', icon: Download })
+  if (!file.isDir && file.editable) items.push({ key: 'edit', label: '在线编辑', icon: Edit3 })
+  items.push({ divider: true })
+  items.push({ key: 'rename', label: '重命名', icon: Compass })
+  items.push({ key: 'chmod', label: '修改权限', icon: Lock })
+  items.push({ key: 'chown', label: '修改属主/属组', icon: Users })
+  items.push({ key: 'copy-path', label: '复制绝对路径', icon: Copy })
+  items.push({ key: 'props', label: '属性', icon: Info })
+  items.push({ divider: true })
+  items.push({ key: 'delete', label: '删除', icon: Trash2, danger: true })
+  return items
+})
+
+const handleFileMenuSelect = async (item: ContextMenuItem) => {
+  const file = fileMenu.value.target
+  if (!file || !item.key) return
+  switch (item.key) {
+    case 'download': handleDownload(file); break
+    case 'edit': emit('edit-file', joinPath(currentPath.value, file.name)); break
+    case 'copy-path':
+      await navigator.clipboard.writeText(joinPath(currentPath.value, file.name))
+      emit('toast', '已复制绝对路径到剪贴板', 'success')
+      break
+    case 'rename': await renameFile(file); break
+    case 'chmod': await changePermissions(file); break
+    case 'chown': await changeOwnership(file); break
+    case 'props': await showProperties(file); break
+    case 'delete': await handleDelete(file); break
+  }
+}
+
+const renameFile = async (file: SftpFileItem) => {
+  if (!props.activeSessionId) return
+  const input = await promptDialog({
+    title: file.isDir ? '重命名目录' : '重命名文件',
+    message: `为 ${file.name} 输入新名称：`,
+    detail: joinPath(currentPath.value, file.name),
+    input: { label: '新名称', value: file.name, placeholder: file.name, required: true },
+    confirmText: '重命名'
+  })
+  if (!input) return
+  const newName = input.trim()
+  if (!newName || newName === file.name) return
+  if (newName.includes('/') || newName === '.' || newName === '..') {
+    emit('toast', '名称无效（不能包含 "/"）', 'warning')
+    return
+  }
+
+  const from = joinPath(currentPath.value, file.name)
+  const target = joinPath(currentPath.value, newName)
+  let overwrite = false
+  const existing = await sftpStatApi(props.activeSessionId, target).catch(() => null)
+  if (existing) {
+    overwrite = await confirmDialog({
+      title: '目标已存在',
+      variant: 'warning',
+      message: `${newName} 已存在，确定要覆盖吗？`,
+      detail: target,
+      confirmText: '覆盖',
+      cancelText: '取消'
+    })
+    if (!overwrite) return
+  }
+
+  try {
+    await sftpRenameApi(props.activeSessionId, from, target, overwrite)
+    emit('toast', `已重命名为 ${newName}`, 'success')
+    await loadFiles()
+  } catch (e: any) {
+    emit('toast', `重命名失败: ${e?.message || e}`, 'error')
+  }
+}
+
+const changePermissions = async (file: SftpFileItem) => {
+  if (!props.activeSessionId) return
+  const input = await promptDialog({
+    title: '修改权限',
+    message: `修改 ${file.name} 的权限位（八进制）：`,
+    detail: `${joinPath(currentPath.value, file.name)}\n当前: ${file.permissions}`,
+    input: {
+      label: '权限（3~4 位八进制）',
+      value: currentOctal(file.permissions),
+      placeholder: '755',
+      required: true
+    },
+    confirmText: '应用'
+  })
+  if (!input) return
+  const mode = input.trim()
+  if (!/^[0-7]{3,4}$/.test(mode)) {
+    emit('toast', '权限格式不正确，请输入 3~4 位八进制（如 644、0755）', 'warning')
+    return
+  }
+  try {
+    await sftpChmodApi(props.activeSessionId, joinPath(currentPath.value, file.name), parseInt(mode, 8))
+    emit('toast', `已修改 ${file.name} 权限为 ${mode}`, 'success')
+    await loadFiles()
+  } catch (e: any) {
+    emit('toast', `修改权限失败: ${e?.message || e}`, 'error')
+  }
+}
+
+const changeOwnership = async (file: SftpFileItem) => {
+  if (!props.activeSessionId) return
+  const input = await promptDialog({
+    title: '修改属主 / 属组',
+    message: `修改 ${file.name} 的属主/属组（数字 id）：`,
+    detail: `${joinPath(currentPath.value, file.name)}\n当前: uid=${file.owner} gid=${file.group}\n格式 uid:gid，留空表示不修改该项`,
+    input: { label: 'uid:gid', value: '', placeholder: '例如 1000:1000', required: true },
+    confirmText: '应用'
+  })
+  if (input === null) return
+
+  const [uidStr, gidStr] = input.trim().split(':')
+  const parseId = (s?: string): number | undefined | 'invalid' => {
+    if (s === undefined || s.trim() === '') return undefined
+    return /^\d+$/.test(s.trim()) ? Number(s.trim()) : 'invalid'
+  }
+  const uid = parseId(uidStr)
+  const gid = parseId(gidStr)
+  if (uid === 'invalid' || gid === 'invalid') {
+    emit('toast', 'uid / gid 必须是数字', 'warning')
+    return
+  }
+  if (uid === undefined && gid === undefined) {
+    emit('toast', '未填写 uid 或 gid', 'warning')
+    return
+  }
+
+  try {
+    await sftpChownApi(props.activeSessionId, joinPath(currentPath.value, file.name), uid, gid)
+    emit('toast', `已更新 ${file.name} 的属主/属组`, 'success')
+    await loadFiles()
+  } catch (e: any) {
+    emit('toast', `修改属主失败: ${e?.message || e}`, 'error')
+  }
+}
+
+const showProperties = async (file: SftpFileItem) => {
+  const fullPath = joinPath(currentPath.value, file.name)
+  const remote = props.activeSessionId
+    ? await sftpStatApi(props.activeSessionId, fullPath).catch(() => null)
+    : null
+  const item = remote ?? file
+  await confirmDialog({
+    title: '文件属性',
+    message: item.name,
+    detail: [
+      `路径: ${fullPath}`,
+      `类型: ${item.isDir ? '目录' : '普通文件'}`,
+      `大小: ${item.size}（${item.sizeBytes} 字节）`,
+      `权限: ${item.permissions}`,
+      `属主: uid=${item.owner}`,
+      `属组: gid=${item.group}`,
+      `修改时间: ${item.modifiedTime}`
+    ].join('\n'),
+    confirmText: '关闭',
+    hideCancel: true
+  })
+}
+
+/** 新建空白文件（工具栏可选，右键菜单已覆盖改名/权限/属主/属性） */
+const createNewFile = async () => {
+  if (!props.activeSessionId) {
+    emit('toast', '尚未建立 SSH 会话，无法创建文件', 'warning')
+    return
+  }
+  const name = await promptDialog({
+    title: '新建空白文件',
+    message: `在 ${currentPath.value} 下创建新文件：`,
+    input: { label: '文件名', placeholder: '例如: app.log, config.yaml', required: true },
+    confirmText: '创建'
+  })
+  if (!name || !name.trim()) return
+  const fileName = name.trim()
+  if (fileName.includes('/')) {
+    emit('toast', '文件名不能包含 "/"', 'warning')
+    return
+  }
+  try {
+    await sftpTouchApi(props.activeSessionId, joinPath(currentPath.value, fileName))
+    emit('toast', `文件「${fileName}」创建成功`, 'success')
+    await loadFiles()
+  } catch (e: any) {
+    emit('toast', `创建失败: ${e?.message || e}`, 'error')
+  }
 }
 
 onMounted(async () => {

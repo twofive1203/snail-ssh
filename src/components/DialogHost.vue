@@ -41,6 +41,7 @@
       <!-- 按键 -->
       <div class="px-5 py-3 border-t border-surface-border flex items-center justify-end gap-2 bg-surface-card/20">
         <button
+          v-if="!dialogState.hideCancel"
           type="button"
           @click="resolveDialog(false)"
           class="px-3.5 py-1.5 rounded-lg bg-surface-card hover:bg-surface-elevated border border-surface-border text-xs text-slate-300 hover:text-white transition-colors"

@@ -137,29 +137,7 @@ pub fn sftp_read_dir(
             continue;
         }
 
-        let is_dir = stat.is_dir();
-        let size_bytes = stat.size.unwrap_or(0);
-        let perm = stat.perm.unwrap_or(0);
-
-        result.push(SftpFileItem {
-            name: name.clone(),
-            is_dir,
-            size: if is_dir {
-                "-".into()
-            } else {
-                format_file_size(size_bytes)
-            },
-            size_bytes,
-            permissions: format_permissions(is_dir, perm),
-            owner: stat.uid.map(|v| v.to_string()).unwrap_or_else(|| "-".into()),
-            group: stat.gid.map(|v| v.to_string()).unwrap_or_else(|| "-".into()),
-            modified_time: stat
-                .mtime
-                .map(format_timestamp)
-                .unwrap_or_else(|| "-".into()),
-            editable: !is_dir && is_editable_file(&name),
-            is_hidden: name.starts_with('.'),
-        });
+        result.push(build_file_item(&name, &stat));
     }
 
     // 目录优先排序
@@ -276,6 +254,129 @@ pub fn sftp_home_dir(session_arc: Arc<Mutex<ssh2::Session>>) -> Result<String, S
         .realpath(Path::new("."))
         .map_err(|e| format!("获取远端家目录失败: {}", e))?;
     Ok(home.to_string_lossy().to_string())
+}
+
+/// 由 SFTP 条目统计信息构造列表项（read_dir / stat 共用同一套格式化规则）
+fn build_file_item(name: &str, stat: &ssh2::FileStat) -> SftpFileItem {
+    let is_dir = stat.is_dir();
+    let size_bytes = stat.size.unwrap_or(0);
+    let perm = stat.perm.unwrap_or(0);
+
+    SftpFileItem {
+        name: name.to_string(),
+        is_dir,
+        size: if is_dir {
+            "-".into()
+        } else {
+            format_file_size(size_bytes)
+        },
+        size_bytes,
+        permissions: format_permissions(is_dir, perm),
+        owner: stat.uid.map(|v| v.to_string()).unwrap_or_else(|| "-".into()),
+        group: stat.gid.map(|v| v.to_string()).unwrap_or_else(|| "-".into()),
+        modified_time: stat
+            .mtime
+            .map(format_timestamp)
+            .unwrap_or_else(|| "-".into()),
+        editable: !is_dir && is_editable_file(name),
+        is_hidden: name.starts_with('.'),
+    }
+}
+
+/// 只填 uid/gid/perm 的 stat，size/时间保持 None，避免误改文件大小
+fn metadata_patch(uid: Option<u32>, gid: Option<u32>, perm: Option<u32>) -> ssh2::FileStat {
+    ssh2::FileStat {
+        size: None,
+        uid,
+        gid,
+        perm,
+        atime: None,
+        mtime: None,
+    }
+}
+
+/// 重命名 / 移动。overwrite=false 时目标已存在会由远端报错，不静默覆盖。
+pub fn sftp_rename(
+    session_arc: Arc<Mutex<ssh2::Session>>,
+    from: &str,
+    to: &str,
+    overwrite: bool,
+) -> Result<(), String> {
+    let sess = session_arc.lock();
+    let sftp = sess.sftp().map_err(|e| format!("初始化 SFTP 失败: {}", e))?;
+    let flags = if overwrite {
+        ssh2::RenameFlags::OVERWRITE
+    } else {
+        // 不传 ATOMIC/NATIVE：这两个只是 hint，部分服务端会直接拒绝；
+        // flags=0 时目标已存在会由服务端报错，正是我们要的非覆盖语义。
+        ssh2::RenameFlags::empty()
+    };
+    sftp.rename(Path::new(from), Path::new(to), Some(flags))
+        .map_err(|e| format!("重命名失败: {}", e))
+}
+
+/// 修改权限位（八进制，含 setuid/setgid/sticky 的低 12 位）
+pub fn sftp_chmod(
+    session_arc: Arc<Mutex<ssh2::Session>>,
+    path: &str,
+    mode: u32,
+) -> Result<(), String> {
+    let sess = session_arc.lock();
+    let sftp = sess.sftp().map_err(|e| format!("初始化 SFTP 失败: {}", e))?;
+    sftp.setstat(Path::new(path), metadata_patch(None, None, Some(mode & 0o7777)))
+        .map_err(|e| format!("修改权限失败: {}", e))
+}
+
+/// 修改属主 / 属组（数字 id，None 表示不改该项）。非 root 会返回远端原始权限错误。
+pub fn sftp_chown(
+    session_arc: Arc<Mutex<ssh2::Session>>,
+    path: &str,
+    uid: Option<u32>,
+    gid: Option<u32>,
+) -> Result<(), String> {
+    if uid.is_none() && gid.is_none() {
+        return Err("未指定新的属主或属组".into());
+    }
+    let sess = session_arc.lock();
+    let sftp = sess.sftp().map_err(|e| format!("初始化 SFTP 失败: {}", e))?;
+    sftp.setstat(Path::new(path), metadata_patch(uid, gid, None))
+        .map_err(|e| format!("修改属主/属组失败: {}", e))
+}
+
+/// 新建空白文件。目标已存在时直接报错，不静默覆盖。
+pub fn sftp_touch(
+    session_arc: Arc<Mutex<ssh2::Session>>,
+    path: &str,
+) -> Result<(), String> {
+    let sess = session_arc.lock();
+    let sftp = sess.sftp().map_err(|e| format!("初始化 SFTP 失败: {}", e))?;
+    if sftp.lstat(Path::new(path)).is_ok() {
+        return Err(format!("目标已存在: {}", path));
+    }
+    // 必须立即释放句柄，否则部分老 sshd 上文件句柄会泄漏到会话结束
+    {
+        let _file = sftp
+            .create(Path::new(path))
+            .map_err(|e| format!("创建文件失败: {}", e))?;
+    }
+    Ok(())
+}
+
+/// 单条目属性（供属性弹窗复用）
+pub fn sftp_stat(
+    session_arc: Arc<Mutex<ssh2::Session>>,
+    path: &str,
+) -> Result<SftpFileItem, String> {
+    let sess = session_arc.lock();
+    let sftp = sess.sftp().map_err(|e| format!("初始化 SFTP 失败: {}", e))?;
+    let stat = sftp
+        .stat(Path::new(path))
+        .map_err(|e| format!("读取属性失败: {}", e))?;
+    let name = Path::new(path)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.to_string());
+    Ok(build_file_item(&name, &stat))
 }
 
 pub fn sftp_upload_file(

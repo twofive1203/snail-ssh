@@ -219,6 +219,81 @@ async fn sftp_remove_file(
 }
 
 #[tauri::command]
+async fn sftp_rename(
+    session_id: String,
+    from: String,
+    to: String,
+    overwrite: bool,
+    ssh_manager: State<'_, SshManager>,
+) -> Result<(), String> {
+    let manager = ssh_manager.inner().clone();
+    run_blocking(move || {
+        let session = manager.get_sftp_session(&session_id)?;
+        sftp::sftp_rename(session, &from, &to, overwrite)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn sftp_chmod(
+    session_id: String,
+    path: String,
+    mode: u32,
+    ssh_manager: State<'_, SshManager>,
+) -> Result<(), String> {
+    let manager = ssh_manager.inner().clone();
+    run_blocking(move || {
+        let session = manager.get_sftp_session(&session_id)?;
+        sftp::sftp_chmod(session, &path, mode)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn sftp_chown(
+    session_id: String,
+    path: String,
+    uid: Option<u32>,
+    gid: Option<u32>,
+    ssh_manager: State<'_, SshManager>,
+) -> Result<(), String> {
+    let manager = ssh_manager.inner().clone();
+    run_blocking(move || {
+        let session = manager.get_sftp_session(&session_id)?;
+        sftp::sftp_chown(session, &path, uid, gid)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn sftp_touch(
+    session_id: String,
+    path: String,
+    ssh_manager: State<'_, SshManager>,
+) -> Result<(), String> {
+    let manager = ssh_manager.inner().clone();
+    run_blocking(move || {
+        let session = manager.get_sftp_session(&session_id)?;
+        sftp::sftp_touch(session, &path)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn sftp_stat(
+    session_id: String,
+    path: String,
+    ssh_manager: State<'_, SshManager>,
+) -> Result<SftpFileItem, String> {
+    let manager = ssh_manager.inner().clone();
+    run_blocking(move || {
+        let session = manager.get_sftp_session(&session_id)?;
+        sftp::sftp_stat(session, &path)
+    })
+    .await
+}
+
+#[tauri::command]
 async fn sftp_upload_file(
     session_id: String,
     local_path: String,
@@ -300,6 +375,11 @@ pub fn run() {
             sftp_write_file,
             sftp_mkdir,
             sftp_remove_file,
+            sftp_rename,
+            sftp_chmod,
+            sftp_chown,
+            sftp_touch,
+            sftp_stat,
             sftp_upload_file,
             sftp_download_file,
             sftp_download_dir,
