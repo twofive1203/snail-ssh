@@ -394,7 +394,9 @@ const handleConnectSsh = async (host: HostItem) => {
     currentPath: '/root',
     sidebarCollapsed: false,
     sidebarWidth: 280,
-    viewMode: 'tree'
+    viewMode: 'tree',
+    // 目录跟随已下移到终端标签页维度（TerminalTab.autoFollowTerminal）
+    remoteMonitorOpen: false
   }
 
   sessions.value.push(newSession)

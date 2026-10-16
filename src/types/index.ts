@@ -95,6 +95,29 @@ export interface HostProbeResult {
   pingMs?: number
 }
 
+/** 远端磁盘使用率指标 */
+export interface RemoteDiskUsage {
+  mountPoint: string
+  usePercent: number
+  total: string
+  used: string
+}
+
+/** 远端服务器实时系统监控指标 (MobaXterm 底部监控条) */
+export interface RemoteSystemMetrics {
+  hostname: string
+  osName?: string
+  uptime: string
+  users: string[]
+  cpu: number
+  memUsedBytes: number
+  memTotalBytes: number
+  memUsagePercent: number
+  netUploadSpeed: number
+  netDownloadSpeed: number
+  disks: RemoteDiskUsage[]
+}
+
 /** 批量传输时引用的远端文件 */
 export interface RemoteFileRef {
   file: SftpFileItem
@@ -131,6 +154,7 @@ export interface HostSession {
   sidebarCollapsed: boolean
   sidebarWidth: number
   viewMode: 'tree' | 'list'
+  remoteMonitorOpen?: boolean
 }
 
 export interface ToastMessage {

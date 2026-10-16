@@ -5,6 +5,7 @@ import type {
   ConnectionTestResult,
   HostItem,
   HostProbeResult,
+  RemoteSystemMetrics,
   SftpFileItem,
   SftpProgressPayload
 } from '@/types'
@@ -274,6 +275,33 @@ export async function getSshSessionCwdApi(sessionId: string): Promise<string> {
     return await invoke<string>('get_ssh_session_cwd', { sessionId })
   }
   return mockTerminalCwdMap.get(sessionId) || '/etc/nginx'
+}
+
+let mockCpuTick = 1
+export async function getRemoteMetricsApi(sessionId: string): Promise<RemoteSystemMetrics> {
+  if (isTauri()) {
+    return await invoke<RemoteSystemMetrics>('get_remote_metrics', { sessionId })
+  }
+  mockCpuTick = mockCpuTick + Math.floor(Math.random() * 5 - 2)
+  if (mockCpuTick < 1) mockCpuTick = 1
+  if (mockCpuTick > 25) mockCpuTick = 12
+  return {
+    hostname: 'quickea144',
+    osName: 'Red Hat Enterprise Linux 9.2',
+    uptime: '111 days',
+    users: ['root', 'root', 'root', 'root', 'root'],
+    cpu: mockCpuTick,
+    memUsedBytes: 15354572800,
+    memTotalBytes: 16825729024,
+    memUsagePercent: 91,
+    netUploadSpeed: 52428 + Math.floor(Math.random() * 10240),
+    netDownloadSpeed: 20971 + Math.floor(Math.random() * 5120),
+    disks: [
+      { mountPoint: '/', usePercent: 9, total: '100.0 GB', used: '9.0 GB' },
+      { mountPoint: '/boot', usePercent: 58, total: '1.0 GB', used: '580 MB' },
+      { mountPoint: '/data', usePercent: 34, total: '500.0 GB', used: '170.0 GB' }
+    ]
+  }
 }
 
 export async function onSshStdout(sessionId: string, callback: (data: string) => void): Promise<UnlistenFn> {

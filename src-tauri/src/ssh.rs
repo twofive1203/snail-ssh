@@ -82,6 +82,53 @@ pub struct HostProbeResult {
     pub ping_ms: Option<u64>,
 }
 
+/// 远端服务器实时系统监控指标（MobaXterm 风格底部监控条）
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RemoteSystemMetrics {
+    #[serde(default)]
+    pub hostname: String,
+    #[serde(default, rename = "osName")]
+    pub os_name: Option<String>,
+    #[serde(default)]
+    pub uptime: String,
+    #[serde(default)]
+    pub users: Vec<String>,
+    #[serde(default)]
+    pub cpu: u32,
+    #[serde(default, rename = "memUsedBytes")]
+    pub mem_used_bytes: u64,
+    #[serde(default, rename = "memTotalBytes")]
+    pub mem_total_bytes: u64,
+    #[serde(default, rename = "memUsagePercent")]
+    pub mem_usage_percent: u32,
+    #[serde(default, rename = "netUploadSpeed")]
+    pub net_upload_speed: f64,
+    #[serde(default, rename = "netDownloadSpeed")]
+    pub net_download_speed: f64,
+    #[serde(default)]
+    pub disks: Vec<RemoteDiskUsage>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RemoteDiskUsage {
+    #[serde(default, rename = "mountPoint")]
+    pub mount_point: String,
+    #[serde(default, rename = "usePercent")]
+    pub use_percent: u32,
+    #[serde(default)]
+    pub total: String,
+    #[serde(default)]
+    pub used: String,
+}
+
+#[derive(Clone, Debug)]
+struct RemoteMetricsSnapshot {
+    sampled_at: Instant,
+    cpu_fields: Vec<u64>,
+    net_rx_bytes: u64,
+    net_tx_bytes: u64,
+}
+
 pub struct ActiveSession {
     /// Shell 会话：握手完成后切非阻塞，避免读阻塞锁死写入。
     /// 同时持有该 Arc 以保证底层连接不会被提前释放。
@@ -98,12 +145,14 @@ pub struct ActiveSession {
 #[derive(Clone)]
 pub struct SshManager {
     sessions: Arc<Mutex<HashMap<String, Arc<ActiveSession>>>>,
+    metrics_cache: Arc<Mutex<HashMap<String, RemoteMetricsSnapshot>>>,
 }
 
 impl SshManager {
     pub fn new() -> Self {
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            metrics_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -262,6 +311,7 @@ impl SshManager {
     }
 
     pub fn close_session(&self, session_id: &str) -> Result<(), String> {
+        self.metrics_cache.lock().remove(session_id);
         let active = self.sessions.lock().remove(session_id);
         if let Some(active) = active {
             active.is_alive.store(false, Ordering::Relaxed);
@@ -329,6 +379,26 @@ impl SshManager {
         } else {
             Ok("/".to_string())
         }
+    }
+
+    /// 采集远端主机实时系统指标（MobaXterm 风格底部监控条），复用终端连接瞬态 exec
+    pub fn get_remote_metrics(&self, session_id: &str) -> Result<RemoteSystemMetrics, String> {
+        let active = self.get_active(session_id)?;
+        if !active.is_alive.load(Ordering::Relaxed) {
+            return Err("会话已断开".into());
+        }
+
+        let default_host = active.config.host.clone();
+        let output = {
+            let sess = active.session.lock();
+            run_probe_command(&sess, REMOTE_METRICS_SCRIPT)?
+        };
+
+        let prev_snap = self.metrics_cache.lock().get(session_id).cloned();
+        let (metrics, new_snap) = parse_remote_metrics(&output, prev_snap, &default_host);
+        self.metrics_cache.lock().insert(session_id.to_string(), new_snap);
+
+        Ok(metrics)
     }
 }
 
@@ -801,6 +871,142 @@ fn cpu_usage_percent(before: &[u64], after: &[u64]) -> Option<u32> {
     Some(usage.round().clamp(0.0, 100.0) as u32)
 }
 
+/// 毫秒级极速远端监控采集脚本：
+/// 一次性聚合 /proc/uptime、/proc/meminfo、/proc/net/dev、/proc/stat 与 df/users，
+/// 全部直接读取虚拟文件系统，执行仅需 5~15ms，完全无 sleep 阻塞。
+const REMOTE_METRICS_SCRIPT: &str = r#"
+printf "HOSTNAME:%s\n" "$(hostname 2>/dev/null || cat /proc/sys/kernel/hostname 2>/dev/null)"
+printf "UPTIME:%s\n" "$(cat /proc/uptime 2>/dev/null | cut -d' ' -f1)"
+printf "USERS:%s\n" "$(users 2>/dev/null || who 2>/dev/null | awk '{print $1}' | tr '\n' ' ')"
+printf "MEM:%s\n" "$(awk '/MemTotal:/{t=$2} /MemAvailable:/{a=$2} /MemFree:/{f=$2} END{print t, (a?a:f)}' /proc/meminfo 2>/dev/null)"
+printf "NET:%s\n" "$(awk 'NR>2 && !/:/{next} /:/{gsub(/:/," "); if($1!="lo"){rx+=$2; tx+=$10}} END{print rx, tx}' /proc/net/dev 2>/dev/null)"
+printf "DISK:%s\n" "$(df -P -k 2>/dev/null | awk 'NR>1 && $1 ~ /^\// {printf "%s=%s=%s=%s;", $6, $5, $2, $3}')"
+printf "CPU:%s\n" "$(grep '^cpu ' /proc/stat 2>/dev/null)"
+"#;
+
+fn format_uptime(secs: f64) -> String {
+    let total_secs = secs.max(0.0) as u64;
+    let days = total_secs / 86400;
+    let hours = (total_secs % 86400) / 3600;
+    let mins = (total_secs % 3600) / 60;
+    if days > 0 {
+        format!("{} days", days)
+    } else if hours > 0 {
+        format!("{}h {}m", hours, mins)
+    } else {
+        format!("{} mins", mins)
+    }
+}
+
+fn format_kb_size(kb: u64) -> String {
+    if kb >= 1024 * 1024 {
+        format!("{:.1} GB", kb as f64 / (1024.0 * 1024.0))
+    } else if kb >= 1024 {
+        format!("{:.0} MB", kb as f64 / 1024.0)
+    } else {
+        format!("{} KB", kb)
+    }
+}
+
+fn parse_remote_metrics(
+    output: &str,
+    last_snap: Option<RemoteMetricsSnapshot>,
+    default_host: &str,
+) -> (RemoteSystemMetrics, RemoteMetricsSnapshot) {
+    let now = Instant::now();
+    let mut metrics = RemoteSystemMetrics::default();
+    let mut cpu_fields: Vec<u64> = Vec::new();
+    let mut net_rx: u64 = 0;
+    let mut net_tx: u64 = 0;
+
+    for line in output.lines() {
+        let line = line.trim();
+        if let Some(v) = line.strip_prefix("HOSTNAME:") {
+            let h = v.trim();
+            if !h.is_empty() {
+                metrics.hostname = h.to_string();
+            }
+        } else if let Some(v) = line.strip_prefix("UPTIME:") {
+            if let Ok(secs) = v.trim().parse::<f64>() {
+                metrics.uptime = format_uptime(secs);
+            }
+        } else if let Some(v) = line.strip_prefix("USERS:") {
+            metrics.users = v.split_whitespace().map(|s| s.to_string()).collect();
+        } else if let Some(v) = line.strip_prefix("MEM:") {
+            let mut parts = v.split_whitespace();
+            if let (Some(total_str), Some(avail_str)) = (parts.next(), parts.next()) {
+                if let (Ok(total_kb), Ok(avail_kb)) =
+                    (total_str.parse::<u64>(), avail_str.parse::<u64>())
+                {
+                    if total_kb > 0 {
+                        let used_kb = total_kb.saturating_sub(avail_kb);
+                        metrics.mem_total_bytes = total_kb * 1024;
+                        metrics.mem_used_bytes = used_kb * 1024;
+                        metrics.mem_usage_percent = ((used_kb as f64 / total_kb as f64) * 100.0)
+                            .round()
+                            .clamp(0.0, 100.0) as u32;
+                    }
+                }
+            }
+        } else if let Some(v) = line.strip_prefix("NET:") {
+            let mut parts = v.split_whitespace();
+            if let (Some(rx_str), Some(tx_str)) = (parts.next(), parts.next()) {
+                net_rx = rx_str.parse().unwrap_or(0);
+                net_tx = tx_str.parse().unwrap_or(0);
+            }
+        } else if let Some(v) = line.strip_prefix("DISK:") {
+            for item in v.split(';') {
+                let item = item.trim();
+                if item.is_empty() {
+                    continue;
+                }
+                let parts: Vec<&str> = item.split('=').collect();
+                if parts.len() >= 2 {
+                    let mount = parts[0].to_string();
+                    let pct_str = parts[1].trim_end_matches('%');
+                    let use_pct = pct_str.parse::<u32>().unwrap_or(0);
+                    let total_kb = parts.get(2).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+                    let used_kb = parts.get(3).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+                    metrics.disks.push(RemoteDiskUsage {
+                        mount_point: mount,
+                        use_percent: use_pct,
+                        total: format_kb_size(total_kb),
+                        used: format_kb_size(used_kb),
+                    });
+                }
+            }
+        } else if let Some(v) = line.strip_prefix("CPU:") {
+            cpu_fields = parse_cpu_fields(v);
+        }
+    }
+
+    if metrics.hostname.is_empty() {
+        metrics.hostname = default_host.to_string();
+    }
+
+    if let Some(prev) = &last_snap {
+        if !cpu_fields.is_empty() && !prev.cpu_fields.is_empty() {
+            metrics.cpu = cpu_usage_percent(&prev.cpu_fields, &cpu_fields).unwrap_or(0);
+        }
+        let delta_secs = now.duration_since(prev.sampled_at).as_secs_f64();
+        if delta_secs > 0.05 {
+            let rx_diff = net_rx.saturating_sub(prev.net_rx_bytes);
+            let tx_diff = net_tx.saturating_sub(prev.net_tx_bytes);
+            metrics.net_download_speed = rx_diff as f64 / delta_secs;
+            metrics.net_upload_speed = tx_diff as f64 / delta_secs;
+        }
+    }
+
+    let new_snap = RemoteMetricsSnapshot {
+        sampled_at: now,
+        cpu_fields,
+        net_rx_bytes: net_rx,
+        net_tx_bytes: net_tx,
+    };
+
+    (metrics, new_snap)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -886,6 +1092,30 @@ mod tests {
         assert_eq!(result.os_name.as_deref(), Some("FreeBSD"));
         assert_eq!(result.cpu, None);
         assert_eq!(result.mem, None);
+    }
+
+    #[test]
+    fn parse_remote_metrics_extracts_complete_info() {
+        let sample = concat!(
+            "HOSTNAME:quickea144\n",
+            "UPTIME:9622543.21\n",
+            "USERS:root root root\n",
+            "MEM:16432128 2097152\n",
+            "NET:10485760 20971520\n",
+            "DISK:/=9%=104857600=9437184;/boot=58%=1048576=608174;\n",
+            "CPU:cpu  200 0 200 1200 50 0 0 0 0 0\n"
+        );
+        let (metrics, snap) = parse_remote_metrics(sample, None, "fallback.host");
+        assert_eq!(metrics.hostname, "quickea144");
+        assert_eq!(metrics.uptime, "111 days");
+        assert_eq!(metrics.users, vec!["root", "root", "root"]);
+        assert_eq!(metrics.disks.len(), 2);
+        assert_eq!(metrics.disks[0].mount_point, "/");
+        assert_eq!(metrics.disks[0].use_percent, 9);
+        assert_eq!(metrics.disks[1].mount_point, "/boot");
+        assert_eq!(metrics.disks[1].use_percent, 58);
+        assert_eq!(snap.net_rx_bytes, 10485760);
+        assert_eq!(snap.net_tx_bytes, 20971520);
     }
 }
 
