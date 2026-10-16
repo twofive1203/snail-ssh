@@ -7,6 +7,7 @@
           v-for="(tab, idx) in tabs"
           :key="tab.id"
           @click="$emit('switch-tab', idx)"
+          @contextmenu.prevent="openTabMenu($event, idx)"
           :class="idx === activeTabIndex ? 'bg-[#0c0e14] border-t-2 border-brand-500 text-slate-200 border-x border-surface-border/50' : 'bg-surface-card/40 hover:bg-surface-card text-surface-subtle hover:text-slate-300 border-t-2 border-transparent'"
           class="group flex items-center gap-2 px-3 py-1.5 rounded-t-lg text-xs cursor-pointer transition-all shrink-0"
         >
@@ -54,6 +55,16 @@
         </button>
       </div>
     </div>
+
+    <!-- 标签页右键菜单：复制会话 / 复制 IP / 标签管理 -->
+    <ContextMenu
+      :open="tabMenu.open"
+      :x="tabMenu.x"
+      :y="tabMenu.y"
+      :items="tabMenuItems"
+      @select="handleTabMenuSelect"
+      @close="tabMenu.open = false"
+    />
 
     <!-- 常用指令代码片段工具栏 -->
     <div class="h-8 bg-surface-card/40 border-b border-surface-border/60 px-3 flex items-center justify-between text-xs shrink-0 select-none">
@@ -120,8 +131,12 @@ import { ref, computed, watch, nextTick, onMounted, onBeforeUnmount } from 'vue'
 import { Terminal as Xterm } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import { WebLinksAddon } from '@xterm/addon-web-links'
-import { X, Plus, FolderGit2, Eraser, Zap, Terminal as TerminalIcon } from 'lucide-vue-next'
-import type { TerminalTab } from '@/types'
+import {
+  X, Plus, FolderGit2, Eraser, Zap, Terminal as TerminalIcon,
+  CopyPlus, Globe, User, Terminal, PenLine, RefreshCw, XCircle, ChevronsRight
+} from 'lucide-vue-next'
+import ContextMenu from '@/components/ContextMenu.vue'
+import type { ContextMenuItem, TerminalTab } from '@/types'
 import {
   writeSshSessionApi,
   resizeSshSessionApi,
@@ -140,6 +155,13 @@ const emit = defineEmits<{
   (e: 'close-tab', index: number): void
   (e: 'add-tab'): void
   (e: 'jump-to-sftp'): void
+  (e: 'duplicate-tab', index: number): void
+  (e: 'reconnect-tab', index: number): void
+  (e: 'rename-tab', index: number): void
+  (e: 'copy-tab-info', index: number, kind: 'ip' | 'login' | 'ssh-command'): void
+  (e: 'open-tab-sftp', index: number): void
+  (e: 'close-other-tabs', index: number): void
+  (e: 'close-tabs-after', index: number): void
   (e: 'session-closed', tabId: string, reason: string): void
 }>()
 
@@ -288,14 +310,68 @@ const fitActive = () => {
   termSize.value = { cols: session.term.cols, rows: session.term.rows }
 }
 
-const clearCurrentTerminal = () => {
-  const session = currentSession.value
+const clearCurrentTerminal = () => clearTerminal(currentTabId.value)
+
+/** 按标签页清屏（右键菜单可作用于非活动标签） */
+const clearTerminal = (tabId: string) => {
+  const session = sessions.get(tabId)
   if (!session) return
   if (isTauri()) {
     // 交给远端 Shell 执行清屏，保留当前提示符
-    writeSshSessionApi(currentTabId.value, '\x0c').catch(() => {})
+    writeSshSessionApi(tabId, '\x0c').catch(() => {})
   } else {
     session.term.clear()
+  }
+}
+
+// ==========================================
+// 标签页右键菜单
+// ==========================================
+const tabMenu = ref({ open: false, x: 0, y: 0, index: -1 })
+
+const openTabMenu = (event: MouseEvent, index: number) => {
+  tabMenu.value = { open: true, x: event.clientX, y: event.clientY, index }
+}
+
+const tabMenuItems = computed<ContextMenuItem[]>(() => {
+  const index = tabMenu.value.index
+  const tab = props.tabs[index]
+  if (!tab) return []
+  const isLast = index === props.tabs.length - 1
+  return [
+    { key: 'duplicate', label: '复制会话', icon: CopyPlus, hint: '新标签页' },
+    { divider: true },
+    { key: 'copy-ip', label: '复制 IP 地址', icon: Globe },
+    { key: 'copy-login', label: '复制登录信息', icon: User, hint: 'user@host' },
+    { key: 'copy-ssh', label: '复制 SSH 命令', icon: Terminal, hint: 'ssh -p' },
+    { divider: true },
+    { key: 'rename', label: '重命名标签', icon: PenLine },
+    { key: 'reconnect', label: '重新连接', icon: RefreshCw, disabled: tab.connected },
+    { key: 'sftp', label: '打开 SFTP', icon: FolderGit2 },
+    { key: 'clear', label: '清除屏幕', icon: Eraser },
+    { divider: true },
+    { key: 'close', label: '关闭标签', icon: X, danger: true },
+    { key: 'close-others', label: '关闭其他标签', icon: XCircle, disabled: props.tabs.length < 2 },
+    { key: 'close-after', label: '关闭右侧标签', icon: ChevronsRight, disabled: isLast }
+  ]
+})
+
+const handleTabMenuSelect = (item: ContextMenuItem) => {
+  const index = tabMenu.value.index
+  const tab = props.tabs[index]
+  if (!tab) return
+  switch (item.key) {
+    case 'duplicate': emit('duplicate-tab', index); break
+    case 'copy-ip': emit('copy-tab-info', index, 'ip'); break
+    case 'copy-login': emit('copy-tab-info', index, 'login'); break
+    case 'copy-ssh': emit('copy-tab-info', index, 'ssh-command'); break
+    case 'rename': emit('rename-tab', index); break
+    case 'reconnect': emit('reconnect-tab', index); break
+    case 'sftp': emit('open-tab-sftp', index); break
+    case 'clear': clearTerminal(tab.id); break
+    case 'close': emit('close-tab', index); break
+    case 'close-others': emit('close-other-tabs', index); break
+    case 'close-after': emit('close-tabs-after', index); break
   }
 }
 

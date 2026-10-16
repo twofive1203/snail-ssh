@@ -30,6 +30,19 @@ export interface TerminalTab {
   connected: boolean
 }
 
+/** 右键菜单项：divider 为 true 时渲染成分隔线，其余字段忽略 */
+export interface ContextMenuItem {
+  key?: string
+  label?: string
+  /** lucide 图标组件 */
+  icon?: unknown
+  /** 右侧灰色提示文案，如快捷键或 IP */
+  hint?: string
+  disabled?: boolean
+  danger?: boolean
+  divider?: boolean
+}
+
 export interface SftpFileItem {
   name: string
   isDir: boolean

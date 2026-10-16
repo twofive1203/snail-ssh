@@ -54,6 +54,13 @@
           @close-tab="handleCloseTerminalTab"
           @add-tab="handleAddTerminalTab"
           @jump-to-sftp="handleJumpToCurrentSftp"
+          @duplicate-tab="handleDuplicateTerminalTab"
+          @reconnect-tab="handleReconnectTerminalTab"
+          @rename-tab="handleRenameTerminalTab"
+          @copy-tab-info="handleCopyTabInfo"
+          @open-tab-sftp="handleOpenTabSftp"
+          @close-other-tabs="handleCloseOtherTerminalTabs"
+          @close-tabs-after="handleCloseTerminalTabsAfter"
           @session-closed="handleSessionClosed"
         />
 
@@ -132,7 +139,7 @@ import HostModal from '@/components/HostModal.vue'
 import EditorModal from '@/components/EditorModal.vue'
 import DialogHost from '@/components/DialogHost.vue'
 import Toast from '@/components/Toast.vue'
-import { confirmDialog, dialogState } from '@/composables/useDialog'
+import { confirmDialog, promptDialog, dialogState } from '@/composables/useDialog'
 import type { HostItem, RemoteFileRef, SftpFileItem, TerminalTab, TransferTask, ToastMessage } from '@/types'
 import {
   getHostsApi,
@@ -465,6 +472,118 @@ const handleJumpToCurrentSftp = () => {
     if (found) {
       handleConnectSftp(found)
     }
+  }
+}
+
+// ==========================================
+// 终端标签右键菜单动作
+// ==========================================
+
+/** 写入系统剪贴板；WebKitGTK 等环境下 Clipboard API 不可用时退回 execCommand */
+const copyToClipboard = async (text: string): Promise<boolean> => {
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text)
+      return true
+    }
+  } catch {
+    // 继续尝试降级方案
+  }
+  try {
+    const el = document.createElement('textarea')
+    el.value = text
+    el.setAttribute('readonly', '')
+    el.style.position = 'fixed'
+    el.style.opacity = '0'
+    document.body.appendChild(el)
+    el.select()
+    const ok = document.execCommand('copy')
+    document.body.removeChild(el)
+    return ok
+  } catch {
+    return false
+  }
+}
+
+/** 右键菜单动作都基于被右键的那一个标签页，而不是当前活动标签 */
+const hostOfTab = (index: number) => {
+  const tab = terminalTabs.value[index]
+  return tab ? hosts.value.find(h => h.id === tab.hostId) : undefined
+}
+
+// 复制会话：在同一台服务器上再开一个独立标签页
+const handleDuplicateTerminalTab = (index: number) => {
+  const host = hostOfTab(index)
+  if (!host) {
+    triggerToast('该会话对应的服务器配置已不存在', 'warning')
+    return
+  }
+  handleConnectSsh(host)
+}
+
+// 重新连接：先释放旧会话，避免同一标签反复重连后留下无法回收的连接
+const handleReconnectTerminalTab = (index: number) => {
+  const host = hostOfTab(index)
+  if (!host) {
+    triggerToast('该会话对应的服务器配置已不存在', 'warning')
+    return
+  }
+  handleCloseTerminalTab(index)
+  handleConnectSsh(host)
+}
+
+const handleRenameTerminalTab = async (index: number) => {
+  const tab = terminalTabs.value[index]
+  if (!tab) return
+  const name = await promptDialog({
+    title: '重命名标签',
+    message: `为会话 ${tab.sub} 设置显示名称`,
+    input: { label: '标签名称', value: tab.title, placeholder: '例如：生产主库', required: true },
+    confirmText: '保存'
+  })
+  if (!name) return
+  tab.title = name.trim()
+}
+
+const handleCopyTabInfo = async (index: number, kind: 'ip' | 'login' | 'ssh-command') => {
+  const tab = terminalTabs.value[index]
+  const host = hostOfTab(index)
+  if (!tab || !host) {
+    triggerToast('该会话对应的服务器配置已不存在', 'warning')
+    return
+  }
+  const text = kind === 'ip'
+    ? host.host
+    : kind === 'login'
+      ? `${host.username}@${host.host}`
+      : `ssh -p ${host.port} ${host.username}@${host.host}`
+  const label = kind === 'ip' ? 'IP 地址' : kind === 'login' ? '登录信息' : 'SSH 命令'
+  const ok = await copyToClipboard(text)
+  if (ok) {
+    triggerToast(`已复制${label}: ${text}`, 'success')
+  } else {
+    triggerToast('复制失败：当前环境不允许访问剪贴板', 'error')
+  }
+}
+
+const handleOpenTabSftp = (index: number) => {
+  const host = hostOfTab(index)
+  if (host) handleConnectSftp(host)
+}
+
+const handleCloseOtherTerminalTabs = (index: number) => {
+  const keep = terminalTabs.value[index]
+  if (!keep) return
+  // 从后往前关闭，避免索引位移导致关错标签
+  for (let i = terminalTabs.value.length - 1; i >= 0; i--) {
+    if (i !== index) handleCloseTerminalTab(i)
+  }
+  activeTabIndex.value = Math.max(0, terminalTabs.value.findIndex(t => t.id === keep.id))
+}
+
+const handleCloseTerminalTabsAfter = (index: number) => {
+  for (let i = terminalTabs.value.length - 1; i > index; i--) {
+    handleCloseTerminalTab(i)
   }
 }
 
