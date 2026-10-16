@@ -14,6 +14,10 @@ export default defineConfig({
     port: 1420,
     strictPort: true,
     host: '127.0.0.1',
+    watch: {
+      // 忽略 src-tauri 目录，避免 Windows 下 cargo 编译 target 时触发 EBUSY 文件锁报错
+      ignored: ['**/src-tauri/**', '**/target/**'],
+    },
   },
   envPrefix: ['VITE_', 'TAURI_ENV_*'],
   build: {
