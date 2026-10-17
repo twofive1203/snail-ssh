@@ -36,7 +36,8 @@
 * **主机密钥校验**：复用 `~/.ssh/known_hosts`，首次连接展示 SHA256 指纹由用户确认（TOFU）后写入；密钥与记录不一致时直接阻断连接，防止中间人攻击。
 * **终端内搜索 (Ctrl+F)**：不用离开终端即可查找回显内容，支持上一个/下一个跳转、命中计数，以及区分大小写 / 全字匹配 / 正则三个开关。
 * **终端剪贴板快捷键**：`Ctrl+Shift+C` / `Ctrl+Insert` 复制选中内容，`Ctrl+Shift+V` / `Shift+Insert` 粘贴；终端内右键菜单提供复制 / 粘贴 / 全选 / 查找 / 清除屏幕。
-* **关键字高亮**：自动着色 `ERROR` / `FATAL` / `FAILED` / `WARN` / `SUCCESS` 等关键字，纯前端 marker + decoration 增量扫描（只扫新增行、每帧限流、默认跳过 alt buffer 与当前输入行），大日志滚动不卡顿；顶栏灯泡图标可随时开关（状态存 localStorage）。
+* **关键字高亮（可配置）**：内置 error / warn / info / debug / success / 自定义 六档规则，默认只开 error / warn / success；纯前端 marker + decoration 增量扫描（只扫新增行、每帧限流、默认跳过 alt buffer 与当前输入行），大日志滚动不卡顿。默认按词着色、`error` 整行铺底；有背景色时不再覆盖前景色，保住 `ls --color` / `grep` / `systemctl` 的 ANSI 着色；CJK / emoji 按 cell 宽度换算列号，高亮与链接范围不偏移。顶栏灯泡开关 + 齿轮面板可增删规则、改正则 / 大小写 / 整行 / 前景与背景色，内置 Dracula / Nord / One Dark / 高对比四套配色预设，支持 JSON 导入导出与一键恢复默认；配置存 localStorage。
+* **错误行导航**：开启高亮后，顶栏 `↑` / `↓` 按当前视口在 error 命中行之间跳转（越界循环）；可选开启右侧错误概览条，在终端右边标出错误行位置（默认关闭）。
 * **可点击的 IP / 文件行号**：回显中的 IPv4 与 `file:line` 支持悬停高亮，点击即复制到剪贴板。
 * **中日韩宽字符宽度修正**：加载 Unicode11 addon，中文环境下字符宽度不再错位。
 * **命令历史 + 联想补全**：输入时在终端底部浮出本主机历史命令候选（前缀匹配优先、其次子串匹配，按使用频次与最近使用时间排序，最多 8 条），并对 `docker` / `systemctl` / `git` 提供内置子命令词表；`Tab` 接受、`↑/↓` 切换、`Esc` 关闭、鼠标点击即用。历史按 `user@host:port` 归属持久化到 `~/.snail-ssh/history.json`（每主机上限 500 条、自动去重累计频次、自动过滤含密码/令牌的敏感命令与超长命令）；首次连接可选拉取远端 `~/.bash_history` 作为词库（`localStorage` 键 `snail_ssh_import_remote_history` 置 `0` 可关闭）。
@@ -99,6 +100,8 @@
 * 快速连接为临时会话：不会保存到资产列表，凭据只存在于内存中，应用重启后需重新填写；同名 `hostId` 不会与已入库主机去重。
 * SFTP 列表中的属主/属组显示的是远端原始**数字 uid/gid**，不是用户名（`chown` 同样接受数字 id）。
 * 关键字高亮为纯前端渲染层效果，只改变显示、不改写收到的数据；IP / `file:line` 点击行为是复制到本地剪贴板，不会在远端执行任何操作。
+* 高亮规则的正则来自用户输入：非法正则会被自动跳过（设置面板会标红提示），不会影响其它规则；单行命中数与装饰对象总量都有上限，避免长会话下无限增长。
+* 右侧错误概览条默认关闭：它会占用终端右侧约 6px，可能遮挡最右一列；只对 `error` 级别打点。
 * 命令补全条仅在可见时接管 `Tab` / `↑` / `↓` / `Esc`，不可见时这些按键完全透传给远端（`vim` / `less` / `man` 均不受影响）；因此当输入行已匹配到候选时，`↑/↓` 用于切换候选而非翻远端 shell 历史。输入行缓冲不跟踪光标左右移动，仅按行尾追加/退格模型工作。
 * 命令历史按 `user@host:port` 归属（临时会话、重新导入资产后历史不丢）；远端 `~/.bash_history` 导入为可选且默认开启，zsh / fish 等未写入该文件时不会自动获得初始词库，且导入只插入不存在的项、不累加频次。
 * 会话日志默认关闭（避免磁盘悄悄写满）；开启后由 localStorage 记忆，之后新建会话会自动进入记录状态。
@@ -144,10 +147,12 @@ snail-ssh/
 │   │   ├── CommandPalette.vue  # Ctrl+K 全局命令面板
 │   │   ├── HostModal.vue       # 新建/编辑主机弹窗
 │   │   ├── EditorModal.vue     # 在线代码/文件编辑器弹窗
+│   │   ├── HighlightSettingsModal.vue # 关键字高亮设置弹窗
 │   │   └── Toast.vue           # 全局微动效提示框
 │   ├── composables/
 │   │   ├── useDialog.ts            # 应用内确认/输入弹窗
 │   │   ├── useRecentHosts.ts       # 最近连接（localStorage）
+│   │   ├── useHighlightSettings.ts # 高亮规则配置、配色预设与持久化
 │   │   └── useTerminalHighlight.ts # 终端关键字高亮与可点击链接
 │   ├── types/
 │   │   └── index.ts        # 全局 TypeScript 接口定义

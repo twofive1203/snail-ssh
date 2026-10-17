@@ -1,4 +1,4 @@
-import type { Terminal, IDecoration, IDisposable, IBufferLine, ILink, ILinkProvider } from '@xterm/xterm'
+import type { Terminal, IDecoration, IDisposable, IBufferLine, ILink, ILinkProvider, IMarker } from '@xterm/xterm'
 
 /**
  * 终端关键字高亮。
@@ -18,6 +18,8 @@ import type { Terminal, IDecoration, IDisposable, IBufferLine, ILink, ILinkProvi
 
 export interface TerminalHighlightRule {
   key: string
+  /** 语义级别，用于错误行导航与概览条；不填则不参与 */
+  level?: string
   pattern: RegExp
   foregroundColor?: string
   backgroundColor?: string
@@ -29,6 +31,7 @@ export interface TerminalHighlightRule {
 export const DEFAULT_HIGHLIGHT_RULES: TerminalHighlightRule[] = [
   {
     key: 'error',
+    level: 'error',
     pattern: /\b(ERROR|FATAL|FAIL(?:ED|URE)?|PANIC|Exception|Traceback)\b/i,
     foregroundColor: '#fecaca',
     backgroundColor: '#7f1d1d',
@@ -37,12 +40,14 @@ export const DEFAULT_HIGHLIGHT_RULES: TerminalHighlightRule[] = [
   },
   {
     key: 'warn',
+    level: 'warn',
     pattern: /\b(WARN(?:ING)?|DEPRECAT(?:ED|ION))\b/i,
     foregroundColor: '#fde68a',
     backgroundColor: '#451a03'
   },
   {
     key: 'success',
+    level: 'success',
     pattern: /\b(SUCCESS|PASSED|Done)\b/i,
     foregroundColor: '#bbf7d0',
     backgroundColor: '#052e16'
@@ -69,7 +74,10 @@ export interface UseTerminalHighlightOptions {
 export interface TerminalHighlight {
   setEnabled(enabled: boolean): void
   isEnabled(): boolean
-  /** 开启时从「当前光标行往前回溯这么多行」开始扫，避免重放整个 scrollback */
+  /** 热更新规则：清空旧装饰后按最近 200 行重建 */
+  setRules(rules: TerminalHighlightRule[]): void
+  /** 当前缓冲区中 error 级别命中的绝对行号（升序），用于上一条/下一条错误导航 */
+  getProblemLines(): number[]
   dispose(): void
 }
 
@@ -131,6 +139,14 @@ const collectHits = (text: string, rules: CompiledRule[]): TextHit[] => {
   return accepted
 }
 
+/** 供设置面板预览复用：按规则返回一行内的所有命中段 */
+export function findHighlightHits(
+  text: string,
+  rules: TerminalHighlightRule[]
+): Array<{ start: number; end: number; rule: TerminalHighlightRule }> {
+  return collectHits(text, compileRules(rules)).map((hit) => ({ start: hit.start, end: hit.end, rule: hit.rule.rule }))
+}
+
 /**
  * 建立「字符串下标 → cell 列号」映射，修正 CJK / emoji 宽字符造成的横向偏移。
  * 必须与 translateToString 的遍历方式一致：宽字符占 2 列，其右半格（width = 0）不产生字符。
@@ -177,8 +193,16 @@ const hasExplicitForeground = (line: IBufferLine, from: number, to: number): boo
   return false
 }
 
+/** 只有 error 级别在右侧概览条打点；颜色必须是合法 #RRGGBB，否则跳过 */
+const rulerOptions = (rule: TerminalHighlightRule): { color: string; position: 'full' } | undefined => {
+  if (rule.level !== 'error') return undefined
+  const color = rule.foregroundColor ?? rule.backgroundColor
+  if (!color || !/^#[0-9a-fA-F]{6}$/.test(color)) return undefined
+  return { color, position: 'full' }
+}
+
 export function useTerminalHighlight(term: Terminal, options: UseTerminalHighlightOptions = {}): TerminalHighlight {
-  const compiledRules = compileRules(options.rules ?? DEFAULT_HIGHLIGHT_RULES)
+  let compiledRules = compileRules(options.rules ?? DEFAULT_HIGHLIGHT_RULES)
   const onToast = options.onToast
 
   let enabled = false
@@ -186,6 +210,10 @@ export function useTerminalHighlight(term: Terminal, options: UseTerminalHighlig
   let lastScannedAbsoluteLine = 0
   let rafId: number | null = null
   const decorations: IDecoration[] = []
+  /** 本次注册的全部 marker：热更新时统一释放，避免旧 marker 残留到行被回收 */
+  const markers: IMarker[] = []
+  /** error 级别命中的 marker，用于上一条/下一条错误导航 */
+  const problemMarkers: IMarker[] = []
   let linkProviderDisposable: IDisposable | null = null
   let writeParsedDisposable: IDisposable | null = null
   let resizeDisposable: IDisposable | null = null
@@ -204,7 +232,15 @@ export function useTerminalHighlight(term: Terminal, options: UseTerminalHighlig
   }
 
   const clearDecorations = () => {
-    // 先整体移出，否则 marker.onDispose 里的 splice 会干扰遍历
+    // 先清 marker：它们的 onDispose 会顺带回收对应 decoration 并从两个数组里摘除
+    for (const marker of markers.splice(0, markers.length)) {
+      try {
+        marker.dispose()
+      } catch {
+        // 缓冲区回收时可能已经 dispose，忽略
+      }
+    }
+    // 再整体移出，否则 marker.onDispose 里的 splice 会干扰遍历
     const list = decorations.splice(0, decorations.length)
     for (const dec of list) {
       try {
@@ -235,9 +271,17 @@ export function useTerminalHighlight(term: Terminal, options: UseTerminalHighlig
       const canPaintForeground =
         foreground !== undefined && (background === undefined || !hasExplicitForeground(line, from, from + width))
 
+      const baseOptions = {
+        marker,
+        x: from,
+        width,
+        backgroundColor: background,
+        layer: 'top' as const,
+        overviewRulerOptions: rulerOptions(hit.rule.rule)
+      }
       const dec = canPaintForeground
-        ? term.registerDecoration({ marker, x: from, width, backgroundColor: background, foregroundColor: foreground, layer: 'top' })
-        : term.registerDecoration({ marker, x: from, width, backgroundColor: background, layer: 'top' })
+        ? term.registerDecoration({ ...baseOptions, foregroundColor: foreground })
+        : term.registerDecoration(baseOptions)
 
       if (!dec) {
         marker.dispose()
@@ -245,6 +289,19 @@ export function useTerminalHighlight(term: Terminal, options: UseTerminalHighlig
       }
 
       decorations.push(dec)
+      markers.push(marker)
+      marker.onDispose(() => {
+        const mi = markers.indexOf(marker)
+        if (mi >= 0) markers.splice(mi, 1)
+      })
+      // error 级别额外登记为错误行，供导航按钮使用
+      if (hit.rule.rule.level === 'error') {
+        problemMarkers.push(marker)
+        marker.onDispose(() => {
+          const pi = problemMarkers.indexOf(marker)
+          if (pi >= 0) problemMarkers.splice(pi, 1)
+        })
+      }
       marker.onDispose(() => {
         dec.dispose()
         const idx = decorations.indexOf(dec)
@@ -302,6 +359,25 @@ export function useTerminalHighlight(term: Terminal, options: UseTerminalHighlig
   const scheduleScan = () => {
     if (disposed || !enabled || rafId !== null) return
     rafId = requestAnimationFrame(scan)
+  }
+
+  /** 规则热更新：清空旧装饰与错误标记，按最近 200 行重建 */
+  const setRules = (next: TerminalHighlightRule[]) => {
+    if (disposed) return
+    compiledRules = compileRules(next)
+    clearDecorations()
+    if (!enabled) return
+    lastScannedAbsoluteLine = Math.max(0, currentAbsoluteLine() - MAX_SCAN_LINES_PER_TICK)
+    scheduleScan()
+  }
+
+  const getProblemLines = (): number[] => {
+    // 同一行可能命中多个 error 词，导航只关心行号，去重后再排序
+    const lines = new Set<number>()
+    for (const marker of problemMarkers) {
+      if (!marker.isDisposed && marker.line >= 0) lines.add(marker.line)
+    }
+    return [...lines].sort((a, b) => a - b)
   }
 
   const buildLinkProvider = (): ILinkProvider => ({
@@ -402,6 +478,8 @@ export function useTerminalHighlight(term: Terminal, options: UseTerminalHighlig
   return {
     setEnabled,
     isEnabled: () => enabled,
+    setRules,
+    getProblemLines,
     dispose() {
       disposed = true
       enabled = false

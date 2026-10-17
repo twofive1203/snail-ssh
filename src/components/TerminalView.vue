@@ -77,6 +77,32 @@
           <Highlighter class="w-3.5 h-3.5" />
         </button>
 
+        <!-- 错误行导航：仅在开启高亮时出现 -->
+        <template v-if="highlightEnabled">
+          <button
+            @click="jumpToProblem(-1)"
+            class="p-1.5 rounded hover:bg-surface-elevated text-surface-subtle hover:text-white transition-colors"
+            title="上一个错误行"
+          >
+            <ChevronUp class="w-3.5 h-3.5" />
+          </button>
+          <button
+            @click="jumpToProblem(1)"
+            class="p-1.5 rounded hover:bg-surface-elevated text-surface-subtle hover:text-white transition-colors"
+            title="下一个错误行"
+          >
+            <ChevronDown class="w-3.5 h-3.5" />
+          </button>
+        </template>
+
+        <button
+          @click="highlightSettingsOpen = true"
+          class="p-1.5 rounded hover:bg-surface-elevated text-surface-subtle hover:text-white transition-colors"
+          title="关键字高亮设置"
+        >
+          <SlidersHorizontal class="w-3.5 h-3.5" />
+        </button>
+
         <button
           @click="toggleSearch"
           :disabled="!currentTab"
@@ -256,6 +282,13 @@
         <span>快捷键: Ctrl+C 中断 | Ctrl+L 清屏</span>
       </div>
     </div>
+
+    <!-- 高亮规则设置（全局配置，改动即时生效） -->
+    <HighlightSettingsModal
+      :open="highlightSettingsOpen"
+      @close="highlightSettingsOpen = false"
+      @toast="emitToast"
+    />
   </section>
 </template>
 
@@ -270,12 +303,15 @@ import {
   X, Plus, FolderGit2, Eraser, Zap, Terminal as TerminalIcon,
   CopyPlus, Globe, User, Terminal, PenLine, RefreshCw, XCircle, ChevronsRight,
   Search, ChevronUp, ChevronDown, CaseSensitive, WholeWord, Regex,
-  Copy, ClipboardPaste, TextSelect, Highlighter, FolderOpen, CircleDot, CircleStop
+  Copy, ClipboardPaste, TextSelect, Highlighter, FolderOpen, CircleDot, CircleStop,
+  SlidersHorizontal
 } from 'lucide-vue-next'
 import ContextMenu from '@/components/ContextMenu.vue'
 import CommandSuggestBar from '@/components/CommandSuggestBar.vue'
+import HighlightSettingsModal from '@/components/HighlightSettingsModal.vue'
 import { dialogState } from '@/composables/useDialog'
-import { useTerminalHighlight, HIGHLIGHT_STORAGE_KEY, type TerminalHighlight } from '@/composables/useTerminalHighlight'
+import { useTerminalHighlight, type TerminalHighlight } from '@/composables/useTerminalHighlight'
+import { compileHighlightRules, highlightSettings } from '@/composables/useHighlightSettings'
 import type { CommandHistoryEntry, ContextMenuItem, TerminalTab } from '@/types'
 import {
   writeSshSessionApi,
@@ -376,15 +412,9 @@ const containerMap = new Map<string, HTMLDivElement>()
 const sessions = new Map<string, TerminalSession>()
 const termSize = ref<{ cols: number; rows: number }>({ cols: 80, rows: 24 })
 
-// 关键字高亮开关（默认开，存 localStorage）
-const readHighlightEnabled = (): boolean => {
-  try {
-    return localStorage.getItem(HIGHLIGHT_STORAGE_KEY) !== '0'
-  } catch {
-    return true
-  }
-}
-const highlightEnabled = ref(readHighlightEnabled())
+// 关键字高亮配置是全局单例（useHighlightSettings），这里只读开关状态用于 UI
+const highlightEnabled = computed(() => highlightSettings.enabled)
+const highlightSettingsOpen = ref(false)
 
 // 选中即复制开关（默认开，存 localStorage）
 const SELECT_COPY_KEY = 'snail_ssh_select_to_copy'
@@ -690,12 +720,16 @@ const createSession = (tab: TerminalTab, container: HTMLDivElement): TerminalSes
 
   const session: TerminalSession = {
     term, fit, search,
-    highlight: useTerminalHighlight(term, { onToast: (msg, type) => emit('toast', msg, type ?? 'info') }),
+    highlight: useTerminalHighlight(term, {
+      rules: compileHighlightRules(highlightSettings),
+      onToast: (msg, type) => emit('toast', msg, type ?? 'info')
+    }),
     container, inputBuffer: '', lineBuffer: '', unlisten: [], writeFailed: false, rightClickSelection: '',
     sawLastLogin: false
   }
 
   term.open(container)
+  term.options.overviewRulerWidth = highlightSettings.overviewRuler ? 6 : 0
   session.highlight.setEnabled(highlightEnabled.value)
 
   // 搜索结果计数（仅在开启 search decorations 时触发）
@@ -1064,16 +1098,53 @@ const closeSearch = () => {
 
 const toggleSearch = () => (searchOpen.value ? closeSearch() : openSearch())
 
-/** 关键字高亮开关：作用于所有已创建的终端实例 */
+/** 关键字高亮开关：存全局配置，由 watch 同步到所有终端实例 */
 const toggleHighlight = () => {
-  highlightEnabled.value = !highlightEnabled.value
-  try {
-    localStorage.setItem(HIGHLIGHT_STORAGE_KEY, highlightEnabled.value ? '1' : '0')
-  } catch {
-    // localStorage 不可用时仅本次会话生效
+  highlightSettings.enabled = !highlightSettings.enabled
+  emitToast(highlightSettings.enabled ? '关键字高亮已开启' : '关键字高亮已关闭', 'info')
+}
+
+/** 把最新规则应用到本视图的所有终端（设置变更后防抖调用） */
+const applyHighlightRules = () => {
+  const rules = compileHighlightRules(highlightSettings)
+  const rulerWidth = highlightSettings.overviewRuler ? 6 : 0
+  for (const session of sessions.values()) {
+    if (session.term.options.overviewRulerWidth !== rulerWidth) {
+      session.term.options.overviewRulerWidth = rulerWidth
+    }
+    session.highlight.setRules(rules)
   }
-  for (const session of sessions.values()) session.highlight.setEnabled(highlightEnabled.value)
-  emitToast(highlightEnabled.value ? '关键字高亮已开启' : '关键字高亮已关闭', 'info')
+}
+
+/** 上一条 / 下一条错误行：以当前视口顶部为锚点，越过边界时循环 */
+const jumpToProblem = (direction: 1 | -1) => {
+  const session = currentSession.value
+  if (!session) return
+  if (!highlightSettings.enabled) {
+    emitToast('请先开启关键字高亮', 'info')
+    return
+  }
+
+  const lines = session.highlight.getProblemLines()
+  if (lines.length === 0) {
+    emitToast('当前缓冲区没有错误行', 'info')
+    return
+  }
+
+  const anchor = session.term.buffer.active.viewportY
+  let target: number | undefined
+  if (direction > 0) {
+    target = lines.find((line) => line > anchor)
+  } else {
+    for (const line of lines) if (line < anchor) target = line
+  }
+  if (target === undefined) {
+    target = direction > 0 ? lines[0] : lines[lines.length - 1]
+    emitToast(direction > 0 ? '已从头开始查找错误' : '已从末尾开始查找错误', 'info')
+  }
+
+  session.term.scrollToLine(target)
+  session.term.focus()
 }
 
 /** 选中即复制开关：默认开，拖动/双击选中后自动写入剪贴板（不弹提示） */
@@ -1386,6 +1457,25 @@ watch(suggestBarVisible, async () => {
   fitActive()
 })
 
+// 高亮开关：立即同步到所有终端
+watch(() => highlightSettings.enabled, (enabled) => {
+  for (const session of sessions.values()) session.highlight.setEnabled(enabled)
+})
+
+// 规则 / 配色 / 概览条变化：防抖后重建，避免正则输入时每键一次全量重扫
+let highlightApplyTimer: number | null = null
+watch(
+  [() => highlightSettings.rules, () => highlightSettings.overviewRuler],
+  () => {
+    if (highlightApplyTimer !== null) window.clearTimeout(highlightApplyTimer)
+    highlightApplyTimer = window.setTimeout(() => {
+      highlightApplyTimer = null
+      applyHighlightRules()
+    }, 200)
+  },
+  { deep: true }
+)
+
 onMounted(async () => {
   window.addEventListener('resize', handleWindowResize)
   window.addEventListener('keydown', handleGlobalKeydown)
@@ -1393,6 +1483,10 @@ onMounted(async () => {
 })
 
 onBeforeUnmount(() => {
+  if (highlightApplyTimer !== null) {
+    window.clearTimeout(highlightApplyTimer)
+    highlightApplyTimer = null
+  }
   window.removeEventListener('resize', handleWindowResize)
   window.removeEventListener('keydown', handleGlobalKeydown)
   for (const session of sessions.values()) {
