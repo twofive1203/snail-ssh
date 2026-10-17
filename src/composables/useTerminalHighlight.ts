@@ -1,4 +1,4 @@
-import type { Terminal, IDecoration, IDisposable, ILink, ILinkProvider } from '@xterm/xterm'
+import type { Terminal, IDecoration, IDisposable, IBufferLine, ILink, ILinkProvider } from '@xterm/xterm'
 
 /**
  * 终端关键字高亮。
@@ -9,6 +9,11 @@ import type { Terminal, IDecoration, IDisposable, ILink, ILinkProvider } from '@
  * - 只扫「新增行」，每 tick 最多扫 MAX_SCAN_LINES_PER_TICK 行，用 requestAnimationFrame 节流，
  *   保证 `tail -f` 大日志时不卡 UI。
  * - decoration 必须挂在 marker（相对位置）上，不能用绝对行号，否则滚动后错位。
+ * - 默认只给命中的「词」上色（x + width），整行铺底需要规则显式声明 wholeLine。
+ * - 有背景色时，前景色只在底层单元格 isFgDefault() 为真时才设置；
+ *   否则会把 ls / grep --color / systemctl 等程序的 ANSI 着色抹平
+ *   （xterm 的 decoration 前景色会直接覆盖 cell 的 $fg，见 CellColorResolver）。
+ * - 列号必须按 cell 宽度换算：CJK / emoji 占 2 列，直接用 JS 字符串下标会横向偏移。
  */
 
 export interface TerminalHighlightRule {
@@ -16,6 +21,8 @@ export interface TerminalHighlightRule {
   pattern: RegExp
   foregroundColor?: string
   backgroundColor?: string
+  /** 整行着色。默认 false，只给命中词上色，避免整屏色块 */
+  wholeLine?: boolean
 }
 
 /** 内置规则集，后续做成设置项时直接复用 */
@@ -24,17 +31,21 @@ export const DEFAULT_HIGHLIGHT_RULES: TerminalHighlightRule[] = [
     key: 'error',
     pattern: /\b(ERROR|FATAL|FAIL(?:ED|URE)?|PANIC|Exception|Traceback)\b/i,
     foregroundColor: '#fecaca',
-    backgroundColor: '#7f1d1d'
+    backgroundColor: '#7f1d1d',
+    // 错误整行铺底：日志里一眼定位，有 ANSI 着色时只铺背景不改字色
+    wholeLine: true
   },
   {
     key: 'warn',
     pattern: /\b(WARN(?:ING)?|DEPRECAT(?:ED|ION))\b/i,
-    foregroundColor: '#fbbf24'
+    foregroundColor: '#fde68a',
+    backgroundColor: '#451a03'
   },
   {
     key: 'success',
     pattern: /\b(SUCCESS|PASSED|Done)\b/i,
-    foregroundColor: '#4ade80'
+    foregroundColor: '#bbf7d0',
+    backgroundColor: '#052e16'
   }
 ]
 
@@ -47,7 +58,8 @@ const LINK_PATTERNS: RegExp[] = [
 export const HIGHLIGHT_STORAGE_KEY = 'snail_ssh_highlight_enabled'
 
 const MAX_SCAN_LINES_PER_TICK = 200
-const MAX_DECORATIONS = 2000
+const MAX_DECORATIONS = 4000
+const MAX_HITS_PER_LINE = 24
 
 export interface UseTerminalHighlightOptions {
   onToast?: (msg: string, type?: 'info' | 'success' | 'warning' | 'error') => void
@@ -61,17 +73,112 @@ export interface TerminalHighlight {
   dispose(): void
 }
 
-const matchRule = (text: string, rules: TerminalHighlightRule[]): TerminalHighlightRule | null => {
+interface CompiledRule {
+  rule: TerminalHighlightRule
+  scan: RegExp
+  priority: number
+}
+
+interface TextHit {
+  start: number
+  end: number
+  rule: CompiledRule
+}
+
+const compileRules = (rules: TerminalHighlightRule[]): CompiledRule[] =>
+  rules.map((rule, priority) => {
+    // 复制成带 g 的正则用于逐行取所有匹配位置，不复用原对象避免 lastIndex 串扰
+    const flags = rule.pattern.flags.includes('g') ? rule.pattern.flags : `${rule.pattern.flags}g`
+    return { rule, priority, scan: new RegExp(rule.pattern.source, flags) }
+  })
+
+/** 收集一行内所有规则的命中，按「起点 + 规则优先级」排序并丢弃重叠段 */
+const collectHits = (text: string, rules: CompiledRule[]): TextHit[] => {
+  const hits: TextHit[] = []
   for (const rule of rules) {
-    // 每次重置 lastIndex，避免全局正则的状态残留
-    rule.pattern.lastIndex = 0
-    if (rule.pattern.test(text)) return rule
+    rule.scan.lastIndex = 0
+    let m: RegExpExecArray | null
+    while ((m = rule.scan.exec(text)) !== null) {
+      // 零长度匹配会死循环
+      if (!m[0]) {
+        rule.scan.lastIndex++
+        continue
+      }
+      hits.push({ start: m.index, end: m.index + m[0].length, rule })
+      // 防止病态正则在一行内产生海量匹配拖垮 UI
+      if (hits.length >= MAX_HITS_PER_LINE * 4) break
+    }
   }
-  return null
+  if (hits.length === 0) return hits
+
+  // 整行规则优先生效且独占：一旦命中就只返回这一条，
+  // 否则后注册的词级高亮会与整行底色叠在一起，观感混乱
+  const wholeLineHit = hits
+    .filter((hit) => hit.rule.rule.wholeLine === true)
+    .sort((a, b) => a.rule.priority - b.rule.priority)[0]
+  if (wholeLineHit) return [wholeLineHit]
+
+  // 规则在数组中的顺序即优先级：同一起点保留高优先级，重叠的丢弃
+  hits.sort((a, b) => a.start - b.start || a.rule.priority - b.rule.priority)
+  const accepted: TextHit[] = []
+  let lastEnd = 0
+  for (const hit of hits) {
+    if (hit.start < lastEnd) continue
+    accepted.push(hit)
+    lastEnd = hit.end
+    if (accepted.length >= MAX_HITS_PER_LINE) break
+  }
+  return accepted
+}
+
+/**
+ * 建立「字符串下标 → cell 列号」映射，修正 CJK / emoji 宽字符造成的横向偏移。
+ * 必须与 translateToString 的遍历方式一致：宽字符占 2 列，其右半格（width = 0）不产生字符。
+ */
+const buildColumnMap = (line: IBufferLine, textLength: number): number[] => {
+  const columns = new Array<number>(textLength + 1)
+  let col = 0
+  let offset = 0
+
+  while (col < line.length && offset < textLength) {
+    const cell = line.getCell(col)
+    if (!cell) break
+
+    const width = cell.getWidth()
+    if (width === 0) {
+      // 宽字符右半格，不承载字符
+      col++
+      continue
+    }
+
+    // 空白单元格 getChars() 返回 ''，但 translateToString 里算作一个空格
+    const chars = cell.getChars() || ' '
+    for (let k = 0; k < chars.length && offset + k < textLength; k++) {
+      columns[offset + k] = col
+    }
+    offset += chars.length
+    col += width
+  }
+
+  // 末端列 = 最后一个字符之后的列，作为命中词的右边界
+  columns[textLength] = col
+  return columns
+}
+
+/** 命中区间内是否有单元格带显式前景色（palette / RGB） */
+const hasExplicitForeground = (line: IBufferLine, from: number, to: number): boolean => {
+  const end = Math.max(from + 1, to)
+  for (let x = from; x < end; x++) {
+    const cell = line.getCell(x)
+    // width = 0 是宽字符右半格，前景色与左半格一致，跳过
+    if (!cell || cell.getWidth() === 0) continue
+    if (!cell.isFgDefault()) return true
+  }
+  return false
 }
 
 export function useTerminalHighlight(term: Terminal, options: UseTerminalHighlightOptions = {}): TerminalHighlight {
-  const rules = options.rules ?? DEFAULT_HIGHLIGHT_RULES
+  const compiledRules = compileRules(options.rules ?? DEFAULT_HIGHLIGHT_RULES)
   const onToast = options.onToast
 
   let enabled = false
@@ -108,6 +215,44 @@ export function useTerminalHighlight(term: Terminal, options: UseTerminalHighlig
     }
   }
 
+  /** 为一行上的命中项挂 decoration；x / width 均为修正后的 cell 列号 */
+  const addHitsForLine = (line: IBufferLine, lineIndex: number, cursorLine: number, hits: TextHit[], text: string) => {
+    // 整行规则不需要列号映射，避免纯错误行多做一次分配
+    const columns = hits.some((hit) => hit.rule.rule.wholeLine !== true) ? buildColumnMap(line, text.length) : null
+    for (const hit of hits) {
+      const wholeLine = hit.rule.rule.wholeLine === true
+      const from = wholeLine ? 0 : (columns?.[hit.start] ?? 0)
+      const to = wholeLine ? term.cols : (columns?.[hit.end] ?? from + 1)
+      const width = Math.max(1, to - from)
+
+      const marker = term.registerMarker(lineIndex - cursorLine)
+      if (!marker) continue
+
+      const background = hit.rule.rule.backgroundColor
+      const foreground = hit.rule.rule.foregroundColor
+      // 有背景时背景已足够醒目，不再动前景色，保住程序原有 ANSI 着色；
+      // 没有背景时前景色是唯一可见手段，只能直接上色。
+      const canPaintForeground =
+        foreground !== undefined && (background === undefined || !hasExplicitForeground(line, from, from + width))
+
+      const dec = canPaintForeground
+        ? term.registerDecoration({ marker, x: from, width, backgroundColor: background, foregroundColor: foreground, layer: 'top' })
+        : term.registerDecoration({ marker, x: from, width, backgroundColor: background, layer: 'top' })
+
+      if (!dec) {
+        marker.dispose()
+        continue
+      }
+
+      decorations.push(dec)
+      marker.onDispose(() => {
+        dec.dispose()
+        const idx = decorations.indexOf(dec)
+        if (idx >= 0) decorations.splice(idx, 1)
+      })
+    }
+  }
+
   const scan = () => {
     rafId = null
     if (disposed || !enabled) return
@@ -127,31 +272,10 @@ export function useTerminalHighlight(term: Terminal, options: UseTerminalHighlig
       if (i < cursorLine) {
         const line = buffer.getLine(i)
         const text = line ? line.translateToString(true) : ''
-        if (text) {
-          const rule = matchRule(text, rules)
-          if (rule) {
-            // marker 使用相对光标行偏移，滚动/回收时自动跟随
-            const marker = term.registerMarker(i - cursorLine)
-            if (marker) {
-              const dec = term.registerDecoration({
-                marker,
-                // width 默认只有 1 格，不指定的话整行只会高亮首字符
-                width: term.cols,
-                backgroundColor: rule.backgroundColor,
-                foregroundColor: rule.foregroundColor,
-                layer: 'top'
-              })
-              if (dec) {
-                decorations.push(dec)
-                marker.onDispose(() => {
-                  dec.dispose()
-                  const idx = decorations.indexOf(dec)
-                  if (idx >= 0) decorations.splice(idx, 1)
-                })
-              } else {
-                marker.dispose()
-              }
-            }
+        if (line && text) {
+          const hits = collectHits(text, compiledRules)
+          if (hits.length > 0) {
+            addHitsForLine(line, i, cursorLine, hits, text)
           }
         }
       }
@@ -189,11 +313,13 @@ export function useTerminalHighlight(term: Terminal, options: UseTerminalHighlig
       const lineIndex = bufferLineNumber - 1
       const line = term.buffer.active.getLine(lineIndex)
       const text = line ? line.translateToString(true) : ''
-      if (!text) {
+      if (!line || !text) {
         callback(undefined)
         return
       }
 
+      // 与关键字高亮共用列号映射，中文 / emoji 行里链接范围不会偏移
+      const columns = buildColumnMap(line, text.length)
       const found: ILink[] = []
       for (const pattern of LINK_PATTERNS) {
         pattern.lastIndex = 0
@@ -207,8 +333,8 @@ export function useTerminalHighlight(term: Terminal, options: UseTerminalHighlig
           const start = m.index
           found.push({
             range: {
-              start: { x: start, y: lineIndex },
-              end: { x: start + value.length, y: lineIndex }
+              start: { x: columns[start] ?? start, y: lineIndex },
+              end: { x: columns[start + value.length] ?? start + value.length, y: lineIndex }
             },
             text: value,
             activate: () => {
