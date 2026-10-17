@@ -60,6 +60,15 @@
         <span class="w-px h-4 bg-surface-border shrink-0"></span>
 
         <button
+          @click="toggleSelectCopy"
+          :title="selectToCopyEnabled ? '关闭选中即复制' : '开启选中即复制（拖选后自动写入剪贴板）'"
+          class="p-1.5 rounded hover:bg-surface-elevated transition-colors"
+          :class="selectToCopyEnabled ? 'text-emerald-300 bg-emerald-500/10' : 'text-surface-subtle hover:text-white'"
+        >
+          <TextSelect class="w-3.5 h-3.5" />
+        </button>
+
+        <button
           @click="toggleHighlight"
           :title="highlightEnabled ? '关闭关键字高亮' : '开启关键字高亮（ERROR/WARN/成功）'"
           class="p-1.5 rounded hover:bg-surface-elevated transition-colors"
@@ -377,6 +386,17 @@ const readHighlightEnabled = (): boolean => {
 }
 const highlightEnabled = ref(readHighlightEnabled())
 
+// 选中即复制开关（默认开，存 localStorage）
+const SELECT_COPY_KEY = 'snail_ssh_select_to_copy'
+const readSelectCopyEnabled = (): boolean => {
+  try {
+    return localStorage.getItem(SELECT_COPY_KEY) !== '0'
+  } catch {
+    return true
+  }
+}
+const selectToCopyEnabled = ref(readSelectCopyEnabled())
+
 const currentTabId = computed(() => props.tabs[props.activeTabIndex]?.id ?? '')
 const currentTab = computed(() => props.tabs[props.activeTabIndex])
 const currentSession = computed(() => sessions.get(currentTabId.value))
@@ -687,6 +707,39 @@ const createSession = (tab: TerminalTab, container: HTMLDivElement): TerminalSes
   container.addEventListener('mousedown', (e) => {
     if (e.button === 2) session.rightClickSelection = term.getSelection()
   }, true)
+
+  // 选中即复制：拖动中不写剪贴板，只在选区定稿后写一次，避免中间态反复覆盖剪贴板
+  let dragging = false
+  let lastCopied = ''
+  const copySelectionToClipboard = () => {
+    if (!selectToCopyEnabled.value) return
+    const text = term.getSelection()
+    if (!text || text === lastCopied) return
+    lastCopied = text
+    // 静默失败：自动复制不该打断用户操作，也不弹 toast
+    navigator.clipboard.writeText(text).catch(() => {})
+  }
+  container.addEventListener('mousedown', (e) => {
+    if (e.button !== 0) return
+    dragging = true
+    lastCopied = ''
+  })
+  container.addEventListener('mouseup', () => {
+    dragging = false
+    copySelectionToClipboard()
+  })
+  // 拖到终端外松开时容器收不到 mouseup，靠 document 兜底（xterm 也在 document 上收尾选择）
+  const onDocumentMouseUp = () => {
+    if (!dragging) return
+    dragging = false
+    copySelectionToClipboard()
+  }
+  document.addEventListener('mouseup', onDocumentMouseUp)
+  // 双击选词 / 三击选行 / 全选不经过拖动，事件触发时选区已是最终结果
+  term.onSelectionChange(() => {
+    if (!dragging) copySelectionToClipboard()
+  })
+  session.unlisten.push(() => document.removeEventListener('mouseup', onDocumentMouseUp))
 
   // 监听 OSC 7 (标准终端当前目录转义序列)
   term.parser.registerOscHandler(7, (data) => {
@@ -1021,6 +1074,17 @@ const toggleHighlight = () => {
   }
   for (const session of sessions.values()) session.highlight.setEnabled(highlightEnabled.value)
   emitToast(highlightEnabled.value ? '关键字高亮已开启' : '关键字高亮已关闭', 'info')
+}
+
+/** 选中即复制开关：默认开，拖动/双击选中后自动写入剪贴板（不弹提示） */
+const toggleSelectCopy = () => {
+  selectToCopyEnabled.value = !selectToCopyEnabled.value
+  try {
+    localStorage.setItem(SELECT_COPY_KEY, selectToCopyEnabled.value ? '1' : '0')
+  } catch {
+    // localStorage 不可用时仅本次会话生效
+  }
+  emitToast(selectToCopyEnabled.value ? '选中即复制已开启' : '选中即复制已关闭', 'info')
 }
 
 watch([searchQuery, searchCaseSensitive, searchWholeWord, searchRegex], () => {
