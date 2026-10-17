@@ -9,10 +9,10 @@
 
 | 层面 | 选型 | 特性与优势 |
 | :--- | :--- | :--- |
-| **桌面框架** | **Tauri v2** | 原生轻量化（安装包仅约 15MB，常驻内存仅 30~50MB，远优于 Electron 的 300MB+） |
+| **桌面框架** | **Tauri v2** | 原生轻量化（Windows 安装包实测 3~5MB 量级，远优于 Electron 的 300MB+） |
 | **后端核心** | **Rust (`ssh2`, `tokio`, `tauri 2.0`)** | 原生多线程非阻塞 I/O，高性能流式 SFTP 传输与 PTY 进程管理，安全可控 |
 | **前端体系** | **Vue 3 + Vite + TypeScript** | 现代 Composition API，极速 HMR 热重载与强类型支持 |
-| **终端引擎** | **`@xterm/xterm` + `addon-fit`** | 行业标准级 xterm.js ANSI 彩色终端渲染与平滑交互 |
+| **终端引擎** | **`@xterm/xterm` + `addon-fit` / `addon-search` / `addon-unicode11` / `addon-web-links`** | 行业标准级 xterm.js ANSI 彩色终端渲染，内置查找、CJK 宽字符修正与链接识别 |
 | **样式与设计** | **Tailwind CSS + Lucide Icons** | Warp / Raycast / Linear 暗黑风格设计系统，毛玻璃磨砂与发光微质感 |
 
 ---
@@ -21,13 +21,15 @@
 
 ### 1. 🖥️ 服务器资产管理 (Host Manager)
 * **卡片网格 (Grid) / 紧凑表格 (List)** 自由切换。
-* **真实监控指标**：连接成功后自动执行远端探测脚本，回填系统发行版、CPU/内存/磁盘利用率与 TCP+SSH 握手延迟；未探测过的主机不再展示伪造数值。
-* **分组与标签检索**：按生产集群 (Prod)、测试环境 (Stage)、个人实验机 (Cloud) 及自定义 Tag 即时过滤。
+* **真实监控指标**：连接成功后自动执行远端探测脚本，回填系统发行版、CPU/内存/磁盘利用率与 TCP+SSH 握手延迟；未探测过的主机不再展示伪造数值（浏览器 Web 预览模式除外，该模式使用内置演示数据 `demoSession`）。
+* **分组与标签检索**：按生产集群 (Prod)、测试环境 (Stage)、个人实验机 (Cloud) 三个固定分组过滤；搜索框同时匹配主机名、IP 与 Tag。分组本身的新增 / 重命名 / 删除尚未实现（侧边栏「+」为占位）。
 * **快捷直连入口**：卡片上提供一键 `连接 SSH` 与 `SFTP`。
 * **新建/编辑服务器弹窗 (Modal)**：支持主机别名、分组、IP、端口、认证方式（密码 / 私钥 PEM 或路径 / SSH Agent）与真实连通性测试。
 * **资产持久化存储**：主机元数据存于 `~/.snail-ssh/hosts.json`，密码、私钥与口令存入系统钥匙串（Windows 凭据管理器 / macOS Keychain / Linux Secret Service），配置文件中不落明文凭据。私钥体积超单条凭据上限时自动分片存储。
 
 ### 2. 💻 SSH 现代终端 (Terminal)
+* **会话工作区 (Workspace)**：每个会话是「左侧树形文件区 + 可拖拽分隔条（默认 280px，双击复位）+ 右侧终端 / SFTP」的组合视图，由 `SessionWorkspace.vue` 统一承载。
+* **底部实时指标条**：工作区底部常驻 `RemoteMonitorBar.vue`，展示主机名 / 发行版、CPU、内存（已用 / 总量）、实时上下行网络吞吐、Uptime、登录用户数与主要磁盘分区占用；数据来自后端 `get_remote_metrics`（按 2.5s 轮询，仅在当前活动会话且监控开启时刷新）。
 * **多会话标签页 (Tab Bar)**：支持多会话并行切换、动态新建终端、独立关闭会话。
 * **真实 PTY 交互通道**：Rust 后端通过 libssh2 分配真实 `xterm-256color` PTY 并启动 Shell，后台线程实时通过 Tauri 事件向前端广播 stdout/stderr，支持双向交互输入与窗口尺寸 Resize。
 * **常用指令代码片段 (Snippets)**：一键向终端发送常用命令（`docker ps`, `free -h`, `df -h`, `systemctl status nginx`, `htop` 等）。
@@ -86,6 +88,7 @@
 * 命令片段库（团队共享）
 * 端口转发 & 隧道（Local / Remote / Dynamic）
 * 主机配置导入 / 导出（SSH Config、FinalShell、Termius）
+* 自定义分组（新增 / 重命名 / 删除分组）
 * 设置中心（终端主题、字体定制）
 
 其它限制：
@@ -118,36 +121,48 @@
 
 ```text
 snail-ssh/
-├── prototype/              # 第一版纯静态高保真交互原型备份 (可直接浏览器双击预览)
+├── prototype/              # 第一版纯静态高保真原型备份（不参与构建，禁止在此改业务逻辑）
 │   ├── index.html
 │   ├── style.css
-│   └── app.js
+│   ├── app.js
+│   └── logo.svg
+├── public/                 # Vite 静态资源（favicon.ico / favicon.svg / logo.svg）
 ├── src-tauri/              # Rust 原生后端工程 (Tauri v2)
-│   ├── Cargo.toml          # Rust 依赖声明 (tauri 2.0, ssh2, tokio, serde 等)
-│   ├── tauri.conf.json     # Tauri 跨平台窗口与应用配置
-│   ├── capabilities/       # Tauri v2 权限策略配置
+│   ├── Cargo.toml          # Rust 依赖声明 (tauri 2.0, ssh2, tokio, serde, keyring, sha2 等)
+│   ├── Cargo.lock
+│   ├── build.rs            # tauri-build 构建脚本
+│   ├── tauri.conf.json     # 窗口、前后端联调命令与打包配置
+│   ├── capabilities/       # Tauri v2 权限策略配置 (default.json)
 │   ├── icons/              # 跨平台标准应用图标资产 (ICO, ICNS, PNG)
 │   └── src/
 │       ├── main.rs         # 桌面客户端可执行入口
-│       ├── lib.rs          # Tauri 命令调度与状态注入
-│       ├── ssh.rs          # SSH 核心：TCP握手、认证、PTY申请、Shell双向读写流
-│       ├── sftp.rs         # SFTP 核心：目录遍历、文件读写、分块流式上传下载
+│       ├── lib.rs          # Tauri 命令调度、状态注入与 generate_handler 注册表
+│       ├── ssh.rs          # SSH 核心：TCP握手、认证、PTY申请、Shell双向读写流、known_hosts 校验、会话日志
+│       ├── sftp.rs         # SFTP 核心：目录遍历、文件读写、分块流式上传下载、进度与续传
+│       ├── transfer.rs     # 传输控制信号注册表（暂停 / 取消 / 续传检查点）
 │       ├── history.rs      # 命令历史持久化（去重累计、频次裁剪、敏感命令过滤）
-│       └── storage.rs      # 主机资产配置本地持久化管理器
+│       └── storage.rs      # 主机资产持久化 + 系统钥匙串凭证分片存储
 ├── src/                    # 前端工程 (Vue 3 + TypeScript + TailwindCSS)
 │   ├── api/
 │   │   └── tauri.ts        # 前后端双模桥接层 (支持 Tauri 原生调用与降级 Mock)
-│   ├── components/
+│   ├── components/         # 18 个 .vue 组件（UI 基础 / 会话工作区 / 资产与弹窗）
 │   │   ├── TitleBar.vue        # 现代化窗口标题栏
 │   │   ├── Sidebar.vue         # 侧边栏与分组筛选
+│   │   ├── SessionWorkspace.vue     # 会话容器：文件树 + 分隔条 + 终端/SFTP + 底部监控条
+│   │   ├── RemoteMonitorBar.vue     # 底部实时指标条（CPU/内存/磁盘/网络/Uptime）
 │   │   ├── HostManager.vue     # 服务器资产卡片/列表管理器
-│   │   ├── TerminalView.vue    # xterm.js 终端会话组件
-│   │   ├── SftpView.vue        # SFTP 文件浏览器组件
-│   │   ├── TransferDrawer.vue  # 悬浮传输任务抽屉
+│   │   ├── HostModal.vue       # 新建/编辑/快速连接主机弹窗
 │   │   ├── CommandPalette.vue  # Ctrl+K 全局命令面板
-│   │   ├── HostModal.vue       # 新建/编辑主机弹窗
-│   │   ├── EditorModal.vue     # 在线代码/文件编辑器弹窗
+│   │   ├── TerminalView.vue    # xterm.js 终端会话组件
+│   │   ├── CommandSuggestBar.vue    # 终端底部命令联想候选条
 │   │   ├── HighlightSettingsModal.vue # 关键字高亮设置弹窗
+│   │   ├── SftpView.vue        # SFTP 列表视图
+│   │   ├── FileTree.vue        # SFTP 树形视图容器
+│   │   ├── FileTreeNodeItem.vue     # 树节点（递归渲染）
+│   │   ├── EditorModal.vue     # 在线代码/文件编辑器弹窗
+│   │   ├── TransferDrawer.vue  # 悬浮传输任务抽屉
+│   │   ├── ContextMenu.vue     # 通用右键菜单
+│   │   ├── DialogHost.vue      # 应用内确认/输入弹窗宿主
 │   │   └── Toast.vue           # 全局微动效提示框
 │   ├── composables/
 │   │   ├── useDialog.ts            # 应用内确认/输入弹窗
@@ -156,14 +171,20 @@ snail-ssh/
 │   │   └── useTerminalHighlight.ts # 终端关键字高亮与可点击链接
 │   ├── types/
 │   │   └── index.ts        # 全局 TypeScript 接口定义
-│   ├── App.vue             # 主界面总线
+│   ├── App.vue             # 主界面总线（会话状态、全局快捷键、传输队列）
 │   ├── main.ts             # 应用入口
-│   └── style.css           # 全局样式系统
-├── index.html              # Vite 单页应用宿主
-├── vite.config.ts          # Vite 打包配置
-├── tailwind.config.js      # Tailwind CSS 主题配置
-└── package.json            # 前端依赖配置
+│   └── style.css           # 全局样式系统（唯一生效的全局样式表）
+├── index.html              # Vite 单页应用宿主（唯一入口；prototype/index.html 是原型副本）
+├── vite.config.ts          # Vite 打包配置（固定端口 1420）
+├── tailwind.config.js      # Tailwind CSS 主题配置（content 只扫描 index.html 与 src/**）
+├── postcss.config.js       # PostCSS 插件配置
+├── tsconfig.json           # 前端 TS 配置（tsconfig.node.json 供 Vite 配置文件用）
+├── package.json            # 前端依赖与脚本
+└── snail-logo.svg          # 品牌 Logo 源文件
 ```
+
+> ⚠️ 前端入口只有 `src/main.ts` + `src/App.vue`；全局样式只有 `src/style.css`（`src/main.ts` 的 `import './style.css'` 相对解析到它）；`tailwind.config.js` 的 `content` 只扫描 `index.html` 与 `src/**`。
+> 第一版原型遗留的根目录 `app.js` / `style.css` 已归档到本地 `backups/legacy-prototype/`（`backups/` 不入库）；若再次在根目录见到这两个文件，视为死代码，不要修改。
 
 ---
 
