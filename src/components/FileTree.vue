@@ -12,6 +12,16 @@
           <FolderGit2 class="w-3.5 h-3.5" />
           <span>文件工作区</span>
         </div>
+        <!-- 环境标识：颜色与终端标签一致，避免在错误的环境里删文件 -->
+        <span
+          v-if="currentGroup.danger"
+          class="flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-mono border"
+          :class="[groupColorOf(currentGroup.color).text, groupColorOf(currentGroup.color).border, groupColorOf(currentGroup.color).bg]"
+          :title="`当前分组：${currentGroup.label}`"
+        >
+          <span class="w-1.5 h-1.5 rounded-full" :class="groupColorOf(currentGroup.color).dot"></span>
+          <span>{{ currentGroup.label }}</span>
+        </span>
       </div>
       <div class="flex items-center gap-1 text-slate-400">
         <button
@@ -116,16 +126,19 @@
         <!-- 书签下拉 -->
         <div
           v-if="showBookmarks"
-          class="absolute right-0 top-full mt-1 w-44 bg-surface-sidebar border border-surface-border rounded-lg shadow-xl z-30 py-1 text-xs"
+          class="absolute right-0 top-full mt-1 w-48 bg-surface-sidebar border border-surface-border rounded-lg shadow-xl z-30 py-1 text-xs"
         >
           <div
-            v-for="b in bookmarks"
-            :key="b.path"
+            v-for="b in settings.bookmarks"
+            :key="b.id"
             @click="jumpBookmark(b.path)"
-            class="px-2.5 py-1.5 hover:bg-surface-elevated text-slate-300 hover:text-white cursor-pointer flex items-center justify-between"
+            class="px-2.5 py-1.5 hover:bg-surface-elevated text-slate-300 hover:text-white cursor-pointer flex items-center justify-between gap-2"
           >
-            <span>{{ b.label }}</span>
-            <span class="text-[10px] text-slate-500 font-mono">{{ b.path }}</span>
+            <span class="truncate">{{ b.label }}</span>
+            <span class="text-[10px] text-slate-500 font-mono truncate max-w-[90px]">{{ b.path }}</span>
+          </div>
+          <div v-if="settings.bookmarks.length === 0" class="px-2.5 py-2 text-[11px] text-slate-500">
+            暂无书签，可在设置中心添加
           </div>
         </div>
       </div>
@@ -352,6 +365,7 @@ import {
   sftpStatApi
 } from '@/api/tauri'
 import { confirmDialog, promptDialog } from '@/composables/useDialog'
+import { settings, groupById, groupColorOf } from '@/composables/useAppSettings'
 
 const props = withDefaults(
   defineProps<{
@@ -361,11 +375,14 @@ const props = withDefaults(
     terminalCwd?: string
     autoFollow?: boolean
     remoteMonitorOpen?: boolean
+    /** 所属分组 id：用于环境色标识与高风险删除确认 */
+    groupId?: string
   }>(),
   {
     terminalCwd: '',
     autoFollow: false,
-    remoteMonitorOpen: false
+    remoteMonitorOpen: false,
+    groupId: ''
   }
 )
 
@@ -400,13 +417,8 @@ const pathInputRef = ref<HTMLInputElement | null>(null)
 // 根级节点集合
 const rootNodes = ref<FileTreeNode[]>([])
 
-const bookmarks = [
-  { label: '家目录 ~', path: '~' },
-  { label: '根目录 /', path: '/' },
-  { label: '日志 /var/log', path: '/var/log' },
-  { label: '配置 /etc', path: '/etc' },
-  { label: '临时 /tmp', path: '/tmp' },
-]
+// 当前分组（决定环境色与高风险确认）
+const currentGroup = computed(() => groupById(props.groupId || props.host.group))
 
 const pathSegments = computed(() => {
   return currentPath.value.split('/').filter(Boolean)
@@ -924,6 +936,9 @@ const handleContextMenuSelect = async (item: ContextMenuItem) => {
         const ok = await confirmDialog({
           title: '确认删除',
           message: `确定要彻底删除 ${node.name} 吗？此操作无法撤销。`,
+          detail: currentGroup.value.danger
+            ? `当前处于高风险分组「${currentGroup.value.label}」，请确认路径无误：\n${node.path}`
+            : node.path,
           variant: 'danger',
           confirmText: '删除',
           cancelText: '取消'

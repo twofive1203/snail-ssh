@@ -20,9 +20,10 @@
 ## 3. 数据落盘位置
 
 - `~/.snail-ssh/hosts.json`：主机元数据（凭证走系统钥匙串，`storage.rs` 分片存储，失败才回退明文并告警）。
+- `~/.snail-ssh/settings.json`：应用设置（终端外观、命令片段、目录书签、主机分组）；`settings.rs` 只做整块 JSON 的原子读写，结构由前端 `AppSettings` 约束，缺字段由前端补默认值。
 - `~/.snail-ssh/history.json`：命令历史（每主机上限 500 条）。
 - `~/.snail-ssh/logs/<host>/<UTC 时间戳>_<会话短 ID>.log`：会话日志（明文、不轮转）。
-- `localStorage`：`snail_ssh_recent`、`snail_ssh_highlight_settings_v1`、`snail_ssh_import_remote_history`。
+- `localStorage`：`snail_ssh_recent`、`snail_ssh_highlight_settings_v1`、`snail_ssh_import_remote_history`、`snail_ssh_select_to_copy`、`snail_ssh_session_log_auto`；浏览器预览降级时 `snail_ssh_app_settings_v1` 充当 settings.json 的替身。
 
 ## 4. 文档纪律
 
@@ -41,4 +42,6 @@ cd src-tauri && cargo check      # Rust 侧；history.rs 有单测可跑 cargo t
 
 ## 6. 现有占位功能（点击只弹提示，勿当已实现）
 
-跳板机/代理、SSH 密钥保险箱、命令片段库、端口转发隧道、主机导入导出、自定义分组增删、设置中心。
+跳板机/代理、SSH 密钥保险箱、端口转发隧道、主机导入导出。
+
+（命令片段库、自定义分组、设置中心、终端主题/字体定制已实现，见 `SettingsModal.vue` 与 `composables/useAppSettings.ts`。）

@@ -8,12 +8,15 @@
           :key="tab.id"
           @click="$emit('switch-tab', idx)"
           @contextmenu.prevent="openTabMenu($event, idx)"
-          :class="idx === activeTabIndex ? 'bg-[#0c0e14] border-t-2 border-brand-500 text-slate-200 border-x border-surface-border/50' : 'bg-surface-card/40 hover:bg-surface-card text-surface-subtle hover:text-slate-300 border-t-2 border-transparent'"
+          :class="idx === activeTabIndex ? 'bg-[#0c0e14] border-t-2 text-slate-200 border-x border-surface-border/50' : 'bg-surface-card/40 hover:bg-surface-card text-surface-subtle hover:text-slate-300 border-t-2 border-transparent'"
+          :style="idx === activeTabIndex ? { borderTopColor: groupColorHex } : undefined"
           class="group flex items-center gap-2 px-3 py-1.5 rounded-t-lg text-xs cursor-pointer transition-all shrink-0"
         >
+          <!-- 环境色点：生产红 / 预发黄 / 测试蓝，降低「在哪个环境敲命令」的认知成本 -->
           <span
-            class="w-2 h-2 rounded-full"
-            :class="tab.connected ? 'bg-emerald-400 animate-pulse' : 'bg-rose-500'"
+            class="w-2 h-2 rounded-full shrink-0"
+            :class="[tab.connected ? groupColorDot : 'bg-rose-500', tab.connected ? 'animate-pulse' : '']"
+            :title="currentGroup.label"
           ></span>
           <span class="font-mono font-medium">{{ tab.title }}</span>
           <span class="text-[10px] font-mono text-slate-500 hidden sm:inline">{{ tab.sub }}</span>
@@ -151,14 +154,18 @@
           <span>常用指令:</span>
         </span>
         <button
-          v-for="s in snippets"
-          :key="s.label"
+          v-for="s in settings.snippets"
+          :key="s.id"
           @click="sendSnippetCommand(s.cmd)"
           :disabled="!currentTab"
           class="px-2 py-0.5 rounded bg-surface-card hover:bg-surface-elevated text-[11px] font-mono text-slate-300 hover:text-brand-300 border border-surface-border transition-colors shrink-0 disabled:opacity-40 disabled:cursor-not-allowed"
+          :title="s.cmd.trim()"
         >
           {{ s.label }}
         </button>
+        <span v-if="settings.snippets.length === 0" class="text-[10px] text-slate-500 font-mono">
+          暂无片段，可在设置中心添加
+        </span>
       </div>
       <div class="flex items-center gap-3 text-[11px] font-mono text-slate-500">
         <span>UTF-8</span>
@@ -247,6 +254,7 @@
         <TerminalIcon class="w-10 h-10 text-slate-600" />
         <p class="text-sm text-slate-400">当前没有活动的终端会话</p>
         <p class="text-xs text-slate-500 font-mono">请在「服务器资产」中选择主机并点击「连接 SSH」，或用 Ctrl+K 快速直连</p>
+        <p class="text-[11px] text-slate-600 font-mono">小技巧：Ctrl+Enter 唤出命令输入框，Ctrl+, 打开设置中心</p>
       </div>
 
       <div
@@ -266,6 +274,90 @@
         @accept="handleSuggestionAccept"
         @hover="handleSuggestionHover"
       />
+    </div>
+
+    <!-- 独立命令输入框（对标 Xshell Compose Bar / FinalShell 命令输入框）
+         Ctrl+Enter 唤出；Shift+Enter 换行，Enter 发送。只用于「写好再发」，
+         交互式程序（vim/htop/top）仍需直接在终端里操作。 -->
+    <div
+      v-if="settings.commandBarEnabled"
+      class="shrink-0 border-t border-surface-border bg-surface-sidebar/80"
+    >
+      <div v-if="!commandBarOpen" class="h-7 px-3 flex items-center justify-between text-[10px] font-mono text-slate-500 select-none">
+        <button
+          @click="openCommandBar"
+          :disabled="!currentTab"
+          class="flex items-center gap-1.5 hover:text-brand-300 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+          title="打开独立命令输入框 (Ctrl+Enter)"
+        >
+          <SquareTerminal class="w-3 h-3" />
+          <span>命令输入框</span>
+          <kbd class="px-1 py-0.2 rounded bg-surface-highlight text-slate-400 border border-surface-border">Ctrl+Enter</kbd>
+        </button>
+        <span class="text-slate-600">Enter 发送 · Shift+Enter 换行 · Esc 收起</span>
+      </div>
+
+      <div v-else class="px-2 py-2 space-y-1.5">
+        <div class="flex items-start gap-2">
+          <div class="flex-1 relative">
+            <textarea
+              ref="commandInputRef"
+              v-model="commandDraft"
+              rows="1"
+              spellcheck="false"
+              placeholder="在此输入命令（支持多行草稿，Enter 发送 / Shift+Enter 换行）"
+              class="w-full bg-[#0a0d14] border border-surface-border rounded-lg px-2.5 py-1.5 text-xs font-mono text-slate-200 placeholder:text-slate-600 focus:outline-none focus:border-brand-500/70 focus:ring-1 focus:ring-brand-500/30 resize-none leading-5 max-h-40 overflow-y-auto custom-scrollbar"
+              :style="{ height: draftHeight + 'px' }"
+              @keydown="onCommandBarKeydown"
+              @input="autoGrowDraft"
+            ></textarea>
+            <!-- 历史候选：复用与终端内联想相同的词库，避免两套逻辑；
+                 仅在按 ↑/↓ 浏览历史时展开，否则会一直挡住上方终端 -->
+            <div
+              v-if="historyIndex >= 0 && commandHistory.length > 0"
+              class="absolute left-0 right-0 bottom-full mb-1 max-h-48 overflow-y-auto custom-scrollbar bg-surface-sidebar/98 backdrop-blur-xl border border-surface-border rounded-lg shadow-2xl z-30"
+            >
+              <button
+                v-for="(item, idx) in commandHistory"
+                :key="item.cmd"
+                @mousedown.prevent="pickHistoryCommand(item.cmd)"
+                class="w-full text-left px-2.5 py-1 text-[11px] font-mono truncate transition-colors"
+                :class="idx === historyIndex ? 'bg-brand-500/15 text-brand-300' : 'text-slate-300 hover:bg-surface-elevated'"
+              >
+                {{ item.cmd }}
+              </button>
+            </div>
+          </div>
+          <button
+            @click="sendCommandDraft"
+            :disabled="!commandDraft.trim() || !currentTab"
+            class="shrink-0 px-3 py-1.5 rounded-lg bg-brand-500 hover:bg-brand-600 text-slate-950 font-semibold text-[11px] transition-all disabled:opacity-40 disabled:cursor-not-allowed"
+            title="发送到当前终端 (Enter)"
+          >
+            发送
+          </button>
+          <button
+            @click="closeCommandBar"
+            class="shrink-0 p-1.5 rounded-lg hover:bg-surface-elevated text-slate-400 hover:text-white transition-colors"
+            title="收起 (Esc)"
+          >
+            <X class="w-3.5 h-3.5" />
+          </button>
+        </div>
+        <div class="flex items-center justify-between text-[10px] font-mono text-slate-500 px-0.5">
+          <span class="flex items-center gap-2">
+            <span v-if="dangerousDraft" class="flex items-center gap-1 text-rose-400">
+              <TriangleAlert class="w-3 h-3" />
+              <span>危险命令：{{ dangerousDraft.label }}</span>
+            </span>
+            <span v-else-if="draftLineCount > 1" class="text-amber-400/80">
+              多行草稿 · {{ draftLineCount }} 行，将一次性发送
+            </span>
+            <span v-else class="text-slate-600">发送目标: {{ currentTab?.sub || '未连接' }}</span>
+          </span>
+          <span class="text-slate-600">↑/↓ 浏览历史 · Shift+Enter 换行</span>
+        </div>
+      </div>
     </div>
 
     <!-- 终端状态栏 -->
@@ -300,7 +392,7 @@ import { WebLinksAddon } from '@xterm/addon-web-links'
 import { SearchAddon } from '@xterm/addon-search'
 import { Unicode11Addon } from '@xterm/addon-unicode11'
 import {
-  X, Plus, FolderGit2, Eraser, Zap, Terminal as TerminalIcon,
+  X, Plus, FolderGit2, Eraser, Zap, Terminal as TerminalIcon, SquareTerminal, TriangleAlert,
   CopyPlus, Globe, User, Terminal, PenLine, RefreshCw, XCircle, ChevronsRight,
   Search, ChevronUp, ChevronDown, CaseSensitive, WholeWord, Regex,
   Copy, ClipboardPaste, TextSelect, Highlighter, FolderOpen, CircleDot, CircleStop,
@@ -309,9 +401,11 @@ import {
 import ContextMenu from '@/components/ContextMenu.vue'
 import CommandSuggestBar from '@/components/CommandSuggestBar.vue'
 import HighlightSettingsModal from '@/components/HighlightSettingsModal.vue'
-import { dialogState } from '@/composables/useDialog'
+import { dialogState, confirmDialog } from '@/composables/useDialog'
 import { useTerminalHighlight, type TerminalHighlight } from '@/composables/useTerminalHighlight'
 import { compileHighlightRules, highlightSettings } from '@/composables/useHighlightSettings'
+import { settings, currentTerminalTheme, groupById, groupColorOf } from '@/composables/useAppSettings'
+import { detectDangerousCommand } from '@/utils/commandSafety'
 import type { CommandHistoryEntry, ContextMenuItem, TerminalTab } from '@/types'
 import {
   writeSshSessionApi,
@@ -340,11 +434,14 @@ const props = withDefaults(
     active?: boolean
     /** 命令历史的主机键："user@host:port"，比 hostId 稳定，临时会话/重新导入资产后历史不丢 */
     hostKey?: string
+    /** 所属分组 id：用于标签环境色与危险命令二次确认 */
+    groupId?: string
   }>(),
   {
     sidebarCollapsed: false,
     active: false,
-    hostKey: ''
+    hostKey: '',
+    groupId: ''
   }
 )
 
@@ -382,30 +479,6 @@ interface TerminalSession {
   rightClickSelection: string
   /** 远端 shell 是否已经自己打印过 Last login（用于避免客户端重复补打） */
   sawLastLogin: boolean
-}
-
-const snippets = [
-  { label: 'docker ps', cmd: 'docker ps\n' },
-  { label: 'free -h', cmd: 'free -h\n' },
-  { label: 'df -h', cmd: 'df -h\n' },
-  { label: 'systemctl status nginx', cmd: 'systemctl status nginx\n' },
-  { label: 'netstat -tulpn', cmd: 'netstat -tulpn\n' },
-  { label: 'htop', cmd: 'htop\n' },
-]
-
-const terminalTheme = {
-  background: '#0c0e14',
-  foreground: '#e2e8f0',
-  cursor: '#10b981',
-  selectionBackground: 'rgba(16, 185, 129, 0.3)',
-  black: '#1e293b',
-  red: '#ef4444',
-  green: '#10b981',
-  yellow: '#f59e0b',
-  blue: '#06b6d4',
-  magenta: '#d946ef',
-  cyan: '#38bdf8',
-  white: '#f8fafc',
 }
 
 const containerMap = new Map<string, HTMLDivElement>()
@@ -611,6 +684,139 @@ const handleLineBufferInput = (tab: TerminalTab, session: TerminalSession, rawDa
 }
 
 // ==========================================
+// 独立命令输入框（Compose Bar）
+// ==========================================
+/**
+ * 设计约束：
+ * 1. 不接管终端键盘——vim/htop/less 等全屏程序必须走 xterm，这里只是「写好再发」；
+ * 2. 不自己重写历史库——直接复用命令历史（含频次排序、敏感词过滤）与联想词表；
+ * 3. 发送前对高风险分组做危险命令确认，避免手滑把 rm -rf 发到生产。
+ */
+const commandBarOpen = ref(false)
+const commandDraft = ref('')
+const commandInputRef = ref<HTMLTextAreaElement | null>(null)
+const draftHeight = ref(38)
+const historyIndex = ref(-1)
+/** 输入框打开时记录的历史快照，避免边输边刷候选导致闪烁 */
+const commandHistory = ref<CommandHistoryEntry[]>([])
+
+const draftLineCount = computed(() => commandDraft.value.split('\n').length)
+const dangerousDraft = computed(() => detectDangerousCommand(commandDraft.value))
+const currentGroup = computed(() => groupById(props.groupId))
+const groupColorDot = computed(() => groupColorOf(currentGroup.value.color).dot)
+const groupColorHex = computed(() => groupColorOf(currentGroup.value.color).hex)
+
+/** 输入框自动增高（最多 160px，超过后内部滚动） */
+const autoGrowDraft = () => {
+  nextTick(() => {
+    const el = commandInputRef.value
+    if (!el) return
+    el.style.height = 'auto'
+    draftHeight.value = Math.min(160, Math.max(38, el.scrollHeight))
+  })
+}
+
+const refreshCommandHistory = () => {
+  const tab = currentTab.value
+  if (!tab) {
+    commandHistory.value = []
+    return
+  }
+  commandHistory.value = (historyCache.get(hostKeyFor(tab)) || []).slice(0, 30)
+}
+
+const openCommandBar = () => {
+  if (!currentTab.value) return
+  commandBarOpen.value = true
+  historyIndex.value = -1
+  refreshCommandHistory()
+  nextTick(() => {
+    commandInputRef.value?.focus()
+    autoGrowDraft()
+  })
+}
+
+const closeCommandBar = () => {
+  commandBarOpen.value = false
+  commandDraft.value = ''
+  historyIndex.value = -1
+  draftHeight.value = 38
+  nextTick(() => focusActive())
+}
+
+const pickHistoryCommand = (cmd: string) => {
+  commandDraft.value = cmd
+  historyIndex.value = -1
+  nextTick(() => {
+    autoGrowDraft()
+    commandInputRef.value?.focus()
+  })
+}
+
+const onCommandBarKeydown = (e: KeyboardEvent) => {
+  if (e.key === 'Escape') {
+    e.preventDefault()
+    closeCommandBar()
+    return
+  }
+  // Enter 发送，Shift+Enter 换行（与 IM 习惯一致）
+  if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
+    e.preventDefault()
+    void sendCommandDraft()
+    return
+  }
+  // ↑/↓ 在草稿为空时浏览历史，否则保持光标移动，避免抢走多行编辑体验
+  if ((e.key === 'ArrowUp' || e.key === 'ArrowDown') && commandHistory.value.length > 0) {
+    if (commandDraft.value.trim() && !e.altKey) return
+    e.preventDefault()
+    const total = commandHistory.value.length
+    // 从「无选中」开始：↑ 选最新一条，↓ 选最旧一条
+    if (historyIndex.value < 0) {
+      historyIndex.value = e.key === 'ArrowUp' ? 0 : total - 1
+    } else {
+      historyIndex.value = e.key === 'ArrowDown'
+        ? (historyIndex.value + 1) % total
+        : (historyIndex.value - 1 + total) % total
+    }
+    commandDraft.value = commandHistory.value[historyIndex.value].cmd
+    nextTick(() => autoGrowDraft())
+  }
+}
+
+/** 真正发送：危险命令先确认，成功后才清空草稿 */
+const sendCommandDraft = async () => {
+  const tab = currentTab.value
+  const text = commandDraft.value
+  if (!tab || !text.trim()) return
+
+  const danger = detectDangerousCommand(text)
+  if (danger && currentGroup.value.danger) {
+    const ok = await confirmDialog({
+      title: '高风险环境：确认发送危险命令',
+      variant: 'danger',
+      message: `${currentGroup.value.label} 下即将执行危险命令（${danger.label}）`,
+      detail: `主机：${tab.sub || tab.title}\n\n${danger.snippet}\n\n确认后将直接发送到远端终端，无法撤销。`,
+      confirmText: '确认发送',
+      cancelText: '取消'
+    })
+    if (!ok) return
+  }
+
+  // 多行草稿按原样发送（含换行），最后补一个回车确保末行执行
+  const payload = text.endsWith('\n') ? text : text + '\n'
+  writeToSession(tab.id, payload)
+  void recordCommand(tab, text.trim())
+  commandDraft.value = ''
+  historyIndex.value = -1
+  draftHeight.value = 38
+  refreshCommandHistory()
+  nextTick(() => {
+    autoGrowDraft()
+    commandInputRef.value?.focus()
+  })
+}
+
+// ==========================================
 // 会话日志（REC 指示 + 开/关 + 打开目录）
 // ==========================================
 const LOG_AUTO_KEY = 'snail_ssh_session_log_auto'
@@ -700,12 +906,12 @@ const openLogDir = async () => {
 
 const createSession = (tab: TerminalTab, container: HTMLDivElement): TerminalSession => {
   const term = new Xterm({
-    fontFamily: '"JetBrains Mono", "Fira Code", monospace',
-    fontSize: 13,
-    lineHeight: 1.3,
-    cursorBlink: true,
-    cursorStyle: 'block',
-    theme: terminalTheme,
+    fontFamily: settings.terminal.fontFamily,
+    fontSize: settings.terminal.fontSize,
+    lineHeight: settings.terminal.lineHeight,
+    cursorBlink: settings.terminal.cursorBlink,
+    cursorStyle: settings.terminal.cursorStyle,
+    theme: currentTerminalTheme().theme,
     allowProposedApi: true,
   })
 
@@ -1429,13 +1635,46 @@ const handleMockTerminalInput = (tab: TerminalTab, session: TerminalSession, dat
 
 const handleWindowResize = () => fitActive()
 
-/** 全局 Ctrl+F：仅在当前活动工作区生效，终端聚焦时交给 xterm 自定义处理器 */
+/** 全局 Ctrl+F / Ctrl+Enter：仅在当前活动工作区生效，终端聚焦时交给 xterm 自定义处理器 */
 const handleGlobalKeydown = (e: KeyboardEvent) => {
   if (!props.active || dialogState.open) return
   const mod = e.ctrlKey || e.metaKey
-  if (!mod || e.shiftKey || e.key.toLowerCase() !== 'f') return
+  if (!mod) return
   const el = e.target as HTMLElement | null
-  if (el && typeof el.closest === 'function' && el.closest('.xterm')) return
+  const inTerminal = !!(el && typeof el.closest === 'function' && el.closest('.xterm'))
+
+  // Ctrl+Enter：唤出 / 收起命令输入框（终端聚焦时也要生效，否则写完命令还得找鼠标）
+  if (e.key === 'Enter' && !e.shiftKey) {
+    if (!currentTab.value) return
+    // 焦点已在输入框内时不要抢：那里 Enter 是“发送”，由 onCommandBarKeydown 处理
+    if ((e.target as HTMLElement | null)?.tagName === 'TEXTAREA') return
+    e.preventDefault()
+    if (commandBarOpen.value) closeCommandBar()
+    else openCommandBar()
+    return
+  }
+
+  // Ctrl+Tab / Ctrl+Shift+Tab 切换终端标签（终端内用户的肌肉记忆）
+  if (e.key === 'Tab' && props.tabs.length > 1) {
+    e.preventDefault()
+    const total = props.tabs.length
+    const next = (props.activeTabIndex + (e.shiftKey ? -1 : 1) + total) % total
+    emit('switch-tab', next)
+    return
+  }
+
+  // Ctrl+1..9 直达第 N 个终端标签
+  if (!e.shiftKey && /^[1-9]$/.test(e.key)) {
+    const index = Number(e.key) - 1
+    if (index < props.tabs.length) {
+      e.preventDefault()
+      emit('switch-tab', index)
+      return
+    }
+  }
+
+  if (e.shiftKey || e.key.toLowerCase() !== 'f') return
+  if (inTerminal) return
   if (!currentSession.value) return
   e.preventDefault()
   openSearch()
@@ -1460,6 +1699,39 @@ watch(suggestBarVisible, async () => {
 // 高亮开关：立即同步到所有终端
 watch(() => highlightSettings.enabled, (enabled) => {
   for (const session of sessions.values()) session.highlight.setEnabled(enabled)
+})
+
+// 终端外观设置：改动即时应用到所有已打开实例，无需重开会话
+watch(
+  () => settings.terminal,
+  (term) => {
+    const theme = currentTerminalTheme().theme
+    for (const session of sessions.values()) {
+      session.term.options.fontFamily = term.fontFamily
+      session.term.options.fontSize = term.fontSize
+      session.term.options.lineHeight = term.lineHeight
+      session.term.options.cursorStyle = term.cursorStyle
+      session.term.options.cursorBlink = term.cursorBlink
+      session.term.options.theme = theme
+      session.fit.fit()
+    }
+    termSize.value = currentSession.value
+      ? { cols: currentSession.value.term.cols, rows: currentSession.value.term.rows }
+      : termSize.value
+  },
+  { deep: true }
+)
+
+// 命令输入框显隐会改变终端可用高度，必须重新 fit，否则行列数会与实际不符
+watch(commandBarOpen, async () => {
+  await nextTick()
+  fitActive()
+})
+
+// 关闭命令输入框时把草稿清掉，避免切到另一台主机后误发上一条命令
+watch(() => props.activeTabIndex, () => {
+  commandDraft.value = ''
+  historyIndex.value = -1
 })
 
 // 规则 / 配色 / 概览条变化：防抖后重建，避免正则输入时每键一次全量重扫
@@ -1502,6 +1774,7 @@ defineExpose({
   clearTerminal: clearCurrentTerminal,
   getCurrentCwd,
   fit: fitActive,
-  focus: focusActive
+  focus: focusActive,
+  openCommandBar
 })
 </script>

@@ -87,6 +87,17 @@
           </span>
           <kbd class="text-[10px] font-mono text-slate-500">Ctrl + T</kbd>
         </div>
+
+        <div
+          @click="$emit('action', 'open-settings'); $emit('close')"
+          class="flex items-center justify-between px-3 py-2 rounded-lg hover:bg-surface-elevated text-xs text-slate-200 cursor-pointer"
+        >
+          <span class="flex items-center gap-2">
+            <Settings class="w-3.5 h-3.5 text-slate-400" />
+            <span>设置中心（终端外观 / 片段 / 分组）</span>
+          </span>
+          <kbd class="text-[10px] font-mono text-slate-500">Ctrl + ,</kbd>
+        </div>
       </div>
     </div>
   </div>
@@ -94,7 +105,7 @@
 
 <script setup lang="ts">
 import { ref, computed, watch, nextTick, onMounted, onBeforeUnmount } from 'vue'
-import { Search, Terminal, PlusCircle, ArrowUpDown, History, Zap } from 'lucide-vue-next'
+import { Search, Terminal, PlusCircle, ArrowUpDown, History, Zap, Settings } from 'lucide-vue-next'
 import type { HostItem } from '@/types'
 
 const props = defineProps<{

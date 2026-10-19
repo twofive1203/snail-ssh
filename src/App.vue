@@ -11,7 +11,7 @@
       @open-palette="paletteOpen = true"
       @toggle-transfers="transfersOpen = !transfersOpen"
       @open-new-host="openNewHostModal"
-      @open-settings="triggerToast('设置中心尚未实现', 'info')"
+      @open-settings="openSettings()"
       @close-window="handleCloseWindow"
     />
 
@@ -30,10 +30,9 @@
           @switch-view="handleSidebarSwitchView"
           @filter-group="val => selectedGroup = val"
           @connect-host="handleConnectSsh"
-          @add-group="triggerToast('自定义分组尚未实现', 'info')"
           @open-vault="triggerToast('SSH 密钥保险箱尚未实现', 'info')"
-          @open-snippets="triggerToast('命令片段库尚未实现', 'info')"
           @open-tunnels="triggerToast('端口转发隧道尚未实现', 'info')"
+          @open-settings="openSettings"
         />
 
         <!-- 主机资产管理视图 -->
@@ -122,6 +121,14 @@
     <!-- 弹窗 4: 应用内确认 / 文本输入（替代原生 confirm / prompt） -->
     <DialogHost />
 
+    <!-- 弹窗 5: 设置中心（终端外观 / 片段 / 书签 / 分组 / 快捷键） -->
+    <SettingsModal
+      :open="settingsOpen"
+      :initial-tab="settingsTab"
+      @close="settingsOpen = false"
+      @toast="triggerToast"
+    />
+
     <!-- 拖拽上传：全屏目标高亮 + 跟随鼠标的提示标签（pointer-events-none 不干扰命中判定） -->
     <div
       v-if="dragActive && dragTargetDir"
@@ -158,9 +165,11 @@ import CommandPalette from '@/components/CommandPalette.vue'
 import HostModal from '@/components/HostModal.vue'
 import EditorModal from '@/components/EditorModal.vue'
 import DialogHost from '@/components/DialogHost.vue'
+import SettingsModal from '@/components/SettingsModal.vue'
 import Toast from '@/components/Toast.vue'
 import { confirmDialog, promptDialog, dialogState } from '@/composables/useDialog'
 import { useRecentHosts, MAX_RECENT_DISPLAY } from '@/composables/useRecentHosts'
+import { loadSettings, groupById } from '@/composables/useAppSettings'
 import type { FileDragDropEvent, HostItem, HostSession, SftpFileItem, TransferContext, TransferTask, ToastMessage } from '@/types'
 import {
   getHostsApi,
@@ -241,6 +250,8 @@ const editingHost = ref<HostItem | null>(null)
 const editorOpen = ref(false)
 const editingFilePath = ref('')
 const currentEditingSessionId = ref('')
+const settingsOpen = ref(false)
+const settingsTab = ref<string | undefined>(undefined)
 
 // Toast 状态
 const toastList = ref<ToastMessage[]>([])
@@ -627,11 +638,17 @@ const handleSaveHost = async (host: HostItem) => {
 }
 
 const handleDeleteHost = async (host: HostItem) => {
+  const group = groupById(host.group)
   const confirmed = await confirmDialog({
     title: '删除服务器',
     variant: 'danger',
-    message: `确定要删除服务器 ${host.name} 吗？`,
-    detail: `${host.username}@${host.host}:${host.port}\n保存在系统钥匙串中的密码 / 私钥也会一并删除。`,
+    message: group.danger
+      ? `确定要从高风险分组「${group.label}」删除服务器 ${host.name} 吗？`
+      : `确定要删除服务器 ${host.name} 吗？`,
+    detail:
+      `${host.username}@${host.host}:${host.port}\n` +
+      '保存在系统钥匙串中的密码 / 私钥也会一并删除。\n\n' +
+      (group.danger ? '注意：这是生产等高危分组，删除后需重新录入凭证才能恢复。' : '此操作不可撤销。'),
     confirmText: '删除',
     cancelText: '取消'
   })
@@ -933,6 +950,13 @@ const handlePaletteAction = (act: string) => {
   if (act === 'new-host') openNewHostModal()
   if (act === 'quick-connect') openQuickConnect()
   if (act === 'toggle-transfers') transfersOpen.value = !transfersOpen.value
+  if (act === 'open-settings') openSettings()
+}
+
+/** 打开设置中心；`tab` 可直接定位到某个分区（侧边栏入口用） */
+const openSettings = (tab?: string) => {
+  settingsTab.value = tab
+  settingsOpen.value = true
 }
 
 const isTerminalOrEditorTarget = (target: EventTarget | null): boolean => {
@@ -966,16 +990,23 @@ const setupGlobalKeybindings = () => {
       e.preventDefault()
       transfersOpen.value = !transfersOpen.value
     }
+    // Ctrl+, 是设置中心的通用约定（VS Code / 浏览器 / 各编辑器一致）
+    if (e.key === ',') {
+      e.preventDefault()
+      openSettings()
+    }
   })
 }
 
 onMounted(async () => {
+  // 设置要先于主机列表加载：分组颜色/名称参与首屏渲染，晚到会闪一下默认值
+  await loadSettings()
   await loadHosts()
   setupGlobalKeybindings()
   if (isTauri()) {
     dragUnlisten = await onFileDragDrop(handleFileDragEvent)
   }
-  triggerToast('SnailSSH 桌面客户端已就绪！支持 Ctrl+K 全局搜索', 'success')
+  triggerToast('SnailSSH 桌面客户端已就绪！支持 Ctrl+K 全局搜索、Ctrl+, 设置中心', 'success')
 })
 
 onBeforeUnmount(() => {

@@ -1,4 +1,5 @@
 mod history;
+mod settings;
 mod sftp;
 mod ssh;
 mod storage;
@@ -7,6 +8,7 @@ mod transfer;
 use history::HistoryEntry;
 use parking_lot::Mutex as ParkingMutex;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sftp::SftpFileItem;
 use ssh::{ConnectionTestResult, HostProbeResult, RemoteSystemMetrics, SshConnectConfig, SshManager};
 use std::sync::Arc;
@@ -74,6 +76,19 @@ fn save_host(host: HostItem) -> Result<(), String> {
 #[tauri::command]
 fn delete_host(id: String) -> Result<(), String> {
     storage::delete_host(&id)
+}
+
+// ==========================================
+// 应用设置（终端字体/主题、片段、书签、分组）
+// ==========================================
+#[tauri::command]
+fn get_settings() -> Option<Value> {
+    settings::load_settings()
+}
+
+#[tauri::command]
+fn save_settings(settings: Value) -> Result<(), String> {
+    settings::save_settings(&settings)
 }
 
 // ==========================================
@@ -562,6 +577,8 @@ pub fn run() {
             get_hosts,
             save_host,
             delete_host,
+            get_settings,
+            save_settings,
             create_ssh_session,
             write_ssh_session,
             resize_ssh_session,

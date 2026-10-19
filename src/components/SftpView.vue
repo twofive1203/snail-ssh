@@ -15,7 +15,7 @@
             @click="showHostDropdown = !showHostDropdown"
             class="flex items-center gap-2 px-2.5 py-1 rounded-lg bg-surface-card border border-surface-border hover:border-brand-500/40 text-xs font-mono text-slate-200"
           >
-            <span class="w-2 h-2 rounded-full bg-emerald-400"></span>
+            <span class="w-2 h-2 rounded-full" :class="groupColorOf(groupById(currentHost?.group || '').color).dot"></span>
             <span>{{ currentHost?.name || '选择服务器' }}</span>
             <ChevronDown class="w-3 h-3 text-slate-400" />
           </button>
@@ -332,6 +332,7 @@ import {
   sftpStatApi
 } from '@/api/tauri'
 import { confirmDialog, promptDialog } from '@/composables/useDialog'
+import { groupById, groupColorOf } from '@/composables/useAppSettings'
 import ContextMenu from '@/components/ContextMenu.vue'
 import {
   Folder,
@@ -588,13 +589,18 @@ const deleteSelected = async () => {
   if (targets.length === 0) return
   const label = targets.length === 1 ? targets[0].name : `${targets.length} 项`
   const hasDir = targets.some(t => t.isDir)
+  const group = groupById(props.currentHost?.group || '')
   const confirmed = await confirmDialog({
     title: '删除远端文件',
     variant: 'danger',
-    message: `确定要删除 ${label} 吗？此操作不可撤销。`,
-    detail: hasDir
-      ? `其中包含目录，目录内的所有内容都会被递归删除。\n\n${targets.map(t => t.name + (t.isDir ? '/' : '')).join('\n')}`
-      : currentPath.value,
+    message: group.danger
+      ? `确定要在高风险环境「${group.label}」删除 ${label} 吗？此操作不可撤销。`
+      : `确定要删除 ${label} 吗？此操作不可撤销。`,
+    detail:
+      (hasDir
+        ? `其中包含目录，目录内的所有内容都会被递归删除。\n\n${targets.map(t => t.name + (t.isDir ? '/' : '')).join('\n')}`
+        : currentPath.value) +
+      (group.danger ? `\n\n主机：${props.currentHost?.username}@${props.currentHost?.host}:${props.currentHost?.port}` : ''),
     confirmText: '删除',
     cancelText: '取消'
   })
@@ -621,10 +627,13 @@ const handleDelete = async (file: SftpFileItem) => {
     emit('toast', '尚未建立 SSH 会话，无法删除', 'warning')
     return
   }
+  const group = groupById(props.currentHost?.group || '')
   const confirmed = await confirmDialog({
     title: file.isDir ? '删除远端目录' : '删除远端文件',
     variant: 'danger',
-    message: `确定要删除 ${file.name} 吗？此操作不可撤销。`,
+    message: group.danger
+      ? `确定要在高风险环境「${group.label}」删除 ${file.name} 吗？此操作不可撤销。`
+      : `确定要删除 ${file.name} 吗？此操作不可撤销。`,
     detail: file.isDir
       ? `目录内的所有内容都会被递归删除。\n\n${joinPath(currentPath.value, file.name)}`
       : joinPath(currentPath.value, file.name),

@@ -191,3 +191,52 @@ export interface ToastMessage {
   text: string
   type: 'info' | 'success' | 'warning' | 'error'
 }
+
+// ==========================================
+// 应用设置（~/.snail-ssh/settings.json）
+// ==========================================
+
+/** 终端外观设置：改动即时应用到所有已打开终端 */
+export interface TerminalSettings {
+  fontFamily: string
+  fontSize: number
+  lineHeight: number
+  cursorStyle: 'block' | 'underline' | 'bar'
+  cursorBlink: boolean
+  /** 内置配色预设 id，见 composables/useAppSettings.ts 的 TERMINAL_THEMES */
+  themeId: string
+}
+
+/** 常用指令片段：终端工具栏与命令面板共用 */
+export interface SnippetItem {
+  id: string
+  label: string
+  /** 发送到终端的原始文本，末尾是否带换行由内容决定 */
+  cmd: string
+}
+
+/** SFTP 常用目录书签 */
+export interface BookmarkItem {
+  id: string
+  label: string
+  path: string
+}
+
+/** 主机分组：颜色用于标签页/工作区环境标识，danger 触发危险命令确认 */
+export interface HostGroupItem {
+  id: string
+  label: string
+  /** 调色板 key，见 GROUP_COLORS */
+  color: string
+  /** 生产等高风险环境：危险命令发送前二次确认 */
+  danger?: boolean
+}
+
+export interface AppSettings {
+  terminal: TerminalSettings
+  snippets: SnippetItem[]
+  bookmarks: BookmarkItem[]
+  groups: HostGroupItem[]
+  /** 底部独立命令输入框（对标 Xshell Compose Bar / FinalShell 命令输入框） */
+  commandBarEnabled: boolean
+}

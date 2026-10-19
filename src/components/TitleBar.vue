@@ -38,7 +38,12 @@
         :class="activeSessionId === s.id ? 'bg-[#1a202c] text-emerald-400 font-semibold border border-brand-500/30 shadow-sm' : 'text-slate-400 hover:text-white hover:bg-surface-card/60 border border-transparent'"
         class="group flex items-center gap-2 px-2.5 py-1 rounded-md text-xs font-mono cursor-pointer transition-all shrink-0 max-w-[190px]"
       >
-        <span class="w-2 h-2 rounded-full bg-emerald-400 shrink-0" :class="{ 'animate-pulse': activeSessionId === s.id }"></span>
+        <!-- 环境色点：与终端标签、文件工作区保持一致 -->
+        <span
+          class="w-2 h-2 rounded-full shrink-0"
+          :class="[groupColorOf(groupById(s.host.group).color).dot, activeSessionId === s.id ? 'animate-pulse' : '']"
+          :title="groupById(s.host.group).label"
+        ></span>
         <span class="truncate">{{ s.title }}</span>
         <button
           @click.stop="$emit('close-session', s.id)"
@@ -161,6 +166,7 @@ import {
   Square
 } from 'lucide-vue-next'
 import { isTauri } from '@/api/tauri'
+import { groupById, groupColorOf } from '@/composables/useAppSettings'
 import type { HostSession } from '@/types'
 
 withDefaults(

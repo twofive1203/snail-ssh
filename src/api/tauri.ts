@@ -3,6 +3,7 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { open as openDialog, save as saveDialog } from '@tauri-apps/plugin-dialog'
 import { getCurrentWebview } from '@tauri-apps/api/webview'
 import type {
+  AppSettings,
   CommandHistoryEntry,
   ConnectionTestResult,
   FileDragDropEvent,
@@ -185,6 +186,21 @@ export async function deleteHostApi(id: string): Promise<void> {
   const list = await getHostsApi()
   const filtered = list.filter(h => h.id !== id)
   localStorage.setItem(MOCK_STORAGE_KEY, JSON.stringify(filtered))
+}
+
+// ==========================================
+// 应用设置（~/.snail-ssh/settings.json）
+// ==========================================
+/** 读取设置；桌面端文件不存在时返回 null，由前端使用默认值 */
+export async function getSettingsApi(): Promise<Partial<AppSettings> | null> {
+  if (!isTauri()) return null
+  return await invoke<Partial<AppSettings> | null>('get_settings')
+}
+
+/** 整块覆盖写入设置（后端只做 JSON 安全落盘，结构由前端约束） */
+export async function saveSettingsApi(settings: AppSettings): Promise<void> {
+  if (!isTauri()) return
+  await invoke('save_settings', { settings })
 }
 
 // ==========================================

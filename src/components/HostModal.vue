@@ -53,9 +53,9 @@
               v-model="form.group"
               class="w-full bg-surface-card border border-surface-border rounded-lg px-3 py-2 text-xs text-white focus:outline-none focus:border-brand-500 transition-colors font-mono"
             >
-              <option value="production">生产集群 (Production)</option>
-              <option value="staging">测试环境 (Staging)</option>
-              <option value="cloud">个人 VPS & 实验机</option>
+              <option v-for="g in settings.groups" :key="g.id" :value="g.id">{{ g.label }}</option>
+              <!-- 旧配置里的分组已不在设置中心时，保留原值避免保存时被静默改写 -->
+              <option v-if="legacyGroup" :value="form.group">{{ form.group }}（未登记）</option>
             </select>
           </div>
         </div>
@@ -196,6 +196,7 @@ import { Server, X } from 'lucide-vue-next'
 import type { HostItem, AuthType } from '@/types'
 import { testSshConnectionApi, isTauri } from '@/api/tauri'
 import { confirmDialog, dialogState } from '@/composables/useDialog'
+import { settings } from '@/composables/useAppSettings'
 
 const props = defineProps<{
   open: boolean
@@ -215,6 +216,11 @@ const isEditing = ref(false)
 const isQuick = computed(() => props.mode === 'quick')
 const tagInput = ref('')
 const testing = ref(false)
+
+/** 当前选中的分组不在设置里时，下拉里要额外提供一个原值选项 */
+
+/** 新主机的默认分组：取设置里的第一个分组，不硬编码 production */
+const defaultGroupId = () => settings.groups[0]?.id || 'production'
 
 const form = ref<{
   id: string
@@ -237,8 +243,12 @@ const form = ref<{
   password: '',
   privateKey: '',
   passphrase: '',
-  group: 'production'
+  group: defaultGroupId()
 })
+
+const legacyGroup = computed(() =>
+  !!form.value.group && !settings.groups.some(g => g.id === form.value.group)
+)
 
 watch(() => props.open, (val) => {
   if (val) {
@@ -255,7 +265,7 @@ watch(() => props.open, (val) => {
         password: '',
         privateKey: '',
         passphrase: '',
-        group: 'production'
+        group: defaultGroupId()
       }
       tagInput.value = ''
       return
@@ -276,7 +286,7 @@ watch(() => props.open, (val) => {
         password: '',
         privateKey: '',
         passphrase: '',
-        group: 'production'
+        group: defaultGroupId()
       }
       tagInput.value = 'Ubuntu, prod'
     }
