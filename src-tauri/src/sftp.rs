@@ -249,14 +249,82 @@ fn remove_path_recursive(sftp: &ssh2::Sftp, path: &Path) -> Result<(), String> {
     sftp.rmdir(path).map_err(|e| format!("删除目录失败: {}", e))
 }
 
-/// 远端登录用户的家目录，用作用户进入 SFTP 视图时的默认位置
+/// 家目录探测超时。SFTP 会话默认 30s，这里收短，避免打开文件区时被登录脚本卡住。
+const HOME_PROBE_TIMEOUT_MS: u32 = 5_000;
+const SFTP_SESSION_TIMEOUT_MS: u32 = 30_000;
+
+/// 远端登录用户的家目录，用作文件工作区 / SFTP 视图的默认位置。
+///
+/// 优先读登录环境的 `$HOME`（并确认 SFTP 能访问该目录）。
+/// 仅 SFTP、受限 shell 无法 exec 时，回退为子系统当前目录（OpenSSH 通常也是家目录，但部分服务端会停在 `/`）。
 pub fn sftp_home_dir(session_arc: Arc<Mutex<ssh2::Session>>) -> Result<String, String> {
     let sess = session_arc.lock();
+    if let Some(home) = probe_login_home(&sess) {
+        if let Ok(sftp) = sess.sftp() {
+            if let Some(dir) = canonical_dir(&sftp, &home) {
+                return Ok(dir);
+            }
+        }
+    }
     let sftp = sess.sftp().map_err(|e| e.to_string())?;
-    let home = sftp
+    let cwd = sftp
         .realpath(Path::new("."))
         .map_err(|e| format!("获取远端家目录失败: {}", e))?;
-    Ok(home.to_string_lossy().to_string())
+    Ok(cwd.to_string_lossy().to_string())
+}
+
+/// 在同一条 SSH 连接上开瞬态 exec，读登录环境的 `$HOME`。
+/// 失败返回 None，由调用方回退，不把文件区打开卡死。
+fn probe_login_home(sess: &ssh2::Session) -> Option<String> {
+    sess.set_timeout(HOME_PROBE_TIMEOUT_MS);
+    let parsed = (|| {
+        let mut channel = sess.channel_session().ok()?;
+        // 标记行：避免登录横幅或包装脚本把其它输出混进 stdout
+        channel
+            .exec("printf 'SNAIL_HOME:%s\n' \"$HOME\"")
+            .ok()?;
+        let mut output = String::new();
+        // 超时也尽量解已经读到的标记行
+        let _ = channel.read_to_string(&mut output);
+        let _ = channel.close();
+        let _ = channel.wait_close();
+        parse_home_marker(&output)
+    })();
+    sess.set_timeout(SFTP_SESSION_TIMEOUT_MS);
+    parsed
+}
+
+fn parse_home_marker(output: &str) -> Option<String> {
+    for line in output.lines() {
+        let line = line.trim();
+        let Some(rest) = line.strip_prefix("SNAIL_HOME:") else {
+            continue;
+        };
+        let home = rest.trim();
+        if home.starts_with('/') && !home.contains('\0') {
+            return Some(home.to_string());
+        }
+    }
+    None
+}
+
+/// 把候选路径规范化，并确认它是 SFTP 可见的目录。
+fn canonical_dir(sftp: &ssh2::Sftp, path: &str) -> Option<String> {
+    if !path.starts_with('/') {
+        return None;
+    }
+    let canon = sftp
+        .realpath(Path::new(path))
+        .ok()
+        .map(|p| p.to_string_lossy().to_string())
+        .filter(|p| p.starts_with('/'))
+        .unwrap_or_else(|| path.to_string());
+    let stat = sftp.stat(Path::new(&canon)).ok()?;
+    if stat.is_dir() {
+        Some(canon)
+    } else {
+        None
+    }
 }
 
 /// 由 SFTP 条目统计信息构造列表项（read_dir / stat 共用同一套格式化规则）
@@ -990,7 +1058,7 @@ fn is_editable_file(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::is_editable_file;
+    use super::{is_editable_file, parse_home_marker};
 
     #[test]
     fn editable_common_configs() {
@@ -1004,5 +1072,20 @@ mod tests {
         assert!(is_editable_file("app.service"));
         assert!(!is_editable_file("backup.tar.gz"));
         assert!(!is_editable_file("ssl-bundle.crt"));
+    }
+
+    #[test]
+    fn home_marker_ignores_banner_and_relative_paths() {
+        assert_eq!(
+            parse_home_marker("SNAIL_HOME:/home/demo\n"),
+            Some("/home/demo".into())
+        );
+        assert_eq!(
+            parse_home_marker("Last login\nSNAIL_HOME:/root\n"),
+            Some("/root".into())
+        );
+        assert_eq!(parse_home_marker("SNAIL_HOME:\n"), None);
+        assert_eq!(parse_home_marker("SNAIL_HOME:relative\n"), None);
+        assert_eq!(parse_home_marker("not a marker\n"), None);
     }
 }

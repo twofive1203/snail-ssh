@@ -169,7 +169,7 @@ import SettingsModal from '@/components/SettingsModal.vue'
 import Toast from '@/components/Toast.vue'
 import { confirmDialog, promptDialog, dialogState } from '@/composables/useDialog'
 import { useRecentHosts, MAX_RECENT_DISPLAY } from '@/composables/useRecentHosts'
-import { loadSettings, groupById } from '@/composables/useAppSettings'
+import { loadSettings, groupById, settings } from '@/composables/useAppSettings'
 import type { FileDragDropEvent, HostItem, HostSession, SftpFileItem, TransferContext, TransferTask, ToastMessage } from '@/types'
 import {
   getHostsApi,
@@ -229,10 +229,11 @@ const demoSession: HostSession = {
   ],
   activeTerminalIndex: 0,
   sftpSessionId: 'session-demo-144',
-  currentPath: '/root',
+  currentPath: '~',
   sidebarCollapsed: false,
   sidebarWidth: 280,
-  viewMode: 'tree'
+  viewMode: 'list',
+  remoteMonitorOpen: true
 }
 
 const sessions = ref<HostSession[]>(isTauri() ? [] : [demoSession])
@@ -452,12 +453,13 @@ const handleConnectSsh = async (host: HostItem) => {
     ],
     activeTerminalIndex: 0,
     sftpSessionId: sessionId,
-    currentPath: '/root',
+    currentPath: '~',
     sidebarCollapsed: false,
     sidebarWidth: 280,
-    viewMode: 'tree',
+    viewMode: 'list',
     // 目录跟随已下移到终端标签页维度（TerminalTab.autoFollowTerminal）
-    remoteMonitorOpen: false
+    // 底部监控条是否默认展开由设置中心控制（默认开），关闭后仍可从文件树工具栏单独开启
+    remoteMonitorOpen: settings.remoteMonitorEnabled
   }
 
   sessions.value.push(newSession)
@@ -851,8 +853,10 @@ const resolveDropTarget = (x: number, y: number): { dir: string | null; sessionI
     ? (el.closest('[data-drop-target="sftp"]') as HTMLElement | null)
     : null
   if (!target) return { dir: null, sessionId: '' }
+  // 家目录尚未解析完时路径为空，不能当成根目录 `/` 接收拖放
+  const rawDir = target.getAttribute('data-remote-path') || ''
   return {
-    dir: target.getAttribute('data-remote-path') || '/',
+    dir: rawDir.startsWith('/') ? rawDir : null,
     sessionId: target.getAttribute('data-session-id') || ''
   }
 }

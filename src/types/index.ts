@@ -239,4 +239,8 @@ export interface AppSettings {
   groups: HostGroupItem[]
   /** 底部独立命令输入框（对标 Xshell Compose Bar / FinalShell 命令输入框） */
   commandBarEnabled: boolean
+  /** 历史补全：开启后终端底部固定留一行，避免候选显隐把终端高度挤来挤去 */
+  historySuggestEnabled: boolean
+  /** 新建会话时默认展开底部远程监控条；关闭后仍可从文件树工具栏按会话手动开启 */
+  remoteMonitorEnabled: boolean
 }

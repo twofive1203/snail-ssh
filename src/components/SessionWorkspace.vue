@@ -19,6 +19,8 @@
         :remote-monitor-open="session.remoteMonitorOpen || false"
         :terminal-cwd="currentActiveTabCwd"
         :group-id="session.host.group"
+        :initial-path="session.currentPath || '~'"
+        @update:current-path="(path) => (session.currentPath = path)"
         @update:auto-follow="setActiveFollow"
         @toggle-remote-monitor="handleToggleRemoteMonitor"
         @manual-sync="handleManualSync"

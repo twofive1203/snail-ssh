@@ -193,7 +193,9 @@ export const defaultSettings = (): AppSettings => ({
   snippets: DEFAULT_SNIPPETS.map(s => ({ ...s })),
   bookmarks: DEFAULT_BOOKMARKS.map(b => ({ ...b })),
   groups: DEFAULT_GROUPS.map(g => ({ ...g })),
-  commandBarEnabled: true
+  commandBarEnabled: true,
+  historySuggestEnabled: true,
+  remoteMonitorEnabled: true
 })
 
 const STORAGE_KEY = 'snail_ssh_app_settings_v1'
@@ -245,7 +247,9 @@ export const normalizeSettings = (raw: any): AppSettings => {
             danger: !!g.danger
           }))
       : base.groups,
-    commandBarEnabled: typeof raw.commandBarEnabled === 'boolean' ? raw.commandBarEnabled : base.commandBarEnabled
+    commandBarEnabled: typeof raw.commandBarEnabled === 'boolean' ? raw.commandBarEnabled : base.commandBarEnabled,
+    historySuggestEnabled: typeof raw.historySuggestEnabled === 'boolean' ? raw.historySuggestEnabled : base.historySuggestEnabled,
+    remoteMonitorEnabled: typeof raw.remoteMonitorEnabled === 'boolean' ? raw.remoteMonitorEnabled : base.remoteMonitorEnabled
   }
 }
 
@@ -262,6 +266,8 @@ const applySettings = (next: AppSettings) => {
   settings.bookmarks = next.bookmarks
   settings.groups = next.groups
   settings.commandBarEnabled = next.commandBarEnabled
+  settings.historySuggestEnabled = next.historySuggestEnabled
+  settings.remoteMonitorEnabled = next.remoteMonitorEnabled
   // 同步 watch 在下一个 tick 才跑，这里用微任务兜底恢复标志，避免漏掉用户紧接的修改
   void Promise.resolve().then(() => { applying = false })
 }

@@ -177,7 +177,6 @@
     <!-- 真实 xterm.js 容器：每个标签页一个独立实例，切换不丢回显 -->
     <div
       class="flex-1 w-full h-full relative overflow-hidden bg-[#0c0e14] p-2"
-      :class="suggestBarVisible ? 'pb-9' : ''"
     >
       <!-- 终端内搜索条 (Ctrl+F)：贴在容器右上角，不抢占终端焦点 -->
       <div
@@ -266,7 +265,13 @@
         @contextmenu.prevent="openTermMenu($event)"
       ></div>
 
-      <!-- 命令历史联想补全条：贴底浮动，容器动态预留底部高度避免遮挡最后一行 -->
+    </div>
+
+    <!-- 历史补全固定占一行：候选显隐只换内容，不再改变终端高度、也不再 fit / 通知远端改窗口 -->
+    <div
+      v-if="settings.historySuggestEnabled"
+      class="shrink-0 h-8 border-t border-surface-border/60 bg-[#0c0e14] px-3 flex items-center"
+    >
       <CommandSuggestBar
         :candidates="suggestCandidates"
         :active-index="suggestIndex"
@@ -575,6 +580,10 @@ const computeCandidates = (hostKey: string, input: string): string[] => {
 }
 
 const updateSuggestions = (tab: TerminalTab, lineBuffer: string) => {
+  if (!settings.historySuggestEnabled) {
+    if (suggestTabId.value === tab.id) closeSuggestions()
+    return
+  }
   const candidates = computeCandidates(hostKeyFor(tab), lineBuffer)
   if (candidates.length === 0) {
     if (suggestTabId.value === tab.id) closeSuggestions()
@@ -1692,8 +1701,9 @@ watch(() => props.activeTabIndex, async () => {
   fitActive()
 })
 
-// 候选条占用底部一行高度，显隐后必须重新 fit，否则 xterm 行列数会与实际不符
-watch(suggestBarVisible, async () => {
+// 开关历史补全会增减底部固定行，只在这一次重新 fit；候选显隐不再改行列
+watch(() => settings.historySuggestEnabled, async (enabled) => {
+  if (!enabled) closeSuggestions()
   await nextTick()
   fitActive()
 })

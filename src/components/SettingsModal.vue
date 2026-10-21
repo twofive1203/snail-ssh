@@ -145,6 +145,26 @@
                   </span>
                 </span>
               </label>
+              <label class="flex items-start gap-2.5 cursor-pointer">
+                <input v-model="settings.historySuggestEnabled" type="checkbox" class="accent-emerald-500 mt-0.5" />
+                <span>
+                  <span class="text-xs text-slate-200 block">显示历史补全</span>
+                  <span class="text-[10px] text-slate-500 block leading-relaxed">
+                    开启后终端底部固定留出一行，输入时在该行显示历史候选，不再把终端内容挤上挤下。
+                    关闭后不显示，也不拦截 <span class="font-mono">Tab</span> / 方向键。
+                  </span>
+                </span>
+              </label>
+              <label class="flex items-start gap-2.5 cursor-pointer">
+                <input v-model="settings.remoteMonitorEnabled" type="checkbox" class="accent-emerald-500 mt-0.5" />
+                <span>
+                  <span class="text-xs text-slate-200 block">新建会话默认展开远程监控条</span>
+                  <span class="text-[10px] text-slate-500 block leading-relaxed">
+                    开启后连接主机时自动在工作区底部显示 CPU / 内存 / 网速 / 磁盘指标栏（每 2.5 秒采样一次）。
+                    只影响之后新建的会话；已打开的会话可用文件树工具栏的监控按钮或信息栏右侧红点单独开关。
+                  </span>
+                </span>
+              </label>
             </section>
           </template>
 

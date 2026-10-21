@@ -2,7 +2,7 @@
   <div
     class="h-full flex flex-col bg-surface-sidebar border-r border-surface-border overflow-hidden select-none"
     data-drop-target="sftp"
-    :data-remote-path="currentPath"
+    :data-remote-path="pathReady ? currentPath : ''"
     :data-session-id="sessionId"
   >
     <!-- 1. 顶部工作区标头栏 (仿现代化标签与窗格控制) -->
@@ -147,7 +147,10 @@
     <!-- 3. 路径面包屑导航栏 -->
     <div class="h-8 bg-[#0c0e14]/70 border-b border-surface-border/60 px-2 flex items-center gap-1 shrink-0 text-xs font-mono">
       <span class="text-[11px] text-brand-400 font-bold shrink-0">2x</span>
-      <div v-if="!editingPathInput" class="flex items-center gap-1 overflow-x-auto no-scrollbar flex-1">
+      <div v-if="!editingPathInput && !pathReady" class="flex-1 text-[11px] text-slate-500 truncate">
+        {{ initialPath === '~' || !initialPath ? '正在打开家目录...' : '正在打开目录...' }}
+      </div>
+      <div v-else-if="!editingPathInput" class="flex items-center gap-1 overflow-x-auto no-scrollbar flex-1">
         <span
           @click="jumpToPath('/')"
           class="px-1 py-0.5 rounded text-slate-400 hover:text-white hover:bg-surface-elevated cursor-pointer"
@@ -377,12 +380,15 @@ const props = withDefaults(
     remoteMonitorOpen?: boolean
     /** 所属分组 id：用于环境色标识与高风险删除确认 */
     groupId?: string
+    /** 会话记下的目录。新会话为 `~`，折叠侧边栏再展开时用来恢复，而不是重新停在根目录 */
+    initialPath?: string
   }>(),
   {
     terminalCwd: '',
     autoFollow: false,
     remoteMonitorOpen: false,
-    groupId: ''
+    groupId: '',
+    initialPath: '~'
   }
 )
 
@@ -396,6 +402,7 @@ const emit = defineEmits<{
   (e: 'update:autoFollow', val: boolean): void
   (e: 'toggle-remote-monitor'): void
   (e: 'manual-sync'): void
+  (e: 'update:currentPath', path: string): void
 }>()
 
 // 只上报一次翻转意图；父组件负责改状态，避免重复取反回到原点
@@ -403,11 +410,13 @@ const toggleRemoteMonitor = () => {
   emit('toggle-remote-monitor')
 }
 
-const viewMode = ref<'tree' | 'list'>('tree')
+const viewMode = ref<'tree' | 'list'>('list')
+// 首次列目录完成前不响应刷新信号，避免用尚未替换的 `/` 覆盖家目录
+const pathReady = ref(false)
 const currentPath = ref('/')
 const selectedPath = ref('')
 const selectedNode = ref<FileTreeNode | null>(null)
-const showHidden = ref(false)
+const showHidden = ref(true)
 const loading = ref(false)
 const showBookmarks = ref(false)
 const editingPathInput = ref(false)
@@ -542,21 +551,39 @@ const fetchDirChildren = async (dirPath: string): Promise<FileTreeNode[]> => {
   }
 }
 
-// 初始化加载根目录或指定目录
+/** 展开 `~` / `~/xxx`。家目录探测失败时，纯 `~` 回退到根目录，避免文件区空着。 */
+const expandHome = async (targetPath: string): Promise<string> => {
+  const trimmed = targetPath.trim()
+  if (!props.sessionId) return trimmed || '/'
+  if (trimmed !== '~' && !trimmed.startsWith('~/')) return trimmed || '/'
+  const home = await sftpHomeDirApi(props.sessionId).catch(() => '')
+  if (!home) return trimmed === '~' ? '/' : trimmed
+  if (trimmed === '~') return home
+  const rest = trimmed.slice(2).replace(/^\/+/, '')
+  return rest ? `${home.replace(/\/+$/, '')}/${rest}` : home
+}
+
+// 丢弃过期请求：家目录探测比直接列 `/` 慢，不能让后发的跳转被先发的结果盖掉
+let loadSeq = 0
+
+// 初始化加载家目录或指定目录
 const loadInitialPath = async (targetPath: string) => {
   if (!props.sessionId) return
+  const seq = ++loadSeq
   loading.value = true
   try {
-    let resolved = targetPath
-    if (resolved === '~') {
-      const home = await sftpHomeDirApi(props.sessionId).catch(() => '/')
-      resolved = home || '/'
-    }
+    const resolved = await expandHome(targetPath)
+    if (seq !== loadSeq) return
     currentPath.value = resolved
+    if (resolved.startsWith('/')) emit('update:currentPath', resolved)
     const children = await fetchDirChildren(resolved)
+    if (seq !== loadSeq) return
     rootNodes.value = children
   } finally {
-    loading.value = false
+    if (seq === loadSeq) {
+      loading.value = false
+      pathReady.value = true
+    }
   }
 }
 
@@ -659,11 +686,14 @@ const refreshCurrent = async () => {
 }
 
 const openInTerminal = (path: string) => {
+  // 家目录还没解析完时 currentPath 仍是占位 `/`，不能当成用户要打开的目录
+  if (!pathReady.value || !path.startsWith('/')) return
   emit('open-in-terminal', path)
 }
 
 const triggerUpload = () => {
   const targetDir = selectedNode.value?.isDir ? selectedNode.value.path : currentPath.value
+  if (!pathReady.value || !targetDir.startsWith('/')) return
   emit('upload-trigger', targetDir)
 }
 
@@ -984,9 +1014,9 @@ const downloadSelectedNode = () => {
 watch(
   () => props.sessionId,
   (sid) => {
-    if (sid) {
-      loadInitialPath(currentPath.value)
-    }
+    if (!sid) return
+    // 新会话 initialPath 为 ~；已浏览过的会话带回绝对路径，避免折叠侧边栏后回到根目录
+    loadInitialPath(props.initialPath || '~')
   },
   { immediate: true }
 )
@@ -994,7 +1024,7 @@ watch(
 watch(
   () => props.refreshSignal,
   () => {
-    if (props.sessionId) {
+    if (props.sessionId && pathReady.value) {
       refreshCurrent()
     }
   }
