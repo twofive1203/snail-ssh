@@ -146,7 +146,6 @@
 
     <!-- 3. 路径面包屑导航栏 -->
     <div class="h-8 bg-[#0c0e14]/70 border-b border-surface-border/60 px-2 flex items-center gap-1 shrink-0 text-xs font-mono">
-      <span class="text-[11px] text-brand-400 font-bold shrink-0">2x</span>
       <div v-if="!editingPathInput && !pathReady" class="flex-1 text-[11px] text-slate-500 truncate">
         {{ initialPath === '~' || !initialPath ? '正在打开家目录...' : '正在打开目录...' }}
       </div>
@@ -289,21 +288,22 @@
         </button>
       </div>
 
-      <!-- 右侧当前终端路径预览提示 -->
+      <!-- 右侧当前终端路径提示：仅在与浏览目录不一致时出现，一致时面包屑已表达，不再重复 -->
       <div
-        v-if="terminalCwd"
+        v-if="terminalCwd && terminalCwd !== currentPath"
         class="text-[10px] font-mono text-slate-500 truncate min-w-0 shrink pl-1 hover:text-slate-300 transition-colors"
-        :title="`当前终端路径: ${terminalCwd}`"
+        :title="`终端当前在 ${terminalCwd}，点「同步」可跟随过去`"
       >
         终端: {{ terminalCwd }}
       </div>
     </div>
 
-    <!-- 6. 底部状态栏 -->
+    <!-- 6. 底部状态栏：只承载选中项信息，当前路径由面包屑表达，不再重复 -->
     <div class="h-6 bg-surface-sidebar border-t border-surface-border px-3 flex items-center justify-between text-[10px] font-mono text-slate-500 shrink-0">
-      <span class="truncate max-w-[160px]" :title="selectedNode?.path || currentPath">
-        {{ selectedNode ? selectedNode.name : currentPath }}
+      <span v-if="selectedNode" class="truncate max-w-[160px]" :title="selectedNode.path">
+        {{ selectedNode.name }}
       </span>
+      <span v-else></span>
       <span v-if="selectedNode && !selectedNode.isDir">
         {{ selectedNode.size }} | {{ selectedNode.permissions }}
       </span>
