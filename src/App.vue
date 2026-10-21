@@ -21,7 +21,7 @@
       <div v-show="activeSessionId === 'hosts'" class="flex flex-1 overflow-hidden">
         <!-- 主机分类侧边栏 -->
         <Sidebar
-          active-view="hosts"
+          :active-view="currentActiveView"
           :selected-group="selectedGroup"
           :total-hosts="hosts.length"
           :active-sessions-count="sessions.length"
@@ -41,7 +41,7 @@
             :hosts="hosts"
             :selected-group="selectedGroup"
             @connect-ssh="handleConnectSsh"
-            @connect-sftp="handleConnectSsh"
+            @connect-sftp="handleConnectSftp"
             @edit-host="handleEditHost"
             @delete-host="handleDeleteHost"
             @open-new-host="openNewHostModal"
@@ -50,12 +50,13 @@
         </main>
       </div>
 
-      <!-- 视图 B: 主机会话协同工作区 (左侧树形文件 + 右侧交互终端) -->
+      <!-- 视图 B: 主机会话协同工作区 (左侧树形文件 + 右侧交互终端 / 全屏 SFTP) -->
       <SessionWorkspace
         v-for="s in sessions"
         :key="s.id"
         v-show="s.id === activeSessionId"
         :session="s"
+        :hosts="hosts"
         :is-active="s.id === activeSessionId"
         :refresh-signal="sftpRefreshSignal"
         @switch-terminal-tab="(idx: number) => s.activeTerminalIndex = idx"
@@ -70,7 +71,9 @@
         @session-closed="(tabId: string, reason: string) => handleSessionClosed(s, tabId, reason)"
         @edit-file="handleOpenEditor"
         @download-file="(file: SftpFileItem, path: string) => handleDownloadFile(s, file, path)"
+        @download-files="(refs: RemoteFileRef[]) => handleDownloadFiles(s, refs)"
         @upload-trigger="(dir: string) => handleUploadTrigger(s, dir)"
+        @select-host="handleConnectSsh"
         @toast="triggerToast"
       />
 
@@ -170,7 +173,7 @@ import Toast from '@/components/Toast.vue'
 import { confirmDialog, promptDialog, dialogState } from '@/composables/useDialog'
 import { useRecentHosts, MAX_RECENT_DISPLAY } from '@/composables/useRecentHosts'
 import { loadSettings, groupById, settings } from '@/composables/useAppSettings'
-import type { FileDragDropEvent, HostItem, HostSession, SftpFileItem, TransferContext, TransferTask, ToastMessage } from '@/types'
+import type { FileDragDropEvent, HostItem, HostSession, RemoteFileRef, SftpFileItem, TransferContext, TransferTask, ToastMessage } from '@/types'
 import {
   getHostsApi,
   saveHostApi,
@@ -185,6 +188,7 @@ import {
   onFileDragDrop,
   pickLocalFiles,
   pickSavePath,
+  pickDirectory,
   isTauri
 } from '@/api/tauri'
 
@@ -310,9 +314,31 @@ const handleSelectSession = (sessionId: string) => {
   activeSessionId.value = sessionId
 }
 
+const currentActiveView = computed(() => {
+  if (activeSessionId.value === 'hosts') return 'hosts'
+  const current = sessions.value.find(s => s.id === activeSessionId.value)
+  return current?.workspaceMode === 'sftp' ? 'sftp' : 'terminal'
+})
+
 const handleSidebarSwitchView = (v: string) => {
   if (v === 'hosts') {
     activeSessionId.value = 'hosts'
+  } else if (v === 'terminal') {
+    if (sessions.value.length === 0) {
+      triggerToast('暂无进行中的会话，请先连接一台服务器', 'info')
+      return
+    }
+    const current = sessions.value.find(s => s.id === activeSessionId.value) || sessions.value[0]
+    current.workspaceMode = 'split'
+    activeSessionId.value = current.id
+  } else if (v === 'sftp') {
+    if (sessions.value.length === 0) {
+      triggerToast('暂无进行中的会话，请先连接一台服务器或点击卡片 SFTP', 'info')
+      return
+    }
+    const current = sessions.value.find(s => s.id === activeSessionId.value) || sessions.value[0]
+    current.workspaceMode = 'sftp'
+    activeSessionId.value = current.id
   } else if (sessions.value.length > 0) {
     activeSessionId.value = sessions.value[0].id
   }
@@ -417,17 +443,28 @@ const refreshHostMetrics = async (host: HostItem, sessionId: string) => {
   }
 }
 
-// 连接主机：创建主机会话工作区（左侧文件树 + 右侧交互终端）
-const handleConnectSsh = async (host: HostItem) => {
-  // 如果已存在该主机会话，直接激活
+// 连接主机：支持指定初始工作区模式（'split' 为终端协同分栏，'sftp' 为独立全屏 SFTP）
+const handleConnectHost = async (host: HostItem, mode: 'split' | 'sftp' = 'split') => {
+  // 如果已存在该主机会话，直接激活并切换到指定模式
   const existing = sessions.value.find(s => s.hostId === host.id)
   if (existing) {
+    existing.workspaceMode = mode
     activeSessionId.value = existing.id
-    triggerToast(`已切换至会话: ${existing.title}`, 'info')
+    triggerToast(
+      mode === 'sftp'
+        ? `已切换至 ${existing.title} 的 SFTP 文件管理`
+        : `已切换至会话: ${existing.title}`,
+      'info'
+    )
     return
   }
 
-  triggerToast(`正在建立 SSH 会话至 ${host.name} (${host.host})...`, 'info')
+  triggerToast(
+    mode === 'sftp'
+      ? `正在建立 SFTP 连接至 ${host.name} (${host.host})...`
+      : `正在建立 SSH 会话至 ${host.name} (${host.host})...`,
+    'info'
+  )
 
   let sessionId: string | null = null
   if (isTauri()) {
@@ -459,7 +496,8 @@ const handleConnectSsh = async (host: HostItem) => {
     viewMode: 'list',
     // 目录跟随已下移到终端标签页维度（TerminalTab.autoFollowTerminal）
     // 底部监控条是否默认展开由设置中心控制（默认开），关闭后仍可从文件树工具栏单独开启
-    remoteMonitorOpen: settings.remoteMonitorEnabled
+    remoteMonitorOpen: settings.remoteMonitorEnabled,
+    workspaceMode: mode
   }
 
   sessions.value.push(newSession)
@@ -468,9 +506,17 @@ const handleConnectSsh = async (host: HostItem) => {
   // 仅记录已入库主机的最近使用时间（临时主机不入列表）
   if (hosts.value.some(h => h.id === host.id)) touchRecent(host)
 
-  triggerToast(`已连通 ${host.name}，文件树与终端就绪`, 'success')
+  triggerToast(
+    mode === 'sftp'
+      ? `已连通 ${host.name}，SFTP 文件系统就绪`
+      : `已连通 ${host.name}，文件树与终端就绪`,
+    'success'
+  )
   refreshHostMetrics(host, sessionId)
 }
+
+const handleConnectSsh = (host: HostItem) => handleConnectHost(host, 'split')
+const handleConnectSftp = (host: HostItem) => handleConnectHost(host, 'sftp')
 
 // 快速连接：不落库，直接建立临时会话
 const handleQuickConnect = async (host: HostItem) => {
@@ -804,6 +850,32 @@ const handleDownloadFile = async (session: HostSession, file: SftpFileItem, remo
   await runTransfer(task, (taskId) =>
     sftpDownloadPathApi(sessionId, fullRemote, localPath, taskId)
   )
+}
+
+// 批量下载文件或目录
+const handleDownloadFiles = async (session: HostSession, refs: RemoteFileRef[]) => {
+  if (refs.length === 0) return
+  const sessionId = session.sftpSessionId || session.id
+  if (!isTauri()) {
+    refs.forEach(r => runMockTransfer(createTransferTask(`下载: ${r.file.name}`, 'download', r.file.size)))
+    return
+  }
+
+  const targetDir = await pickDirectory()
+  if (!targetDir) return
+
+  for (const ref of refs) {
+    const localPath = `${targetDir.replace(/[/\\]+$/, '')}/${ref.file.name}`
+    const task = createTransferTask(`下载: ${ref.file.name}`, 'download', ref.file.size, {
+      sessionId,
+      localPath,
+      remotePath: ref.remotePath,
+      upload: false
+    })
+    await runTransfer(task, (taskId) =>
+      sftpDownloadPathApi(sessionId, ref.remotePath, localPath, taskId)
+    )
+  }
 }
 
 /** 批量入队上传：先一次性建好所有任务卡片，再顺序执行（同一 SFTP 会话不并发混用） */

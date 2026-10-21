@@ -171,6 +171,8 @@ export interface FileTreeNode {
   loaded?: boolean
 }
 
+export type WorkspaceMode = 'split' | 'sftp'
+
 export interface HostSession {
   id: string
   hostId: string
@@ -184,6 +186,8 @@ export interface HostSession {
   sidebarWidth: number
   viewMode: 'tree' | 'list'
   remoteMonitorOpen?: boolean
+  /** 当前工作区模式：'split' 为终端分栏协同，'sftp' 为独立全屏 SFTP 文件管理 */
+  workspaceMode?: WorkspaceMode
 }
 
 export interface ToastMessage {

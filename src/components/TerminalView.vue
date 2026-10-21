@@ -60,6 +60,16 @@
           <span class="hidden sm:inline">文件工作区</span>
         </button>
 
+        <!-- 切换到全屏 SFTP 视图 -->
+        <button
+          @click="$emit('jump-to-sftp')"
+          class="flex items-center gap-1.5 px-2 py-1 rounded bg-surface-card hover:bg-surface-elevated border border-surface-border hover:border-cyan-500/40 text-cyan-400 text-xs font-medium transition-all"
+          title="切换至独立全屏 SFTP 传输视图"
+        >
+          <FolderGit2 class="w-3.5 h-3.5" />
+          <span class="hidden sm:inline">全屏 SFTP</span>
+        </button>
+
         <span class="w-px h-4 bg-surface-border shrink-0"></span>
 
         <button
@@ -73,7 +83,7 @@
 
         <button
           @click="toggleHighlight"
-          :title="highlightEnabled ? '关闭关键字高亮' : '开启关键字高亮（ERROR/WARN/成功）'"
+          :title="highlightEnabled ? '关闭语法高亮' : '开启语法高亮（MobaXterm 级实时语法着色）'"
           class="p-1.5 rounded hover:bg-surface-elevated transition-colors"
           :class="highlightEnabled ? 'text-amber-300 bg-amber-500/10' : 'text-surface-subtle hover:text-white'"
         >
@@ -101,7 +111,7 @@
         <button
           @click="highlightSettingsOpen = true"
           class="p-1.5 rounded hover:bg-surface-elevated text-surface-subtle hover:text-white transition-colors"
-          title="关键字高亮设置"
+          title="终端语法高亮设置"
         >
           <SlidersHorizontal class="w-3.5 h-3.5" />
         </button>
@@ -1443,6 +1453,9 @@ const termMenuItems = computed<ContextMenuItem[]>(() => [
   { key: 'paste', label: '粘贴', icon: ClipboardPaste, hint: 'Ctrl+Shift+V' },
   { key: 'select-all', label: '全选', icon: TextSelect },
   { divider: true },
+  { key: 'toggle-highlight', label: highlightEnabled.value ? '关闭语法高亮' : '开启语法高亮', icon: Highlighter },
+  { key: 'highlight-settings', label: '语法高亮设置...', icon: SlidersHorizontal },
+  { divider: true },
   { key: 'find', label: '查找', icon: Search, hint: 'Ctrl+F' },
   { key: 'clear', label: '清除屏幕', icon: Eraser }
 ])
@@ -1465,6 +1478,8 @@ const handleTermMenuSelect = (item: ContextMenuItem) => {
     }
     case 'paste': pasteToTerminal(tabId); break
     case 'select-all': selectAllInTerminal(tabId); break
+    case 'toggle-highlight': toggleHighlight(); break
+    case 'highlight-settings': highlightSettingsOpen.value = true; break
     case 'find':
       if (tabId === currentTabId.value) openSearch()
       else emitToast('请先切换到该终端再查找', 'info')

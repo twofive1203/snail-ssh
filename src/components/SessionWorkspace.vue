@@ -1,84 +1,109 @@
 <template>
   <div class="flex-1 flex h-full w-full overflow-hidden relative select-none bg-surface-base">
-    <!-- 1. 左侧：树形文件工作区 -->
-    <aside
-      class="h-full flex flex-col shrink-0 transition-all duration-150 relative border-r border-surface-border bg-surface-sidebar"
-      :style="{
-        width: isCollapsed ? '0px' : `${sidebarWidth}px`,
-        opacity: isCollapsed ? 0 : 1,
-        pointerEvents: isCollapsed ? 'none' : 'auto'
-      }"
-    >
-      <FileTree
+    <!-- 模式 A：独立全屏 SFTP 专业视图 -->
+    <SftpView
+      v-if="session.workspaceMode === 'sftp'"
+      ref="sftpViewRef"
+      :hosts="hosts"
+      :current-host="session.host"
+      :active-session-id="session.sftpSessionId || session.id"
+      :refresh-signal="refreshSignal"
+      :initial-path="session.currentPath || '~'"
+      @switch-to-terminal="handleSwitchToTerminal"
+      @open-in-terminal="handleOpenInTerminal"
+      @select-host="(h) => emit('select-host', h)"
+      @update:current-path="(path) => (session.currentPath = path)"
+      @edit-file="(path) => emit('edit-file', path)"
+      @download-file="(file, path) => emit('download-file', file, path)"
+      @download-files="(refs) => emit('download-files', refs)"
+      @upload-trigger="(dir) => emit('upload-trigger', dir)"
+      @toast="(msg, type) => emit('toast', msg, type)"
+    />
+
+    <!-- 模式 B：终端协同分栏工作区 -->
+    <template v-else>
+      <!-- 1. 左侧：树形文件工作区 -->
+      <aside
+        class="h-full flex flex-col shrink-0 transition-all duration-150 relative border-r border-surface-border bg-surface-sidebar"
+        :style="{
+          width: isCollapsed ? '0px' : `${sidebarWidth}px`,
+          opacity: isCollapsed ? 0 : 1,
+          pointerEvents: isCollapsed ? 'none' : 'auto'
+        }"
+      >
+        <FileTree
+          v-if="!isCollapsed"
+          ref="fileTreeRef"
+          :host="session.host"
+          :session-id="session.sftpSessionId || session.id"
+          :refresh-signal="refreshSignal"
+          :auto-follow="activeFollow"
+          :remote-monitor-open="session.remoteMonitorOpen || false"
+          :terminal-cwd="currentActiveTabCwd"
+          :group-id="session.host.group"
+          :initial-path="session.currentPath || '~'"
+          @update:current-path="(path) => (session.currentPath = path)"
+          @update:auto-follow="setActiveFollow"
+          @toggle-remote-monitor="handleToggleRemoteMonitor"
+          @manual-sync="handleManualSync"
+          @toggle-collapse="toggleCollapse"
+          @open-in-terminal="handleOpenInTerminal"
+          @edit-file="(path) => emit('edit-file', path)"
+          @download-file="(file, path) => emit('download-file', file, path)"
+          @upload-trigger="(dir) => emit('upload-trigger', dir)"
+          @toast="(msg, type) => emit('toast', msg, type)"
+        />
+      </aside>
+
+      <!-- 2. 中间：可拖拽调整宽度的 Splitter 分割条 -->
+      <div
         v-if="!isCollapsed"
-        ref="fileTreeRef"
-        :host="session.host"
-        :session-id="session.sftpSessionId || session.id"
-        :refresh-signal="refreshSignal"
-        :auto-follow="activeFollow"
-        :remote-monitor-open="session.remoteMonitorOpen || false"
-        :terminal-cwd="currentActiveTabCwd"
-        :group-id="session.host.group"
-        :initial-path="session.currentPath || '~'"
-        @update:current-path="(path) => (session.currentPath = path)"
-        @update:auto-follow="setActiveFollow"
-        @toggle-remote-monitor="handleToggleRemoteMonitor"
-        @manual-sync="handleManualSync"
-        @toggle-collapse="toggleCollapse"
-        @open-in-terminal="handleOpenInTerminal"
-        @edit-file="(path) => emit('edit-file', path)"
-        @download-file="(file, path) => emit('download-file', file, path)"
-        @upload-trigger="(dir) => emit('upload-trigger', dir)"
-        @toast="(msg, type) => emit('toast', msg, type)"
-      />
-    </aside>
+        class="w-1.5 h-full cursor-col-resize hover:bg-brand-500/50 active:bg-brand-500 transition-colors shrink-0 z-20 flex items-center justify-center group -ml-0.5"
+        @mousedown="startResize"
+        title="拖拽调节宽度 (双击恢复默认 280px)"
+        @dblclick="resetWidth"
+      >
+        <div class="w-0.5 h-6 bg-slate-600 group-hover:bg-brand-300 rounded-full transition-colors"></div>
+      </div>
 
-    <!-- 2. 中间：可拖拽调整宽度的 Splitter 分割条 -->
-    <div
-      v-if="!isCollapsed"
-      class="w-1.5 h-full cursor-col-resize hover:bg-brand-500/50 active:bg-brand-500 transition-colors shrink-0 z-20 flex items-center justify-center group -ml-0.5"
-      @mousedown="startResize"
-      title="拖拽调节宽度 (双击恢复默认 280px)"
-      @dblclick="resetWidth"
-    >
-      <div class="w-0.5 h-6 bg-slate-600 group-hover:bg-brand-300 rounded-full transition-colors"></div>
-    </div>
+      <!-- 3. 右侧：交互式终端 (单会话支持多终端 Tab) -->
+      <main class="flex-1 h-full overflow-hidden flex flex-col relative bg-[#0c0e14]">
+        <TerminalView
+          ref="terminalRef"
+          :tabs="session.terminalTabs"
+          :active-tab-index="session.activeTerminalIndex"
+          :sidebar-collapsed="isCollapsed"
+          :active="!!isActive"
+          :host-key="terminalHostKey"
+          :group-id="session.host.group"
+          @switch-tab="(idx) => emit('switch-terminal-tab', idx)"
+          @close-tab="(idx) => emit('close-terminal-tab', idx)"
+          @add-tab="emit('add-terminal-tab')"
+          @toggle-sidebar="toggleCollapse"
+          @jump-to-sftp="handleSwitchToSftp"
+          @open-tab-sftp="(idx) => handleSwitchToSftp(idx)"
+          @duplicate-tab="(idx) => emit('duplicate-terminal-tab', idx)"
+          @reconnect-tab="(idx) => emit('reconnect-terminal-tab', idx)"
+          @rename-tab="(idx) => emit('rename-terminal-tab', idx)"
+          @copy-tab-info="(idx, kind) => emit('copy-terminal-info', idx, kind)"
+          @close-other-tabs="(idx) => emit('close-other-terminal-tabs', idx)"
+          @close-tabs-after="(idx) => emit('close-terminal-tabs-after', idx)"
+          @session-closed="(tabId, reason) => emit('session-closed', tabId, reason)"
+          @terminal-cwd-change="handleTerminalCwdChange"
+          @terminal-enter="handleTerminalEnter"
+          @toast="(msg, type) => emit('toast', msg, type)"
+        />
 
-    <!-- 3. 右侧：交互式终端 (单会话支持多终端 Tab) -->
-    <main class="flex-1 h-full overflow-hidden flex flex-col relative bg-[#0c0e14]">
-      <TerminalView
-        ref="terminalRef"
-        :tabs="session.terminalTabs"
-        :active-tab-index="session.activeTerminalIndex"
-        :sidebar-collapsed="isCollapsed"
-        :active="!!isActive"
-        :host-key="terminalHostKey"
-        :group-id="session.host.group"
-        @switch-tab="(idx) => emit('switch-terminal-tab', idx)"
-        @close-tab="(idx) => emit('close-terminal-tab', idx)"
-        @add-tab="emit('add-terminal-tab')"
-        @toggle-sidebar="toggleCollapse"
-        @duplicate-tab="(idx) => emit('duplicate-terminal-tab', idx)"
-        @reconnect-tab="(idx) => emit('reconnect-terminal-tab', idx)"
-        @rename-tab="(idx) => emit('rename-terminal-tab', idx)"
-        @copy-tab-info="(idx, kind) => emit('copy-terminal-info', idx, kind)"
-        @close-other-tabs="(idx) => emit('close-other-terminal-tabs', idx)"
-        @close-tabs-after="(idx) => emit('close-terminal-tabs-after', idx)"
-        @session-closed="(tabId, reason) => emit('session-closed', tabId, reason)"
-        @terminal-cwd-change="handleTerminalCwdChange"
-        @terminal-enter="handleTerminalEnter"
-        @toast="(msg, type) => emit('toast', msg, type)"
-      />
-
-      <!-- 4. 底部远程监控信息栏 (对标 MobaXterm 底部服务器资源监控) -->
-      <RemoteMonitorBar
-        v-if="session.remoteMonitorOpen"
-        :metrics="remoteMetrics"
-        :loading="metricsLoading"
-        :default-hostname="session.host.host"
-        @close="handleCloseRemoteMonitor"
-      />
-    </main>
+        <!-- 4. 底部远程监控信息栏 (对标 MobaXterm 底部服务器资源监控) -->
+        <RemoteMonitorBar
+          v-if="session.remoteMonitorOpen"
+          :metrics="remoteMetrics"
+          :loading="metricsLoading"
+          :default-hostname="session.host.host"
+          @close="handleCloseRemoteMonitor"
+        />
+      </main>
+    </template>
   </div>
 </template>
 
@@ -87,11 +112,13 @@ import { ref, computed, watch, onBeforeUnmount, nextTick } from 'vue'
 import FileTree from '@/components/FileTree.vue'
 import TerminalView from '@/components/TerminalView.vue'
 import RemoteMonitorBar from '@/components/RemoteMonitorBar.vue'
-import type { HostSession, RemoteSystemMetrics, SftpFileItem } from '@/types'
+import SftpView from '@/components/SftpView.vue'
+import type { HostItem, HostSession, RemoteFileRef, RemoteSystemMetrics, SftpFileItem } from '@/types'
 import { getRemoteMetricsApi } from '@/api/tauri'
 
 const props = defineProps<{
   session: HostSession
+  hosts?: HostItem[]
   refreshSignal?: number
   isActive?: boolean
 }>()
@@ -109,12 +136,15 @@ const emit = defineEmits<{
   (e: 'session-closed', tabId: string, reason: string): void
   (e: 'edit-file', path: string): void
   (e: 'download-file', file: SftpFileItem, path: string): void
+  (e: 'download-files', refs: RemoteFileRef[]): void
   (e: 'upload-trigger', dir: string): void
+  (e: 'select-host', host: HostItem): void
   (e: 'toast', msg: string, type: 'info' | 'success' | 'warning' | 'error'): void
 }>()
 
 const terminalRef = ref<InstanceType<typeof TerminalView> | null>(null)
 const fileTreeRef = ref<InstanceType<typeof FileTree> | null>(null)
+const sftpViewRef = ref<InstanceType<typeof SftpView> | null>(null)
 
 // 命令历史按 "user@host:port" 归属：比 hostId 稳定，临时会话/重新导入资产后历史不丢
 const terminalHostKey = computed(
@@ -363,12 +393,38 @@ onBeforeUnmount(() => {
   window.removeEventListener('mouseup', onMouseUp)
 })
 
+// 模式切换与联动
+const handleSwitchToSftp = (tabIndex?: number) => {
+  props.session.workspaceMode = 'sftp'
+  const targetTab = typeof tabIndex === 'number'
+    ? props.session.terminalTabs[tabIndex]
+    : activeTerminalTab.value
+  const cwd = targetTab?.cwd
+  if (cwd && cwd.startsWith('/')) {
+    props.session.currentPath = cwd
+    nextTick(() => {
+      sftpViewRef.value?.jumpToPath(cwd)
+    })
+  }
+}
+
+const handleSwitchToTerminal = () => {
+  props.session.workspaceMode = 'split'
+  nextTick(() => {
+    terminalRef.value?.fit()
+  })
+}
+
 // 深度联动：在右侧终端中打开指定目录
 const handleOpenInTerminal = (path: string) => {
-  if (!terminalRef.value) return
-  // 转义单双引号，安全 cd
-  const sanitized = path.replace(/"/g, '\\"')
-  terminalRef.value.sendCommand(`cd "${sanitized}"\n`)
-  emit('toast', `已在终端定位至: ${path}`, 'info')
+  if (props.session.workspaceMode === 'sftp') {
+    handleSwitchToTerminal()
+  }
+  nextTick(() => {
+    if (!terminalRef.value) return
+    const sanitized = path.replace(/"/g, '\\"')
+    terminalRef.value.sendCommand(`cd "${sanitized}"\n`)
+    emit('toast', `已在终端定位至: ${path}`, 'info')
+  })
 }
 </script>

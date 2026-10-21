@@ -76,6 +76,34 @@
           <button @click="copyPath" class="text-slate-500 hover:text-white p-0.5 rounded transition-colors ml-1 shrink-0" title="复制完整路径">
             <Copy class="w-3.5 h-3.5" />
           </button>
+
+          <!-- 常用目录书签 -->
+          <div class="relative shrink-0">
+            <button
+              @click="showBookmarks = !showBookmarks"
+              class="text-slate-500 hover:text-amber-400 p-0.5 rounded transition-colors ml-1 shrink-0"
+              title="常用目录快捷书签"
+            >
+              <Bookmark class="w-3.5 h-3.5" />
+            </button>
+            <div
+              v-if="showBookmarks"
+              class="absolute right-0 top-full mt-1.5 w-52 bg-surface-sidebar border border-surface-border rounded-lg shadow-xl z-30 py-1 text-xs"
+            >
+              <div
+                v-for="b in settings.bookmarks"
+                :key="b.id"
+                @click="jumpBookmark(b.path)"
+                class="px-2.5 py-1.5 hover:bg-surface-elevated text-slate-300 hover:text-white cursor-pointer flex items-center justify-between gap-2"
+              >
+                <span class="truncate">{{ b.label }}</span>
+                <span class="text-[10px] text-slate-500 font-mono truncate max-w-[90px]">{{ b.path }}</span>
+              </div>
+              <div v-if="settings.bookmarks.length === 0" class="px-2.5 py-2 text-[11px] text-slate-500">
+                暂无书签，可在设置中心添加
+              </div>
+            </div>
+          </div>
         </div>
       </div>
 
@@ -129,6 +157,15 @@
         >
           <Terminal class="w-3.5 h-3.5 text-emerald-400" />
           <span>在终端打开</span>
+        </button>
+
+        <button
+          @click="$emit('switch-to-terminal')"
+          class="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-surface-card hover:bg-surface-elevated border border-surface-border hover:border-brand-500/40 text-slate-200 transition-colors"
+          title="切换回终端分栏工作区"
+        >
+          <Columns2 class="w-3.5 h-3.5 text-cyan-400" />
+          <span>终端分栏</span>
         </button>
       </div>
     </div>
@@ -332,7 +369,7 @@ import {
   sftpStatApi
 } from '@/api/tauri'
 import { confirmDialog, promptDialog } from '@/composables/useDialog'
-import { groupById, groupColorOf } from '@/composables/useAppSettings'
+import { settings, groupById, groupColorOf } from '@/composables/useAppSettings'
 import ContextMenu from '@/components/ContextMenu.vue'
 import {
   Folder,
@@ -359,16 +396,25 @@ import {
   Lock,
   Users,
   Info,
-  FilePlus
+  FilePlus,
+  Bookmark,
+  Columns2
 } from 'lucide-vue-next'
 
-const props = defineProps<{
-  hosts: HostItem[]
-  currentHost?: HostItem
-  activeSessionId?: string
-  /** 传输完成后由父组件自增，触发目录刷新 */
-  refreshSignal?: number
-}>()
+const props = withDefaults(
+  defineProps<{
+    hosts?: HostItem[]
+    currentHost?: HostItem
+    activeSessionId?: string
+    /** 传输完成后由父组件自增，触发目录刷新 */
+    refreshSignal?: number
+    initialPath?: string
+  }>(),
+  {
+    hosts: () => [],
+    initialPath: '~'
+  }
+)
 
 const emit = defineEmits<{
   (e: 'select-host', host: HostItem): void
@@ -377,8 +423,12 @@ const emit = defineEmits<{
   (e: 'download-files', refs: RemoteFileRef[]): void
   (e: 'upload-trigger', remoteDir: string): void
   (e: 'open-in-terminal', path: string): void
+  (e: 'switch-to-terminal'): void
+  (e: 'update:current-path', path: string): void
   (e: 'toast', msg: string, type: 'info' | 'success' | 'warning' | 'error'): void
 }>()
+
+const showBookmarks = ref(false)
 
 const showHostDropdown = ref(false)
 // 进入视图后由 sftp_home_dir 解析为远端家目录
@@ -461,7 +511,20 @@ const loadFiles = async () => {
 
 const navigateTo = (path: string) => {
   currentPath.value = path
+  emit('update:current-path', path)
   loadFiles()
+}
+
+const jumpBookmark = async (path: string) => {
+  showBookmarks.value = false
+  let target = path
+  if ((path === '~' || path.startsWith('~/')) && props.activeSessionId) {
+    const home = await sftpHomeDirApi(props.activeSessionId).catch(() => '')
+    if (home) {
+      target = path === '~' ? home : `${home.replace(/\/+$/, '')}/${path.slice(2)}`
+    }
+  }
+  navigateTo(target)
 }
 
 /** 路径直输：支持 ~ 与 ~/xxx 自动展开为家目录 */
@@ -892,7 +955,11 @@ const createNewFile = async () => {
 }
 
 onMounted(async () => {
-  if (props.activeSessionId) await resolveHome()
+  if (props.initialPath && props.initialPath !== '~' && props.initialPath !== '/') {
+    currentPath.value = props.initialPath
+  } else if (props.activeSessionId) {
+    await resolveHome()
+  }
   loadFiles()
 })
 
@@ -900,11 +967,21 @@ onMounted(async () => {
 watch(
   () => [props.activeSessionId, props.currentHost?.id].join('|'),
   async () => {
-    currentPath.value = '/'
-    if (props.activeSessionId) await resolveHome()
+    if (props.initialPath && props.initialPath !== '~' && props.initialPath !== '/') {
+      currentPath.value = props.initialPath
+    } else {
+      currentPath.value = '/'
+      if (props.activeSessionId) await resolveHome()
+    }
     loadFiles()
   }
 )
+
+defineExpose({
+  jumpToPath: navigateTo,
+  getCurrentPath: () => currentPath.value,
+  refresh: loadFiles
+})
 
 // 传输完成后刷新当前目录，让新上传/下载的文件立刻可见
 watch(

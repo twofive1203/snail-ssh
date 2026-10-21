@@ -45,6 +45,12 @@
           :title="groupById(s.host.group).label"
         ></span>
         <span class="truncate">{{ s.title }}</span>
+        <span
+          v-if="s.workspaceMode === 'sftp'"
+          class="text-[9px] px-1 py-0.2 rounded bg-cyan-500/15 text-cyan-300 border border-cyan-500/30 shrink-0 font-sans"
+        >
+          SFTP
+        </span>
         <button
           @click.stop="$emit('close-session', s.id)"
           class="opacity-0 group-hover:opacity-100 p-0.5 rounded hover:bg-surface-elevated hover:text-white text-slate-400 transition-opacity ml-0.5"
