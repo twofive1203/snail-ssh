@@ -1638,6 +1638,8 @@ const handleWindowResize = () => fitActive()
 /** 全局 Ctrl+F / Ctrl+Enter：仅在当前活动工作区生效，终端聚焦时交给 xterm 自定义处理器 */
 const handleGlobalKeydown = (e: KeyboardEvent) => {
   if (!props.active || dialogState.open) return
+  // 在线编辑器打开时，Ctrl+F / Ctrl+Tab 属于编辑器，不要切到终端查找或换标签
+  if (document.querySelector('[data-snail-editor]')) return
   const mod = e.ctrlKey || e.metaKey
   if (!mod) return
   const el = e.target as HTMLElement | null

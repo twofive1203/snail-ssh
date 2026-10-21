@@ -1,29 +1,34 @@
 <template>
   <div
     v-if="open"
+    data-snail-editor
     class="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 flex items-center justify-center p-6 transition-opacity"
   >
     <div
-      class="w-full max-w-4xl h-[80vh] bg-surface-sidebar border border-surface-border rounded-2xl shadow-2xl flex flex-col overflow-hidden"
+      class="w-full max-w-6xl h-[86vh] bg-surface-sidebar border border-surface-border rounded-2xl shadow-2xl flex flex-col overflow-hidden"
       @click.stop
     >
-      <!-- 编辑器顶栏 -->
-      <div class="h-12 border-b border-surface-border px-4 flex items-center justify-between bg-surface-card/50">
-        <div class="flex items-center gap-3">
-          <FileCode class="w-4 h-4 text-brand-400" />
-          <div class="text-xs font-bold text-white font-mono flex items-center gap-2">
-            <span>{{ filePath }}</span>
-            <span class="text-[10px] px-1.5 py-0.2 rounded bg-amber-500/20 text-amber-300 font-normal">远程实时编辑</span>
+      <div class="h-12 border-b border-surface-border px-4 flex items-center justify-between bg-surface-card/50 gap-3">
+        <div class="flex items-center gap-3 min-w-0">
+          <FileCode class="w-4 h-4 text-brand-400 shrink-0" />
+          <div class="text-xs font-bold text-white font-mono flex items-center gap-2 min-w-0">
+            <span class="truncate" :title="filePath">{{ filePath }}</span>
+            <span class="text-[10px] px-1.5 py-0.2 rounded bg-amber-500/20 text-amber-300 font-normal shrink-0">远程实时编辑</span>
+            <span
+              v-if="languageLabel"
+              class="text-[10px] px-1.5 py-0.2 rounded bg-brand-500/15 text-brand-300 font-normal shrink-0"
+            >{{ languageLabel }}</span>
           </div>
         </div>
-        <div class="flex items-center gap-2">
+        <div class="flex items-center gap-2 shrink-0">
           <button
             @click="handleSave"
-            :disabled="saving"
+            :disabled="saving || loading || !!loadError"
             class="flex items-center gap-1.5 px-3 py-1 rounded bg-brand-500 hover:bg-brand-600 text-slate-950 font-semibold text-xs transition-all shadow-glow-emerald disabled:opacity-50"
+            title="写入远程服务器，编辑器保持打开"
           >
             <Save class="w-3.5 h-3.5" />
-            <span>{{ saving ? '同步中...' : '保存并远程同步' }}</span>
+            <span>{{ saving ? '同步中...' : '保存到远程' }}</span>
           </button>
           <button @click="handleClose" class="p-1 rounded hover:bg-surface-elevated text-slate-400 hover:text-white" title="关闭编辑器">
             <X class="w-4 h-4" />
@@ -31,42 +36,41 @@
         </div>
       </div>
 
-      <!-- 编辑器文本区域 -->
-      <div class="flex-1 flex overflow-hidden">
-        <!-- 行号 -->
+      <div class="flex-1 relative overflow-hidden bg-[#0a0d14]">
+        <div ref="hostRef" class="absolute inset-0"></div>
         <div
-          ref="gutterRef"
-          class="w-12 py-3 bg-surface-base text-right pr-3 font-mono text-xs text-slate-600 select-none border-r border-surface-border leading-6 overflow-hidden"
+          v-if="loading"
+          class="absolute inset-0 z-10 flex items-center justify-center text-xs font-mono text-slate-400 bg-[#0a0d14]"
         >
-          <div v-for="n in lineCount" :key="n">{{ n }}</div>
+          正在读取远程文件…
         </div>
-        <!-- 代码正文 -->
-        <textarea
-          ref="textareaRef"
-          v-model="content"
-          spellcheck="false"
-          class="flex-1 p-3 bg-[#0a0d14] text-slate-200 font-mono text-xs leading-6 resize-none focus:outline-none custom-scrollbar"
-          @scroll="syncScroll"
-        ></textarea>
+        <div
+          v-else-if="loadError"
+          class="absolute inset-0 z-10 flex items-center justify-center px-8 text-center text-xs font-mono text-rose-300 bg-[#0a0d14]"
+        >
+          {{ loadError }}
+        </div>
       </div>
 
-      <!-- 编辑器底部信息 -->
-      <div class="h-7 bg-surface-card border-t border-surface-border px-4 flex items-center justify-between text-[11px] font-mono text-surface-subtle">
-        <span class="flex items-center gap-2">
-          <span>编码: UTF-8 | 换行: LF | 模式: Config / Code</span>
+      <div class="h-7 bg-surface-card border-t border-surface-border px-4 flex items-center justify-between text-[11px] font-mono text-surface-subtle gap-3">
+        <span class="flex items-center gap-2 min-w-0 truncate">
+          <span>UTF-8</span>
+          <span>换行: {{ lineEndingLabel }}</span>
+          <span>Ln {{ cursor.line }}, Col {{ cursor.col }}</span>
           <span v-if="dirty" class="text-amber-400">● 未保存</span>
         </span>
-        <span>按 Ctrl+S 或点击右上角保存</span>
+        <span class="shrink-0">Ctrl+S 保存 · Ctrl+F 查找 · 行号旁箭头折叠</span>
       </div>
     </div>
   </div>
 </template>
 
 <script setup lang="ts">
-import { ref, computed, watch, onMounted, onBeforeUnmount } from 'vue'
+import { ref, computed, watch, onBeforeUnmount, nextTick } from 'vue'
 import { FileCode, Save, X } from 'lucide-vue-next'
 import { sftpReadFileApi, sftpWriteFileApi } from '@/api/tauri'
 import { confirmDialog, dialogState } from '@/composables/useDialog'
+import type { EditorCursor, RemoteEditorHandle } from '@/components/editor/createRemoteEditor'
 
 const props = defineProps<{
   open: boolean
@@ -79,44 +83,90 @@ const emit = defineEmits<{
   (e: 'toast', msg: string, type: 'info' | 'success' | 'warning' | 'error'): void
 }>()
 
-const content = ref('')
 const saving = ref(false)
-const textareaRef = ref<HTMLTextAreaElement | null>(null)
-const gutterRef = ref<HTMLDivElement | null>(null)
-// 远端原始内容，用于判断是否有未保存修改
-const originalContent = ref('')
+const loading = ref(false)
+const loadError = ref('')
+const hostRef = ref<HTMLElement | null>(null)
+const docText = ref('')
+const baseline = ref('')
+const languageLabel = ref('')
+const lineEndingLabel = ref('LF')
+const cursor = ref<EditorCursor>({ line: 1, col: 1 })
 
-const dirty = computed(() => content.value !== originalContent.value)
+let loadSeq = 0
+let editor: RemoteEditorHandle | null = null
 
-// 行号列是独立元素，需手动跟随正文滚动
-const syncScroll = () => {
-  if (gutterRef.value && textareaRef.value) {
-    gutterRef.value.scrollTop = textareaRef.value.scrollTop
+const dirty = computed(() => docText.value !== baseline.value)
+
+const destroyEditor = () => {
+  editor?.destroy()
+  editor = null
+  docText.value = ''
+  baseline.value = ''
+}
+
+const loadFile = async () => {
+  const seq = ++loadSeq
+  destroyEditor()
+  loading.value = true
+  loadError.value = ''
+  languageLabel.value = ''
+  cursor.value = { line: 1, col: 1 }
+
+  if (!props.sessionId) {
+    loading.value = false
+    loadError.value = '尚未建立 SSH 会话，无法读取远程文件'
+    emit('toast', loadError.value, 'warning')
+    return
+  }
+
+  try {
+    const text = await sftpReadFileApi(props.sessionId, props.filePath)
+    if (seq !== loadSeq || !props.open) return
+    await nextTick()
+    if (!hostRef.value || seq !== loadSeq) return
+    const { createRemoteEditor } = await import('@/components/editor/createRemoteEditor')
+    if (seq !== loadSeq || !props.open || !hostRef.value) return
+    editor = createRemoteEditor({
+      parent: hostRef.value,
+      path: props.filePath,
+      text,
+      onChange: (value, nextCursor) => {
+        docText.value = value
+        cursor.value = nextCursor
+      },
+    })
+    baseline.value = editor.getValue()
+    docText.value = baseline.value
+    cursor.value = editor.getCursor()
+    languageLabel.value = editor.languageLabel
+    lineEndingLabel.value = editor.lineEndingLabel
+    loading.value = false
+  } catch (err: any) {
+    if (seq !== loadSeq) return
+    destroyEditor()
+    loading.value = false
+    loadError.value = `读取文件失败: ${err?.message || err}`
+    emit('toast', loadError.value, 'error')
   }
 }
 
-const lineCount = computed(() => {
-  const count = content.value.split('\n').length
-  return Math.max(count, 15)
-})
-
-watch(() => props.open, async (val) => {
-  if (!val || !props.filePath) return
-  if (!props.sessionId) {
-    emit('toast', '尚未建立 SSH 会话，无法读取远程文件', 'warning')
+watch(() => [props.open, props.filePath, props.sessionId] as const, ([open]) => {
+  if (!open) {
+    loadSeq++
+    destroyEditor()
+    loading.value = false
+    loadError.value = ''
     return
   }
-  try {
-    content.value = await sftpReadFileApi(props.sessionId, props.filePath)
-    originalContent.value = content.value
-    syncScroll()
-  } catch (err: any) {
-    emit('toast', `读取文件失败: ${err?.message || err}`, 'error')
-  }
+  void loadFile()
 })
 
-// 关闭前拦一层，避免误点丢失尚未同步到远端的修改
 const handleClose = async () => {
+  if (saving.value) {
+    emit('toast', '正在保存，请稍候再关闭', 'info')
+    return
+  }
   if (dirty.value) {
     const confirmed = await confirmDialog({
       title: '放弃未保存的修改？',
@@ -135,11 +185,15 @@ const handleSave = async () => {
     emit('toast', '尚未建立 SSH 会话，无法写入远程文件', 'warning')
     return
   }
+  if (!editor || saving.value || loading.value || loadError.value) return
+  const snapshot = editor.getValue()
   saving.value = true
   try {
-    await sftpWriteFileApi(props.sessionId, props.filePath, content.value)
-    emit('toast', '文件已成功写入远程服务器！', 'success')
-    emit('close')
+    await sftpWriteFileApi(props.sessionId, props.filePath, snapshot)
+    // 保存期间如果又改了内容，基线只记已写入的那一版，编辑器保持打开
+    baseline.value = snapshot
+    if (editor.getValue() === snapshot) docText.value = snapshot
+    emit('toast', '文件已写入远程服务器', 'success')
   } catch (err: any) {
     emit('toast', `保存失败: ${err?.message || err}`, 'error')
   } finally {
@@ -147,21 +201,24 @@ const handleSave = async () => {
   }
 }
 
-// 底部提示的 Ctrl+S 快捷键：仅在编辑器打开时接管；ESC 关闭（带未保存拦截）
 const onKeydown = (e: KeyboardEvent) => {
-  if (!props.open) return
+  if (!props.open || dialogState.open) return
   if (e.key === 'Escape') {
-    if (dialogState.open) return
+    if (e.defaultPrevented) return
     e.preventDefault()
-    handleClose()
+    void handleClose()
     return
   }
   if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
     e.preventDefault()
-    if (!saving.value) handleSave()
+    void handleSave()
   }
 }
 
-onMounted(() => window.addEventListener('keydown', onKeydown))
-onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
+window.addEventListener('keydown', onKeydown)
+onBeforeUnmount(() => {
+  loadSeq++
+  destroyEditor()
+  window.removeEventListener('keydown', onKeydown)
+})
 </script>

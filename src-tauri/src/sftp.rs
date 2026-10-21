@@ -972,18 +972,37 @@ fn civil_from_days(days_since_epoch: i64) -> (i64, u32, u32) {
 
 fn is_editable_file(name: &str) -> bool {
     let lower = name.to_lowercase();
-    lower.ends_with(".conf")
-        || lower.ends_with(".yaml")
-        || lower.ends_with(".yml")
-        || lower.ends_with(".json")
-        || lower.ends_with(".sh")
-        || lower.ends_with(".bash")
-        || lower.ends_with(".py")
-        || lower.ends_with(".js")
-        || lower.ends_with(".ts")
-        || lower.ends_with(".txt")
-        || lower.ends_with(".env")
-        || lower.ends_with(".ini")
-        || lower.ends_with(".toml")
-        || lower.ends_with(".log")
+    // Dockerfile / .env / .env.local 没有统一后缀，按文件名认
+    if lower == "dockerfile"
+        || lower.starts_with("dockerfile.")
+        || lower == ".env"
+        || lower.starts_with(".env.")
+    {
+        return true;
+    }
+    const EXTS: &[&str] = &[
+        ".conf", ".yaml", ".yml", ".json", ".sh", ".bash", ".py", ".js", ".ts",
+        ".txt", ".env", ".ini", ".toml", ".log", ".xml", ".html", ".htm", ".css",
+        ".properties", ".cfg", ".cnf", ".service",
+    ];
+    EXTS.iter().any(|ext| lower.ends_with(ext))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_editable_file;
+
+    #[test]
+    fn editable_common_configs() {
+        assert!(is_editable_file("nginx.conf"));
+        assert!(is_editable_file("app.yaml"));
+        assert!(is_editable_file("site.xml"));
+        assert!(is_editable_file("index.html"));
+        assert!(is_editable_file("Dockerfile"));
+        assert!(is_editable_file(".env"));
+        assert!(is_editable_file(".env.local"));
+        assert!(is_editable_file("app.service"));
+        assert!(!is_editable_file("backup.tar.gz"));
+        assert!(!is_editable_file("ssl-bundle.crt"));
+    }
 }

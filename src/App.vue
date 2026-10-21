@@ -969,6 +969,7 @@ const isTerminalOrEditorTarget = (target: EventTarget | null): boolean => {
 const setupGlobalKeybindings = () => {
   window.addEventListener('keydown', (e) => {
     if (dialogState.open) return
+    if (document.querySelector('[data-snail-editor]')) return
     const mod = e.ctrlKey || e.metaKey
     if (!mod) return
     const key = e.key.toLowerCase()

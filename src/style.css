@@ -61,6 +61,22 @@
   background: #3a4561;
 }
 
+/* 在线编辑器滚动条，跟终端视口同一套暗色 */
+.cm-scroller::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+.cm-scroller::-webkit-scrollbar-track {
+  background: #0a0d14;
+}
+.cm-scroller::-webkit-scrollbar-thumb {
+  background: #262d40;
+  border-radius: 4px;
+}
+.cm-scroller::-webkit-scrollbar-thumb:hover {
+  background: #3a4561;
+}
+
 /* 键盘按键质感 */
 kbd {
   font-family: "JetBrains Mono", monospace;
