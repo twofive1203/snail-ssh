@@ -103,28 +103,28 @@
         <div
           v-for="host in filteredHosts"
           :key="host.id"
-          class="host-card rounded-xl border border-surface-border p-4 flex flex-col justify-between group shadow-glow-card"
+          class="host-card min-w-0 rounded-xl border border-surface-border p-4 flex flex-col justify-between group shadow-glow-card"
         >
           <!-- 头部信息 -->
           <div>
-            <div class="flex items-start justify-between mb-2.5">
-              <div class="flex items-center gap-2.5">
-                <div class="w-8 h-8 rounded-lg bg-surface-card border border-surface-border/80 flex items-center justify-center text-brand-400 group-hover:border-brand-500/30 transition-colors">
+            <div class="flex items-start justify-between gap-2 mb-2.5">
+              <div class="flex items-center gap-2.5 min-w-0 flex-1">
+                <div class="w-8 h-8 shrink-0 rounded-lg bg-surface-card border border-surface-border/80 flex items-center justify-center text-brand-400 group-hover:border-brand-500/30 transition-colors">
                   <component :is="getOsIcon(host.os)" class="w-4 h-4 text-brand-400" />
                 </div>
-                <div>
-                  <div class="text-xs font-bold text-white flex items-center gap-1.5 font-mono">
-                    <span>{{ host.name }}</span>
-                    <span class="w-2 h-2 rounded-full" :class="statusDotClass(host)" :title="statusTitle(host)"></span>
+                <div class="min-w-0 flex-1">
+                  <div class="text-xs font-bold text-white flex items-center gap-1.5 font-mono min-w-0">
+                    <span class="truncate" :title="host.name">{{ host.name }}</span>
+                    <span class="w-2 h-2 shrink-0 rounded-full" :class="statusDotClass(host)" :title="statusTitle(host)"></span>
                   </div>
-                  <div class="text-[11px] font-mono text-surface-subtle flex items-center gap-1 mt-0.5">
-                    <span>{{ host.username }}@{{ host.host }}:{{ host.port }}</span>
+                  <div class="text-[11px] font-mono text-surface-subtle flex items-center gap-1 mt-0.5 min-w-0">
+                    <span class="truncate" :title="`${host.username}@${host.host}:${host.port}`">{{ host.username }}@{{ host.host }}:{{ host.port }}</span>
                   </div>
                 </div>
               </div>
 
               <!-- 右侧更多操作 -->
-              <div class="flex items-center gap-1">
+              <div class="flex items-center gap-1 shrink-0">
                 <button
                   @click.stop="$emit('edit-host', host)"
                   class="p-1 rounded text-surface-subtle hover:text-white hover:bg-surface-highlight transition-colors"
@@ -188,9 +188,9 @@
           </div>
 
           <!-- 卡片底部直连动作栏 -->
-          <div class="pt-3 border-t border-surface-border/60 flex items-center justify-between text-xs">
-            <span class="text-[10px] font-mono text-slate-500 uppercase">{{ host.authType }} 认证</span>
-            <div class="flex items-center gap-2">
+          <div class="pt-3 border-t border-surface-border/60 flex items-center justify-between gap-2 text-xs">
+            <span class="text-[10px] font-mono text-slate-500 uppercase truncate">{{ host.authType }} 认证</span>
+            <div class="flex items-center gap-2 shrink-0">
               <button
                 @click="$emit('connect-sftp', host)"
                 class="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-surface-card hover:bg-surface-elevated border border-surface-border hover:border-cyan-500/40 text-cyan-400 text-xs transition-all"
@@ -226,12 +226,14 @@
           </thead>
           <tbody class="divide-y divide-surface-border/40">
             <tr v-for="host in filteredHosts" :key="host.id" class="hover:bg-surface-card/50 transition-colors">
-              <td class="py-3 px-4 font-medium text-white flex items-center gap-2">
-                <span class="w-2 h-2 rounded-full" :class="statusDotClass(host)" :title="statusTitle(host)"></span>
-                <span class="font-bold">{{ host.name }}</span>
+              <td class="py-3 px-4 font-medium text-white">
+                <div class="flex items-center gap-2 min-w-0">
+                  <span class="w-2 h-2 shrink-0 rounded-full" :class="statusDotClass(host)" :title="statusTitle(host)"></span>
+                  <span class="font-bold truncate max-w-[14rem]" :title="host.name">{{ host.name }}</span>
+                </div>
               </td>
               <td class="py-3 px-4 text-slate-300 text-[11px]">{{ host.osName || '未知系统' }}</td>
-              <td class="py-3 px-4 text-slate-400">{{ host.username }}@{{ host.host }}:{{ host.port }}</td>
+              <td class="py-3 px-4 text-slate-400 truncate max-w-[14rem]" :title="`${host.username}@${host.host}:${host.port}`">{{ host.username }}@{{ host.host }}:{{ host.port }}</td>
               <td class="py-3 px-4 text-slate-400 uppercase">{{ host.authType }}</td>
               <td class="py-3 px-4 text-center text-emerald-400 font-semibold">{{ host.ping || '—' }}</td>
               <td class="py-3 px-4">
