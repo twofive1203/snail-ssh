@@ -151,7 +151,8 @@
                   <span class="text-xs text-slate-200 block">显示历史补全</span>
                   <span class="text-[10px] text-slate-500 block leading-relaxed">
                     开启后终端底部固定留出一行，输入时在该行显示历史候选，不再把终端内容挤上挤下。
-                    关闭后不显示，也不拦截 <span class="font-mono">Tab</span> / 方向键。
+                    方向键或悬停选中后按 <span class="font-mono">Enter</span> 写入命令行，不会直接执行；<span class="font-mono">Tab</span> 仍交给终端自身补全。
+                    关闭后不显示，也不拦截方向键。
                   </span>
                 </span>
               </label>
@@ -434,7 +435,8 @@ const shortcutList = [
   { label: '终端内查找', keys: 'Ctrl + F' },
   { label: '复制选中内容', keys: 'Ctrl + Shift + C / Ctrl + Insert' },
   { label: '粘贴', keys: 'Ctrl + Shift + V / Shift + Insert' },
-  { label: '退出弹窗 / 关闭搜索条', keys: 'ESC' }
+  { label: '退出弹窗 / 关闭搜索条', keys: 'ESC' },
+  { label: '历史补全：选中后写入命令行', keys: '↑↓ 选中，Enter 补全' }
 ]
 
 const uid = (prefix: string) => `${prefix}-${Date.now()}-${Math.floor(Math.random() * 1000)}`

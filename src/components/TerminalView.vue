@@ -288,6 +288,7 @@
         :visible="suggestBarVisible"
         @accept="handleSuggestionAccept"
         @hover="handleSuggestionHover"
+        @leave="handleSuggestionLeave"
       />
     </div>
 
@@ -537,7 +538,11 @@ const remoteHistoryBootstrapped = new Set<string>()
 const REMOTE_HISTORY_KEY = 'snail_ssh_import_remote_history'
 
 const suggestCandidates = ref<string[]>([])
-const suggestIndex = ref(0)
+const suggestIndex = ref(-1)
+/** 用户用方向键或悬停明确选中后才允许 Enter 补全；仅打开候选不算选中，避免抢走正常回车执行 */
+const suggestArmed = ref(false)
+/** key：方向键选中，鼠标离开条不取消；hover：悬停选中，离开条后取消，避免手偶停在候选上把下一次 Enter 变成补全 */
+const suggestPickSource = ref<'key' | 'hover' | ''>('')
 const suggestTabId = ref('')
 
 const suggestBarVisible = computed(() =>
@@ -546,12 +551,18 @@ const suggestBarVisible = computed(() =>
 
 const hostKeyFor = (tab: TerminalTab): string => props.hostKey || tab.hostId
 
-/** 候选条仅在可见时接管按键，不可见时一概透传 */
+/** 候选条仅在可见时接管 ↑/↓ / Esc；Enter 只在已选中时补全，Tab 始终透传 */
 const hasSuggestions = (tabId: string) => suggestTabId.value === tabId && suggestCandidates.value.length > 0
+
+const resetSuggestionPick = () => {
+  suggestIndex.value = -1
+  suggestArmed.value = false
+  suggestPickSource.value = ''
+}
 
 const closeSuggestions = () => {
   suggestCandidates.value = []
-  suggestIndex.value = 0
+  resetSuggestionPick()
   suggestTabId.value = ''
 }
 
@@ -600,7 +611,8 @@ const updateSuggestions = (tab: TerminalTab, lineBuffer: string) => {
     return
   }
   suggestCandidates.value = candidates
-  suggestIndex.value = 0
+  // 输入变了就作废上一次选中：未选中时 Enter 仍执行当前输入
+  resetSuggestionPick()
   suggestTabId.value = tab.id
 }
 
@@ -655,11 +667,27 @@ const applySuggestion = (cmd: string) => {
 }
 
 const handleSuggestionAccept = (cmd: string) => applySuggestion(cmd)
-const handleSuggestionHover = (index: number) => { suggestIndex.value = index }
+const handleSuggestionHover = (index: number) => {
+  suggestIndex.value = index
+  suggestArmed.value = true
+  // 方向键已选中时，悬停只改高亮，不把选中降级成「鼠标一离开就消失」
+  if (suggestPickSource.value !== 'key') suggestPickSource.value = 'hover'
+}
+const handleSuggestionLeave = () => {
+  if (suggestPickSource.value !== 'hover') return
+  resetSuggestionPick()
+}
 
 const moveSuggestion = (delta: number) => {
   const total = suggestCandidates.value.length
   if (total === 0) return
+  suggestPickSource.value = 'key'
+  suggestArmed.value = true
+  // 还没选中时，第一下方向键只选中端点，不要从默认 0 再跳一格
+  if (suggestIndex.value < 0) {
+    suggestIndex.value = delta > 0 ? 0 : total - 1
+    return
+  }
   suggestIndex.value = (suggestIndex.value + delta + total) % total
 }
 
@@ -1054,10 +1082,17 @@ const createSession = (tab: TerminalTab, container: HTMLDivElement): TerminalSes
       return false
     }
 
-    // 命令补全接管：仅在候选条可见时截获 Tab / Esc / ↑ / ↓，
-    // 不可见时一概透传——绝不接管裸 ↑/↓，否则 vim/less/man 全部失效
+    // 历史补全不接管 Tab，留给远端 shell 自身补全。
+    // 候选可见时才截获 ↑/↓ / Esc；Enter 只在用户选中某一条后写入命令行（不直接执行）。
+    // 没有候选时一概透传——绝不接管裸 ↑/↓，否则 vim/less/man 全部失效
     if (hasSuggestions(tab.id)) {
-      if (key === 'Tab' && !e.ctrlKey && !e.altKey && !e.metaKey) {
+      if (
+        key === 'Enter'
+        && suggestArmed.value
+        && suggestIndex.value >= 0
+        && !e.ctrlKey && !e.altKey && !e.metaKey && !e.shiftKey
+        && !e.isComposing
+      ) {
         e.preventDefault()
         applySuggestion(suggestCandidates.value[suggestIndex.value])
         return false

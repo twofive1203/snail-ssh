@@ -1,5 +1,5 @@
 <template>
-  <div class="w-full min-w-0 flex items-center gap-2 overflow-x-auto no-scrollbar">
+  <div class="w-full min-w-0 flex items-center gap-2 overflow-x-auto no-scrollbar" @mouseleave="$emit('leave')">
     <span class="text-[10px] font-mono text-slate-500 uppercase shrink-0 select-none">历史补全</span>
     <template v-if="visible && candidates.length > 0">
       <button
@@ -15,7 +15,7 @@
         {{ candidate }}
       </button>
       <span class="ml-auto text-[10px] font-mono text-slate-500 shrink-0 hidden sm:inline select-none">
-        Tab 接受 · ↑↓ 切换 · Esc 关闭
+        {{ activeIndex >= 0 ? 'Enter 补全 · ↑↓ 切换 · Esc 关闭' : '↑↓ 选中后 Enter 补全 · Esc 关闭' }}
       </span>
     </template>
     <span v-else class="text-[10px] font-mono text-slate-600 truncate select-none">输入时显示历史候选</span>
@@ -34,7 +34,7 @@ withDefaults(
   }>(),
   {
     candidates: () => [],
-    activeIndex: 0,
+    activeIndex: -1,
     visible: false
   }
 )
@@ -42,5 +42,6 @@ withDefaults(
 defineEmits<{
   (e: 'accept', cmd: string): void
   (e: 'hover', index: number): void
+  (e: 'leave'): void
 }>()
 </script>
