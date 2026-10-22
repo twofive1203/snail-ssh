@@ -12,8 +12,17 @@ use crate::transfer::{resume_offset, TransferSignal, TRANSFER_CANCELLED};
 
 /// 在线编辑器单次读取上限，避免把超大文件整个读进内存
 const MAX_EDITABLE_FILE_SIZE: u64 = 8 * 1024 * 1024;
-/// 传输块大小
-const TRANSFER_CHUNK_SIZE: usize = 64 * 1024;
+/// 上传在途窗口。libssh2 只对一次 write 传入的缓冲做 FXP_WRITE 流水线（单包约 30KB），
+/// 窗口要接近 SSH channel 窗口（常见 2MB）才喂得满；取 4MB 以覆盖略大的服务端窗口。
+const UPLOAD_WINDOW_SIZE: usize = 4 * 1024 * 1024;
+/// 每轮从磁盘补进窗口的上限。单次 write 会阻塞到新数据发出并收到一个 ACK，
+/// 补数过大时暂停/取消要等这次调用返回。
+const UPLOAD_FILL_CHUNK: usize = 256 * 1024;
+/// 已消费前缀超过该值且不少于缓冲一半时压实，避免每次 ACK 都搬移整个窗口。
+const UPLOAD_COMPACT_THRESHOLD: usize = 1024 * 1024;
+/// 下载读缓冲。libssh2 按本次缓冲的 4 倍预发 FXP_READ，1MB 对应约 4MB 在途。
+/// 暂停/取消要等这一次 read 返回，粒度就是这块缓冲。
+const DOWNLOAD_READ_SIZE: usize = 1024 * 1024;
 /// 进度事件最小上报间隔
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(150);
 
@@ -450,6 +459,61 @@ pub fn sftp_stat(
     Ok(build_file_item(&name, &stat))
 }
 
+/// 上传在途缓冲：前端是 libssh2 尚未确认的字节，尾部是新读入的数据。
+/// 每次 write 必须从「第一个未确认字节」开始，不能只传新增部分；否则库内部会跳过错误的前缀。
+struct UploadWindow {
+    buf: Vec<u8>,
+    start: usize,
+}
+
+impl UploadWindow {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            buf: Vec::with_capacity(capacity),
+            start: 0,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.buf.len() - self.start
+    }
+
+    fn is_empty(&self) -> bool {
+        self.start == self.buf.len()
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        &self.buf[self.start..]
+    }
+
+    fn extend_from_slice(&mut self, data: &[u8]) {
+        if data.is_empty() {
+            return;
+        }
+        self.compact_if_needed();
+        self.buf.extend_from_slice(data);
+    }
+
+    /// 丢弃已确认前缀。调用方必须保证 n 不超过当前未确认长度。
+    fn consume(&mut self, n: usize) {
+        self.start += n;
+        if self.start == self.buf.len() {
+            self.buf.clear();
+            self.start = 0;
+            return;
+        }
+        self.compact_if_needed();
+    }
+
+    fn compact_if_needed(&mut self) {
+        if self.start >= UPLOAD_COMPACT_THRESHOLD && self.start * 2 >= self.buf.len() {
+            self.buf.copy_within(self.start.., 0);
+            self.buf.truncate(self.len());
+            self.start = 0;
+        }
+    }
+}
+
 /// 块循环中的暂停/取消检查点：暂停时阻塞轮询，取消时上报并返回哨兵错误。
 fn pause_or_cancel(
     signal: &TransferSignal,
@@ -514,18 +578,42 @@ fn transfer_upload_one(
         reporter.advance(offset);
     }
 
-    let mut buf = vec![0u8; TRANSFER_CHUNK_SIZE];
+    // 不能用 write_all 按块等待：它会把当前块全部 ACK 完才读下一块，窗口在块边界被排空。
+    // 这里保持约 4MB 未确认数据，每次只消费已 ACK 的前缀并立刻补新数据。
+    // 进度只计已确认字节；续传仍以远端文件长度为准，不把尚未 ACK 的数据算进已传。
+    let mut window = UploadWindow::with_capacity(UPLOAD_WINDOW_SIZE * 2);
+    let mut read_buf = vec![0u8; UPLOAD_FILL_CHUNK];
+    let mut local_eof = false;
     loop {
         pause_or_cancel(signal, reporter, app)?;
-        let n = local_file
-            .read(&mut buf)
-            .map_err(|e| format!("读取本地文件失败: {}", e))?;
-        if n == 0 {
+
+        if !local_eof {
+            let room = UPLOAD_WINDOW_SIZE.saturating_sub(window.len());
+            // 窗口快满时不补几十字节，等腾出至少一块的 1/4 再读盘。
+            if room >= UPLOAD_FILL_CHUNK / 4 {
+                let to_read = room.min(read_buf.len());
+                let n = local_file
+                    .read(&mut read_buf[..to_read])
+                    .map_err(|e| format!("读取本地文件失败: {}", e))?;
+                if n == 0 {
+                    local_eof = true;
+                } else {
+                    window.extend_from_slice(&read_buf[..n]);
+                }
+            }
+        }
+
+        if window.is_empty() {
             break;
         }
-        remote_file
-            .write_all(&buf[..n])
+
+        let n = remote_file
+            .write(window.as_slice())
             .map_err(|e| format!("传输中断: {}", e))?;
+        if n == 0 || n > window.len() {
+            return Err("传输中断: 远端确认的字节数异常".into());
+        }
+        window.consume(n);
         reporter.advance(n as u64);
         signal.set_transferred(reporter.transferred);
         reporter.report(app, "running", false);
@@ -570,7 +658,8 @@ fn transfer_download_one(
         reporter.advance(offset);
     }
 
-    let mut buf = vec![0u8; TRANSFER_CHUNK_SIZE];
+    // 读缓冲越大，libssh2 预读越深（约 4 倍）。预读状态跨 read 调用保留，不会在块边界排空。
+    let mut buf = vec![0u8; DOWNLOAD_READ_SIZE];
     loop {
         pause_or_cancel(signal, reporter, app)?;
         let n = remote_file
@@ -1087,5 +1176,29 @@ mod tests {
         assert_eq!(parse_home_marker("SNAIL_HOME:\n"), None);
         assert_eq!(parse_home_marker("SNAIL_HOME:relative\n"), None);
         assert_eq!(parse_home_marker("not a marker\n"), None);
+    }
+
+    #[test]
+    fn upload_window_keeps_unacked_prefix_and_compacts() {
+        let mut window = super::UploadWindow::with_capacity(64);
+        window.extend_from_slice(b"abcdefghij");
+        window.consume(3);
+        assert_eq!(window.as_slice(), b"defghij");
+        window.extend_from_slice(b"XYZ");
+        assert_eq!(window.as_slice(), b"defghijXYZ");
+        window.consume(window.len());
+        assert!(window.is_empty());
+        window.extend_from_slice(b"next");
+        assert_eq!(window.as_slice(), b"next");
+
+        let chunk = vec![0xABu8; super::UPLOAD_FILL_CHUNK];
+        while window.len() < super::UPLOAD_WINDOW_SIZE {
+            window.extend_from_slice(&chunk);
+        }
+        let keep = 16;
+        let tail = window.as_slice()[window.len() - keep..].to_vec();
+        window.consume(window.len() - keep);
+        assert_eq!(window.as_slice(), tail.as_slice());
+        assert_eq!(window.start, 0);
     }
 }
