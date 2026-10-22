@@ -1,12 +1,15 @@
+mod conn;
 mod history;
+mod rt;
 mod settings;
 mod sftp;
+mod sftp_compat;
 mod ssh;
 mod storage;
 mod transfer;
 
+use conn::Conn;
 use history::HistoryEntry;
-use parking_lot::Mutex as ParkingMutex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sftp::SftpFileItem;
@@ -43,7 +46,7 @@ async fn run_transfer<F>(
     job: F,
 ) -> Result<(), String>
 where
-    F: FnOnce(Arc<ParkingMutex<ssh2::Session>>, Arc<TransferSignal>) -> Result<(), String>
+    F: FnOnce(Arc<Conn>, Arc<TransferSignal>) -> Result<(), String>
         + Send
         + 'static,
 {

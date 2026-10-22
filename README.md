@@ -10,7 +10,7 @@
 | 层面 | 选型 | 特性与优势 |
 | :--- | :--- | :--- |
 | **桌面框架** | **Tauri v2** | 原生轻量化（Windows 安装包实测 3~5MB 量级，远优于 Electron 的 300MB+） |
-| **后端核心** | **Rust (`ssh2`, `tokio`, `tauri 2.0`)** | 原生多线程非阻塞 I/O，高性能流式 SFTP 传输与 PTY 进程管理，安全可控 |
+| **后端核心** | **Rust (`russh`, `russh-sftp`, `tokio`, `tauri 2.0`)** | 纯 Rust SSH 协议栈（支持 ed25519 与 OpenSSH 证书主机密钥），异步多路复用通道，流式 SFTP 传输与真实 PTY |
 | **前端体系** | **Vue 3 + Vite + TypeScript** | 现代 Composition API，极速 HMR 热重载与强类型支持 |
 | **终端引擎** | **`@xterm/xterm` + `addon-fit` / `addon-search` / `addon-unicode11` / `addon-web-links`** | 行业标准级 xterm.js ANSI 彩色终端渲染，内置查找、CJK 宽字符修正与链接识别 |
 | **样式与设计** | **Tailwind CSS + Lucide Icons** | Warp / Raycast / Linear 暗黑风格设计系统，毛玻璃磨砂与发光微质感 |
@@ -31,13 +31,13 @@
 * **会话工作区 (Workspace)**：每个会话是「左侧文件区 + 可拖拽分隔条（默认 280px，双击复位）+ 右侧终端 / SFTP」的组合视图，由 `SessionWorkspace.vue` 统一承载。连接后左侧文件工作区默认打开远端登录用户的家目录（探测失败时回退到 SFTP 当前目录），并以平铺列表显示、默认展示点开头的隐藏文件；仍可手动切回树形或关掉隐藏文件。
 * **底部实时指标条**：工作区底部常驻 `RemoteMonitorBar.vue`，展示主机名 / 发行版、CPU、内存（已用 / 总量）、实时上下行网络吞吐、Uptime、登录用户数与主要磁盘分区占用；数据来自后端 `get_remote_metrics`（按 2.5s 轮询，仅在当前活动会话且监控开启时刷新）。新建会话默认展开，可在设置中心「终端外观」关闭默认展开，或对单个会话用文件树工具栏的监控按钮 / 信息栏右侧红点即时开关。
 * **多会话标签页 (Tab Bar)**：支持多会话并行切换、动态新建终端、独立关闭会话。
-* **真实 PTY 交互通道**：Rust 后端通过 libssh2 分配真实 `xterm-256color` PTY 并启动 Shell，后台线程实时通过 Tauri 事件向前端广播 stdout/stderr，支持双向交互输入与窗口尺寸 Resize。
+* **真实 PTY 交互通道**：Rust 后端通过 russh 分配真实 `xterm-256color` PTY 并启动 Shell，输出泵任务实时通过 Tauri 事件向前端广播 stdout/stderr，支持双向交互输入与窗口尺寸 Resize。
 * **常用指令代码片段 (Snippets)**：终端工具栏一键向终端发送常用命令，片段在设置中心可增删、改名、排序（默认 `docker ps`, `free -h`, `df -h`, `systemctl status nginx`, `netstat -tulpn`, `htop`）。命令末尾是否带换行由片段内容决定：带换行立即执行，不带则只填进命令行等待确认。
 * **独立命令输入框 (Compose Bar)**：`Ctrl+Enter` 唤出终端底部输入条，`Enter` 发送、`Shift+Enter` 换行，可先写多行脚本/长命令再一次性下发；`↑/↓` 在草稿为空时浏览本机历史命令，点击候选即填入。输入框只在需要时接管键盘，`vim` / `htop` / `less` 等交互式程序仍直接在终端里操作。草稿命中危险命令（`rm -rf`、`mkfs`、`dd of=/dev/*`、`shutdown` 等）时输入条下方即时标红；若当前主机属于「高风险」分组，发送前会再弹一次确认。
 * **终端标签快捷键**：`Ctrl+Tab` / `Ctrl+Shift+Tab` 切换标签，`Ctrl+1`~`Ctrl+9` 直达第 N 个标签。
 * **环境色标识**：分组可配置颜色与「高风险」标记，颜色同时出现在标题栏会话标签、终端标签页、文件工作区标头与 SFTP 主机选择器上，降低「在哪个环境敲命令」的认知成本。
 * **终端与 SFTP 快速联动**：终端顶栏提供“打开 SFTP”按钮，一键打开对应主机的文件管理器。
-* **非阻塞双向通道**：Shell 会话以 libssh2 非阻塞模式读写，读线程不再长时间持锁，输入/回显互不阻塞；输出按 UTF-8 边界增量解码，避免中文被分片截断。
+* **非阻塞双向通道**：Shell 通道由独立输出泵任务独占（读远端输出与写按键输入在同一事件循环），输入/回显互不阻塞；输出按 UTF-8 边界增量解码，避免中文被分片截断。
 * **主机密钥校验**：复用 `~/.ssh/known_hosts`，首次连接展示 SHA256 指纹由用户确认（TOFU）后写入；密钥与记录不一致时直接阻断连接，防止中间人攻击。
 * **终端内搜索 (Ctrl+F)**：不用离开终端即可查找回显内容，支持上一个/下一个跳转、命中计数，以及区分大小写 / 全字匹配 / 正则三个开关。
 * **终端剪贴板快捷键**：`Ctrl+Shift+C` / `Ctrl+Insert` 复制选中内容，`Ctrl+Shift+V` / `Shift+Insert` 粘贴；终端内右键菜单提供复制 / 粘贴 / 全选 / 语法高亮开关与设置 / 查找 / 清除屏幕。
@@ -106,10 +106,13 @@
 
 其它限制：
 
+* SSH 栈已从 libssh2 换成 russh：Windows 上也支持 ed25519 / OpenSSH 证书主机密钥（旧版只支持 RSA 主机密钥，遇到仅提供证书主机密钥的服务器会握手失败）。证书主机密钥按 `~/.ssh/known_hosts` 中的裸公钥或 `@cert-authority` 记录校验，`@revoked` 一律拒绝。
+* 「SSH Agent」认证在 Windows 上只支持 Pageant（russh 的 Unix socket 代理仅 Unix 编译）；本机 OpenSSH 的 `ssh-agent` 服务未运行时该方式会失败，建议改用私钥认证，私钥填绝对路径（例如 `C:\Users\<用户名>\.ssh\id_rsa`）。
+* 认证前会先尝试 `none`（与 OpenSSH 行为一致）：部分网关（用户名即连接令牌）不需要任何凭证即可登录。
 * 在线编辑器的高亮和折叠在本地完成，不连接语言服务器。认不出的后缀按纯文本显示，仍可用缩进或括号折叠。混合换行（同一文件里既有 LF 又有 CRLF）保存时会规范为 LF。
 * 远端探测脚本依赖 Linux 常见命令（`/etc/os-release`、`free`、`df`、`/proc/stat`），非 Linux 主机的 CPU/内存指标可能采集不到。
-* 传输任务已支持暂停 / 继续 / 取消 / 重试与断点续传。暂停为协作式：进入暂停后约 120ms 轮询；上传大约每个 ACK 检查一次，下载要等当前最多 1MB 读完。阻塞在 libssh2 调用内时无法立刻打断。
-* 大文件仍走单连接 SFTP。libssh2 单次请求约 30KB，上传在途约 4MB、下载预读约 4MB；延迟很高或带宽远大于该窗口时仍可能跑不满。多文件顺序传输，不并发。
+* 传输任务已支持暂停 / 继续 / 取消 / 重试与断点续传。暂停为协作式：进入暂停后约 120ms 轮询；上传大约每个回执检查一次，下载要等当前最多 1MB 读完。阻塞在单个 SFTP 请求内时无法立刻打断。
+* 大文件仍走单连接 SFTP。russh-sftp 单包约 32KB、并发读写各 16 个请求，上传在途约 4MB、下载缓冲 1MB；延迟很高或带宽远大于该窗口时仍可能跑不满。多文件顺序传输，不并发。
 * 同一会话的传输独占其 SFTP 连接：传输（含暂停）期间该会话的文件列表刷新/浏览会被阻塞，需继续或取消后恢复。
 * 续传仅按目标文件长度判断：若目标文件被外部改成「等长但内容不同」，会被视为已传/从头重传，后端不做 mtime / hash 内容校验。
 * 目录上传/下载会跳过与源等大的文件（视为已传），不逐一做 md5 校验。
@@ -147,7 +150,7 @@ snail-ssh/
 │   └── logo.svg
 ├── public/                 # Vite 静态资源（favicon.ico / favicon.svg / logo.svg）
 ├── src-tauri/              # Rust 原生后端工程 (Tauri v2)
-│   ├── Cargo.toml          # Rust 依赖声明 (tauri 2.0, ssh2, tokio, serde, keyring, sha2 等)
+│   ├── Cargo.toml          # Rust 依赖声明 (tauri 2.0, russh, russh-sftp, tokio, serde, keyring, sha2 等)
 │   ├── Cargo.lock
 │   ├── build.rs            # tauri-build 构建脚本
 │   ├── tauri.conf.json     # 窗口、前后端联调命令与打包配置
@@ -156,7 +159,10 @@ snail-ssh/
 │   └── src/
 │       ├── main.rs         # 桌面客户端可执行入口
 │       ├── lib.rs          # Tauri 命令调度、状态注入与 generate_handler 注册表
-│       ├── ssh.rs          # SSH 核心：TCP握手、认证、PTY申请、Shell双向读写流、known_hosts 校验、会话日志
+│       ├── ssh.rs          # 会话层：PTY 申请、Shell 输出泵、首屏抓取、CWD 探测、会话日志与事件广播
+│       ├── conn.rs         # 连接层：russh 握手、认证（none/密码/私钥/Agent）、known_hosts 校验、一次性 exec、SFTP 会话
+│       ├── sftp_compat.rs  # SFTP 同步门面：把 russh-sftp 异步 API 适配为原有文件操作语义
+│       ├── rt.rs           # 网络层 tokio 运行时（阻塞线程 block_on 桥接 + 常驻任务 spawn）
 │       ├── sftp.rs         # SFTP 核心：目录遍历、文件读写、分块流式上传下载、进度与续传
 │       ├── transfer.rs     # 传输控制信号注册表（暂停 / 取消 / 续传检查点）
 │       ├── history.rs      # 命令历史持久化（去重累计、频次裁剪、敏感命令过滤）

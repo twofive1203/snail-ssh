@@ -1,31 +1,24 @@
-use base64::Engine as _;
+use crate::conn::Conn;
+use crate::rt;
 use parking_lot::Mutex;
+use russh::ChannelMsg;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-use ssh2::{CheckResult, KnownHostFileKind};
 use std::collections::HashMap;
 use std::fs;
-use std::io::{ErrorKind, Read, Write};
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
-use std::path::{Path, PathBuf};
+use std::io::Write;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter};
+use tokio::sync::mpsc as tokio_mpsc;
 use uuid::Uuid;
 
-/// libssh2 的 LIBSSH2_ERROR_EAGAIN：非阻塞模式下表示"暂时不可读写，稍后重试"
-const LIBSSH2_EAGAIN: i32 = -37;
-/// 非阻塞读的轮询间隔，兼顾输入回显延迟与 CPU 占用
-const IO_POLL_INTERVAL: Duration = Duration::from_millis(5);
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const PTY_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
+/// 写入指令通道的容量：远端不消费输入时在这里形成背压
+const SHELL_COMMAND_CAPACITY: usize = 256;
+/// 写入超时：远端窗口长时间不打开时判为卡死，避免命令线程永久阻塞
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
-/// SFTP 会话走阻塞模式，超时兜底避免服务器无响应时线程永久挂起
-const SFTP_IO_TIMEOUT_MS: u32 = 30_000;
-/// 工作目录探测的整体超时，避免远端命令挂住时阻塞自动跟随
-const CWD_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Shell 启动后的首屏输出（Last login / MOTD / 首个提示符）抓取窗口。
 /// 这几行由远端在 shell 刚起来时立刻发出，而前端要等 Vue 渲染完才注册 stdout 监听，
@@ -139,24 +132,6 @@ struct RemoteMetricsSnapshot {
     net_rx_bytes: u64,
     net_tx_bytes: u64,
 }
-
-pub struct ActiveSession {
-    /// Shell 会话：握手完成后切非阻塞，避免读阻塞锁死写入。
-    /// 同时持有该 Arc 以保证底层连接不会被提前释放。
-    /// 工作目录探测也在它上面开瞬态通道：必须与本会话的 shell 同属一条连接，
-    /// 才能按“同父兄弟进程”精确认出本会话，而不是靠 pts 活跃度去猜。
-    session: Arc<Mutex<ssh2::Session>>,
-    channel: Arc<Mutex<ssh2::Channel>>,
-    /// SFTP 专用会话（首次使用 SFTP 时懒加载的独立连接）
-    sftp_session: Arc<Mutex<Option<Arc<Mutex<ssh2::Session>>>>>,
-    config: SshConnectConfig,
-    is_alive: Arc<AtomicBool>,
-    /// 建连时扣下的首屏输出，等前端注册好监听后由 take_initial_output 取走（只取一次）
-    banner: Arc<Mutex<String>>,
-    /// 会话日志槽：开着时读线程把脱敏后的输出 try_send 给专用 writer 线程
-    log_sink: Arc<Mutex<Option<LogSink>>>,
-}
-
 /// 会话日志的写入句柄：路径用于前端展示，tx 交给 writer 线程落盘。
 /// 直接 drop 即关闭 channel，writer 线程随之 flush 退出。
 struct LogSink {
@@ -406,6 +381,34 @@ fn push_log(
     }
 }
 
+/// 终端会话：shell 通道本体由输出泵任务独占，其余线程通过指令通道操作它。
+pub struct ActiveSession {
+    /// 终端连接：shell 输出泵、工作目录探测、一次性 exec 都跑在这条连接上
+    conn: Arc<Conn>,
+    shell: ShellHandle,
+    /// SFTP 专用连接（首次使用时懒加载的独立连接）
+    sftp_conn: Arc<Mutex<Option<Arc<Conn>>>>,
+    config: SshConnectConfig,
+    is_alive: Arc<AtomicBool>,
+    /// 建连时扣下的首屏输出，等前端注册好监听后由 take_initial_output 取走（只取一次）
+    banner: Arc<Mutex<String>>,
+    /// 会话日志槽：开着时输出泵把脱敏后的内容 try_send 给专用 writer 线程
+    log_sink: Arc<Mutex<Option<LogSink>>>,
+}
+
+/// 终端 shell 的写输入 / 改窗口 / 关闭指令
+enum ShellCmd {
+    Write(Vec<u8>),
+    Resize { cols: u32, rows: u32 },
+    Close,
+}
+
+/// shell 通道的写入口：通道被输出泵任务独占，避免"读线程持锁阻塞、写线程拿不到锁"
+struct ShellHandle {
+    tx: tokio_mpsc::Sender<ShellCmd>,
+    task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
 #[derive(Clone)]
 pub struct SshManager {
     sessions: Arc<Mutex<HashMap<String, Arc<ActiveSession>>>>,
@@ -425,114 +428,55 @@ impl SshManager {
         config: SshConnectConfig,
         app_handle: AppHandle,
     ) -> Result<String, String> {
-        let sess =
-            connect_and_auth(&config).map(|(session, _host_key)| session)?;
-
-        // 关键：切非阻塞后再申请 PTY/Shell，这样 read/write 都只做短暂持锁，
-        // 不会出现"读线程持锁阻塞、写线程永远拿不到锁"的死锁。
-        sess.set_blocking(false);
-
-        let mut channel = wait_retry(|| sess.channel_session(), PTY_WAIT_TIMEOUT)
-            .map_err(|e| format!("打开 Shell 通道失败: {}", e))?;
-
-        let cols = config.cols.max(1);
-        let rows = config.rows.max(1);
-        wait_retry(
-            || channel.request_pty("xterm-256color", None, Some((cols, rows, 0, 0))),
-            PTY_WAIT_TIMEOUT,
-        )
-        .map_err(|e| format!("申请 PTY 失败: {}", e))?;
-        wait_retry(|| channel.shell(), PTY_WAIT_TIMEOUT)
-            .map_err(|e| format!("启动 Shell 失败: {}", e))?;
-
-        // 先同步扣下首屏（Last login / MOTD / 首个提示符）：此时前端还没注册监听，
-        // 交给下面的读线程 emit 只会被丢掉。读取量极小且带超时，不影响建连耗时。
-        let banner = read_initial_output(&mut channel).unwrap_or_default();
-
         let session_id = format!("ssh-{}", Uuid::new_v4());
-        let channel_arc = Arc::new(Mutex::new(channel));
         let is_alive = Arc::new(AtomicBool::new(true));
         let log_sink: Arc<Mutex<Option<LogSink>>> = Arc::new(Mutex::new(None));
+        let banner: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
 
-        // 后台读取远端输出并广播给前端（非阻塞读 + 短轮询）
-        let channel_reader = Arc::clone(&channel_arc);
-        let is_alive_reader = Arc::clone(&is_alive);
-        let log_sink_reader = Arc::clone(&log_sink);
-        let app = app_handle.clone();
         let stdout_event = format!("ssh-stdout-{}", session_id);
         let closed_event = format!("ssh-closed-{}", session_id);
 
-        std::thread::spawn(move || {
-            let mut buf = [0u8; 16 * 1024];
-            let mut pending: Vec<u8> = Vec::new();
-            let mut exit_reason: Option<&str> = None;
-            let mut log_backpressure_warned = false;
-            let mut log_binary_warned = false;
+        let (conn, shell) = rt::block_on({
+            let config = config.clone();
+            let is_alive = Arc::clone(&is_alive);
+            let log_sink = Arc::clone(&log_sink);
+            let banner = Arc::clone(&banner);
+            let app = app_handle.clone();
+            async move {
+                let conn = Conn::connect_async(config.clone()).await?;
+                let mut channel =
+                    Conn::open_shell(conn.handle(), config.cols, config.rows).await?;
 
-            while is_alive_reader.load(Ordering::Relaxed) {
-                let read_result = {
-                    let mut ch = channel_reader.lock();
-                    match ch.read(&mut buf) {
-                        Ok(n) => Ok((n, ch.eof())),
-                        Err(e) => Err(e),
-                    }
-                };
+                // 先同步扣下首屏：此时前端还没注册监听，交给输出泵 emit 只会被丢掉。
+                *banner.lock() = read_initial_output(&mut channel).await;
 
-                match read_result {
-                    Ok((n, _)) if n > 0 => {
-                        // 按 UTF-8 边界解码，避免多字节字符被分片截断出现乱码
-                        let text = decode_stream(&mut pending, &buf[..n]);
-                        if !text.is_empty() {
-                            // 先 emit（保持原行为与顺序不变），再异步落盘；
-                            // 未开启日志时不 clone，避免无谓分配
-                            match current_log_tx(&log_sink_reader) {
-                                Some(tx) => {
-                                    let _ = app.emit(&stdout_event, text.clone());
-                                    push_log(&tx, &text, &mut log_backpressure_warned, &mut log_binary_warned);
-                                }
-                                None => {
-                                    let _ = app.emit(&stdout_event, text);
-                                }
-                            }
-                        }
-                    }
-                    Ok((_, eof)) => {
-                        if eof {
-                            exit_reason = Some("远端已关闭 Shell 会话");
-                            break;
-                        }
-                        std::thread::sleep(IO_POLL_INTERVAL);
-                    }
-                    Err(e) if e.kind() == ErrorKind::WouldBlock => {
-                        std::thread::sleep(IO_POLL_INTERVAL);
-                    }
-                    Err(_) => {
-                        exit_reason = Some("SSH 连接已中断");
-                        break;
-                    }
-                }
+                let (tx, rx) = tokio_mpsc::channel(SHELL_COMMAND_CAPACITY);
+                let task = spawn_shell_pump(
+                    channel,
+                    rx,
+                    Arc::new(app),
+                    stdout_event,
+                    closed_event,
+                    Arc::clone(&is_alive),
+                    Arc::clone(&log_sink),
+                );
+                Ok::<_, String>((
+                    conn,
+                    ShellHandle {
+                        tx,
+                        task: Mutex::new(Some(task)),
+                    },
+                ))
             }
-
-            if !pending.is_empty() {
-                let tail = String::from_utf8_lossy(&pending).to_string();
-                let _ = app.emit(&stdout_event, tail.clone());
-                if let Some(tx) = current_log_tx(&log_sink_reader) {
-                    push_log(&tx, &tail, &mut log_backpressure_warned, &mut log_binary_warned);
-                }
-            }
-            if let Some(reason) = exit_reason {
-                is_alive_reader.store(false, Ordering::Relaxed);
-                let _ = app.emit(&closed_event, reason.to_string());
-            }
-        });
+        })?;
 
         let active = Arc::new(ActiveSession {
-            session: Arc::new(Mutex::new(sess)),
-            channel: channel_arc,
-            sftp_session: Arc::new(Mutex::new(None)),
+            conn,
+            shell,
+            sftp_conn: Arc::new(Mutex::new(None)),
             config,
             is_alive,
-            banner: Arc::new(Mutex::new(banner)),
+            banner,
             log_sink,
         });
         self.sessions.lock().insert(session_id.clone(), active);
@@ -547,54 +491,38 @@ impl SshManager {
             .ok_or_else(|| "会话不存在或已关闭".to_string())
     }
 
-    /// 非阻塞写入：写不进（窗口满/远端未消费）时短暂退让重试，并保证不长时间持锁
+    /// 写入远端：指令通道满（远端未消费）时短暂退让重试，超时即判失败
     pub fn write_session(&self, session_id: &str, data: &str) -> Result<(), String> {
         if data.is_empty() {
             return Ok(());
         }
-        let active = self.get_active(session_id)?;        if !active.is_alive.load(Ordering::Relaxed) {
+        let active = self.get_active(session_id)?;
+        if !active.is_alive.load(Ordering::Relaxed) {
             return Err("会话已断开".into());
         }
 
-        let bytes = data.as_bytes();
-        let mut written = 0usize;
+        let bytes = data.as_bytes().to_vec();
         let start = Instant::now();
-
-        while written < bytes.len() {
-            let step = {
-                let mut ch = active.channel.lock();
-                ch.write(&bytes[written..])
-            };
-            match step {
-                Ok(0) => {}
-                Ok(n) => {
-                    written += n;
-                    continue;
+        loop {
+            match active.shell.tx.try_send(ShellCmd::Write(bytes.clone())) {
+                Ok(()) => return Ok(()),
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    if start.elapsed() > WRITE_TIMEOUT {
+                        return Err("写入超时（远端未消费输入）".into());
+                    }
+                    std::thread::sleep(Duration::from_millis(2));
                 }
-                Err(e) if e.kind() == ErrorKind::WouldBlock => {}
-                Err(e) if e.kind() == ErrorKind::BrokenPipe => {
-                    return Err("会话已断开，无法写入".into())
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    return Err("会话已断开，无法写入".into());
                 }
-                Err(e) => return Err(format!("写入失败: {}", e)),
             }
-
-            if start.elapsed() > WRITE_TIMEOUT {
-                return Err("写入超时（远端未消费输入）".into());
-            }
-            std::thread::sleep(IO_POLL_INTERVAL);
         }
-        Ok(())
     }
 
     pub fn resize_session(&self, session_id: &str, cols: u32, rows: u32) -> Result<(), String> {
         let active = self.get_active(session_id)?;
-        let mut ch = active.channel.lock();
-        // 窗口尺寸属于尽力而为的调整，失败不影响终端可用性；
-        // 超时取值较短，避免拖拽窗口时长时间占用通道锁卡住回显
-        let _ = wait_retry(
-            || ch.request_pty_size(cols.max(1), rows.max(1), None, None),
-            Duration::from_millis(300),
-        );
+        // 窗口尺寸属于尽力而为的调整，失败不影响终端可用性
+        let _ = active.shell.tx.try_send(ShellCmd::Resize { cols, rows });
         Ok(())
     }
 
@@ -605,9 +533,16 @@ impl SshManager {
             active.is_alive.store(false, Ordering::Relaxed);
             // 显式 drop 日志槽：关闭 channel 让 writer 线程退出并 flush，避免尾部内容丢失
             active.log_sink.lock().take();
-            // 尽力关闭通道；SFTP 会话随 Arc 释放（进行中的传输结束后自动断开）
-            if let Some(mut ch) = active.channel.try_lock() {
-                let _ = wait_retry(|| ch.close(), Duration::from_secs(2));
+            // 尽力关闭通道；SFTP 连接随 Arc 释放
+            let _ = active.shell.tx.try_send(ShellCmd::Close);
+            let conn = Arc::clone(&active.conn);
+            rt::spawn(async move {
+                // 给输出泵一点时间把 Close 发出去，然后断开整条连接
+                tokio::time::sleep(Duration::from_millis(80)).await;
+                conn.disconnect_async().await;
+            });
+            if let Some(task) = active.shell.task.lock().take() {
+                task.abort();
             }
         }
         Ok(())
@@ -675,20 +610,18 @@ impl SshManager {
     }
 
     /// 获取（必要时懒加载）该会话专属的 SFTP 连接，与终端 Shell 互不干扰
-    pub fn get_sftp_session(&self, session_id: &str) -> Result<Arc<Mutex<ssh2::Session>>, String> {        let active = self.get_active(session_id)?;
+    pub fn get_sftp_session(&self, session_id: &str) -> Result<Arc<Conn>, String> {
+        let active = self.get_active(session_id)?;
 
         // 快路径：已建立则直接复用
-        if let Some(existing) = active.sftp_session.lock().as_ref() {
+        if let Some(existing) = active.sftp_conn.lock().as_ref() {
             return Ok(Arc::clone(existing));
         }
 
         // 建连期间不持有会话表锁，避免阻塞其他会话操作
-        let config = active.config.clone();
-        let sess = connect_and_auth(&config).map(|(session, _host_key)| session)?;
-        sess.set_timeout(SFTP_IO_TIMEOUT_MS);
-        let created = Arc::new(Mutex::new(sess));
+        let created = Conn::connect(&active.config)?;
 
-        let mut slot = active.sftp_session.lock();
+        let mut slot = active.sftp_conn.lock();
         if let Some(existing) = slot.as_ref() {
             // 并发进入时复用先建立好的连接
             return Ok(Arc::clone(existing));
@@ -713,10 +646,7 @@ impl SshManager {
             return Err("会话已断开".into());
         }
 
-        let output = {
-            let sess = active.session.lock();
-            run_probe_command(&sess, CWD_DETECT_SCRIPT)?
-        };
+        let output = active.conn.exec(CWD_DETECT_SCRIPT)?;
 
         let path = output
             .lines()
@@ -747,8 +677,7 @@ impl SshManager {
         if !active.is_alive.load(Ordering::Relaxed) {
             return Err("会话已断开".into());
         }
-        let sess = active.session.lock();
-        run_probe_command(&sess, command)
+        active.conn.exec(command)
     }
 
     /// 采集远端主机实时系统指标（MobaXterm 风格底部监控条），复用终端连接瞬态 exec
@@ -759,10 +688,7 @@ impl SshManager {
         }
 
         let default_host = active.config.host.clone();
-        let output = {
-            let sess = active.session.lock();
-            run_probe_command(&sess, REMOTE_METRICS_SCRIPT)?
-        };
+        let output = active.conn.exec(REMOTE_METRICS_SCRIPT)?;
 
         let prev_snap = self.metrics_cache.lock().get(session_id).cloned();
         let (metrics, new_snap) = parse_remote_metrics(&output, prev_snap, &default_host);
@@ -772,82 +698,156 @@ impl SshManager {
     }
 }
 
-/// 建连时同步扣下 shell 首屏输出。
-/// 会话已切非阻塞，因此按 EAGAIN 轮询；读到数据后静默 `BANNER_QUIET_GAP` 即收工，
-/// 始终没有数据（远端既不打印 Last login 也无 MOTD）则按 `BANNER_FIRST_BYTE_TIMEOUT` 收工。
-fn read_initial_output(channel: &mut ssh2::Channel) -> Result<String, String> {
+/// 输出端：把远端输出与关闭原因送出去。
+/// 生产环境是 Tauri 事件广播，集成测试里换成内存收集器，两边跑同一套输出泵逻辑。
+pub(crate) trait ShellEventSink: Send + Sync + 'static {
+    fn send(&self, event: &str, payload: String);
+}
+
+impl ShellEventSink for AppHandle {
+    fn send(&self, event: &str, payload: String) {
+        let _ = self.emit(event, payload);
+    }
+}
+
+/// 建连时同步扣下 shell 首屏输出（Last login / MOTD / 首个提示符）。
+/// 读到数据后静默 `BANNER_QUIET_GAP` 即收工，始终无数据则按 `BANNER_FIRST_BYTE_TIMEOUT` 收工，
+/// 总耗时不超过 `BANNER_MAX_WAIT`。
+async fn read_initial_output(channel: &mut crate::conn::ShellChannel) -> String {
     let mut out = String::new();
     let mut pending: Vec<u8> = Vec::new();
-    let mut buf = [0u8; 8192];
     let start = Instant::now();
     let mut last_data: Option<Instant> = None;
 
     loop {
-        match channel.read(&mut buf) {
-            Ok(0) => {
-                // libssh2 非阻塞模式下 0 字节可能是 EOF，也可能只是本次没读到
-                if channel.eof() {
-                    break;
-                }
-            }
-            Ok(n) => {
-                out.push_str(&decode_stream(&mut pending, &buf[..n]));
-                last_data = Some(Instant::now());
-                continue;
-            }
-            Err(e) if e.kind() == ErrorKind::WouldBlock => {}
-            Err(e) => return Err(format!("读取会话首屏输出失败: {}", e)),
-        }
-
         let now = Instant::now();
-        let waited = now.duration_since(start);
-        let finished = match last_data {
-            Some(t) => now.duration_since(t) >= BANNER_QUIET_GAP || waited >= BANNER_MAX_WAIT,
-            None => waited >= BANNER_FIRST_BYTE_TIMEOUT,
-        };
-        if finished {
+        if now.duration_since(start) >= BANNER_MAX_WAIT {
             break;
         }
-        std::thread::sleep(IO_POLL_INTERVAL);
+        let deadline = match last_data {
+            Some(at) => at + BANNER_QUIET_GAP,
+            None => start + BANNER_FIRST_BYTE_TIMEOUT,
+        };
+        let wait = deadline.saturating_duration_since(now);
+        if wait.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(wait, channel.wait()).await {
+            Err(_) => break,
+            Ok(None) => break,
+            Ok(Some(ChannelMsg::Data { data })) | Ok(Some(ChannelMsg::ExtendedData { data, .. })) => {
+                out.push_str(&decode_stream(&mut pending, &data));
+                last_data = Some(Instant::now());
+            }
+            Ok(Some(ChannelMsg::Eof)) | Ok(Some(ChannelMsg::Close)) => break,
+            Ok(Some(_)) => {}
+        }
     }
 
     // 收尾时残留在缓冲区里的多字节序列按宽松解码补上，避免丢掉末尾字符
     if !pending.is_empty() {
         out.push_str(&String::from_utf8_lossy(&pending));
     }
-    Ok(out)
+    out
 }
 
-/// 在指定连接上开一个瞬态 exec 通道执行脚本并读回输出。
-/// 会话可能处于非阻塞模式，因此按 EAGAIN 轮询并在超时后返回已读到的内容。
-fn run_probe_command(sess: &ssh2::Session, command: &str) -> Result<String, String> {
-    let mut channel = wait_retry(|| sess.channel_session(), PTY_WAIT_TIMEOUT)
-        .map_err(|e| format!("打开命令通道失败: {}", e))?;
-    wait_retry(|| channel.exec(command), PTY_WAIT_TIMEOUT)
-        .map_err(|e| format!("执行命令失败: {}", e))?;
-
-    let mut output: Vec<u8> = Vec::new();
-    let mut buf = [0u8; 4096];
-    let start = Instant::now();
-    loop {
-        match channel.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => output.extend_from_slice(&buf[..n]),
-            Err(e) if e.kind() == ErrorKind::WouldBlock => {
-                if start.elapsed() >= CWD_PROBE_TIMEOUT {
-                    break;
-                }
-                std::thread::sleep(IO_POLL_INTERVAL);
-            }
-            Err(e) => return Err(format!("读取命令输出失败: {}", e)),
-        }
-        if start.elapsed() >= CWD_PROBE_TIMEOUT {
-            break;
-        }
+/// 输出广播：先 emit（保持原行为与顺序不变），再异步落盘
+fn publish_output(
+    sink: &dyn ShellEventSink,
+    event: &str,
+    text: String,
+    log_sink: &Arc<Mutex<Option<LogSink>>>,
+    log_backpressure_warned: &mut bool,
+    log_binary_warned: &mut bool,
+) {
+    if text.is_empty() {
+        return;
     }
-    let _ = wait_retry(|| channel.wait_close(), Duration::from_secs(1));
+    match current_log_tx(log_sink) {
+        Some(tx) => {
+            sink.send(event, text.clone());
+            push_log(&tx, &text, log_backpressure_warned, log_binary_warned);
+        }
+        None => sink.send(event, text),
+    }
+}
 
-    Ok(String::from_utf8_lossy(&output).to_string())
+/// 启动 shell 输出泵：独占通道，一边转发远端输出，一边执行上游的写/改窗口/关闭指令。
+fn spawn_shell_pump(
+    mut channel: crate::conn::ShellChannel,
+    mut rx: tokio_mpsc::Receiver<ShellCmd>,
+    sink: Arc<dyn ShellEventSink>,
+    stdout_event: String,
+    closed_event: String,
+    is_alive: Arc<AtomicBool>,
+    log_sink: Arc<Mutex<Option<LogSink>>>,
+) -> tokio::task::JoinHandle<()> {
+    rt::spawn(async move {
+        let mut pending: Vec<u8> = Vec::new();
+        let mut exit_reason: Option<&'static str> = None;
+        let mut log_backpressure_warned = false;
+        let mut log_binary_warned = false;
+
+        loop {
+            tokio::select! {
+                message = channel.wait() => match message {
+                    Some(ChannelMsg::Data { data })
+                    | Some(ChannelMsg::ExtendedData { data, .. }) => {
+                        // 按 UTF-8 边界解码，避免多字节字符被分片截断出现乱码
+                        let text = decode_stream(&mut pending, &data);
+                        publish_output(
+                            sink.as_ref(),
+                            &stdout_event,
+                            text,
+                            &log_sink,
+                            &mut log_backpressure_warned,
+                            &mut log_binary_warned,
+                        );
+                    }
+                    Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) => {
+                        exit_reason = Some("远端已关闭 Shell 会话");
+                        break;
+                    }
+                    None => {
+                        exit_reason = Some("SSH 连接已中断");
+                        break;
+                    }
+                    _ => {}
+                },
+                command = rx.recv() => match command {
+                    Some(ShellCmd::Write(bytes)) => {
+                        if channel.data_bytes(bytes).await.is_err() {
+                            exit_reason = Some("SSH 连接已中断");
+                            break;
+                        }
+                    }
+                    Some(ShellCmd::Resize { cols, rows }) => {
+                        let _ = channel
+                            .window_change(cols.max(1), rows.max(1), 0, 0)
+                            .await;
+                    }
+                    // 会话被主动关闭：不再上报 closed 事件（前端已自行清理）
+                    Some(ShellCmd::Close) | None => break,
+                },
+            }
+        }
+
+        if !pending.is_empty() {
+            let tail = String::from_utf8_lossy(&pending).to_string();
+            publish_output(
+                sink.as_ref(),
+                &stdout_event,
+                tail,
+                &log_sink,
+                &mut log_backpressure_warned,
+                &mut log_binary_warned,
+            );
+        }
+        if let Some(reason) = exit_reason {
+            is_alive.store(false, Ordering::Relaxed);
+            sink.send(&closed_event, reason.to_string());
+        }
+    })
 }
 
 /// 远端工作目录探测脚本（必须在终端所属连接上执行）：
@@ -949,223 +949,14 @@ if [ -z "$CWD" ] || [ ! -d "$CWD" ]; then
 fi
 echo "$CWD"
 "#;
-
-/// 建立 TCP 连接、完成握手、校验主机密钥并认证。
-/// 主机密钥在认证之前校验，避免把凭证发送给中间人。
-fn connect_and_auth(config: &SshConnectConfig) -> Result<(ssh2::Session, HostKeyInfo), String> {
-    let addr = resolve_addr(&config.host, config.port)?;
-    let stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)
-        .map_err(|e| format!("TCP 连接超时/失败: {}", e))?;
-    // 关闭 Nagle，降低交互式输入的往返延迟
-    let _ = stream.set_nodelay(true);
-
-    let mut sess = ssh2::Session::new().map_err(|e| e.to_string())?;
-    sess.set_tcp_stream(stream);
-    // 必须在 handshake 之前设置主机密钥算法优先级
-    prefer_openssh_host_key_order(&sess);
-    sess.handshake().map_err(|e| format!("SSH 握手失败: {}", e))?;
-
-    let host_key = verify_host_key(&sess, config)?;
-
-    authenticate(&sess, config)?;
-
-    if !sess.authenticated() {
-        return Err("身份认证未通过，请检查账号密码或密钥".into());
-    }
-    Ok((sess, host_key))
-}
-
-/// 与 OpenSSH 客户端的 HostKeyAlgorithms 默认顺序保持一致。
-///
-/// libssh2 默认把 ECDSA 排在 ed25519 之前，而 OpenSSH 优先 ed25519；
-/// 若服务器同时提供两种密钥，`ssh` 会把 ed25519 写进 known_hosts，
-/// 而 libssh2 却协商到 ECDSA，主机名匹配、密钥不同，就会被误报为
-/// “主机密钥不一致”而无法登录。统一优先级后两者协商结果一致。
-fn prefer_openssh_host_key_order(sess: &ssh2::Session) {
-    // 未编译进 libssh2 的算法会被自动忽略
-    let prefs = [
-        "ssh-ed25519",
-        "ssh-ed25519-cert-v01@openssh.com",
-        "ecdsa-sha2-nistp256",
-        "ecdsa-sha2-nistp384",
-        "ecdsa-sha2-nistp521",
-        "ecdsa-sha2-nistp256-cert-v01@openssh.com",
-        "ecdsa-sha2-nistp384-cert-v01@openssh.com",
-        "ecdsa-sha2-nistp521-cert-v01@openssh.com",
-        "rsa-sha2-512",
-        "rsa-sha2-256",
-        "ssh-rsa",
-        "ssh-dss",
-    ]
-    .join(",");
-    let _ = sess.method_pref(ssh2::MethodType::HostKey, &prefs);
-}
-
-fn known_hosts_path() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".ssh")
-        .join("known_hosts")
-}
-
-/// 计算 OpenSSH 风格的 SHA256 指纹
-fn fingerprint_sha256(key: &[u8]) -> String {
-    let digest = Sha256::digest(key);
-    format!(
-        "SHA256:{}",
-        base64::engine::general_purpose::STANDARD_NO_PAD.encode(digest)
-    )
-}
-
-/// known_hosts 里存的是 base64 密钥，解码后算指纹用于向用户展示
-fn fingerprint_from_base64(key_b64: &str) -> Option<String> {
-    let raw = base64::engine::general_purpose::STANDARD
-        .decode(key_b64.trim())
-        .ok()?;
-    Some(fingerprint_sha256(&raw))
-}
-
-/// 判断 known_hosts 条目名是否指向当前主机（支持逗号分隔的多个别名）。
-/// 语义对齐 OpenSSH：非默认端口的记录写作 `[host]:port`，
-/// 因此裸主机名只在 22 端口下才视为同一主机。
-fn name_covers_host(name: &str, config: &SshConnectConfig) -> bool {
-    let port_entry = format!("[{}]:{}", config.host, config.port);
-    name.split(',').map(str::trim).any(|part| {
-        if part == port_entry {
-            return true;
-        }
-        config.port == 22 && part == config.host
-    })
-}
-
-/// 某主机在 known_hosts 中已记录的密钥指纹（去重，限量避免异常文件产生巨量输出）
-fn existing_host_fingerprints(known_hosts: &ssh2::KnownHosts, config: &SshConnectConfig) -> Vec<String> {
-    let mut result: Vec<String> = Vec::new();
-    if let Ok(hosts) = known_hosts.hosts() {
-        for host in hosts {
-            let Some(name) = host.name() else { continue };
-            if !name_covers_host(name, config) {
-                continue;
-            }
-            if let Some(fp) = fingerprint_from_base64(host.key()) {
-                if !result.contains(&fp) {
-                    result.push(fp);
-                }
-            }
-            if result.len() >= 8 {
-                break;
-            }
-        }
-    }
-    result
-}
-
-/// 校验远端主机密钥：对比 ~/.ssh/known_hosts。
-/// - 一致：放行
-/// - 未知：仅在用户已确认（trust_host_key）时写入 known_hosts 后放行，
-///   否则返回 HOST_KEY_UNKNOWN|<指纹>，由前端弹窗确认
-/// - 不一致：默认阻断并返回 HOST_KEY_MISMATCH|<新指纹>|<旧指纹...>；
-///   用户在界面上确认替换后会传入 trust_host_key=true，此时移除同名旧条目
-///   并写入新密钥（等价于 ssh-keygen -R + 重新信任）
-fn verify_host_key(sess: &ssh2::Session, config: &SshConnectConfig) -> Result<HostKeyInfo, String> {
-    let (key, key_type) = sess
-        .host_key()
-        .ok_or_else(|| "无法获取远端主机公钥".to_string())?;
-    let fingerprint = fingerprint_sha256(key);
-
-    let mut known_hosts = sess
-        .known_hosts()
-        .map_err(|e| format!("初始化 known_hosts 失败: {}", e))?;
-    let kh_path = known_hosts_path();
-    if kh_path.exists() {
-        // 解析失败不阻断：当作无记录处理，交由指纹确认流程兜底
-        let _ = known_hosts.read_file(&kh_path, KnownHostFileKind::OpenSSH);
-    }
-
-    // 非默认端口必须写成 [host]:port 形式，否则后续 check_port 匹配不到
-    let host_entry = if config.port == 22 {
-        config.host.clone()
-    } else {
-        format!("[{}]:{}", config.host, config.port)
-    };
-
-    match known_hosts.check_port(&config.host, config.port, key) {
-        CheckResult::Match => Ok(HostKeyInfo {
-            fingerprint,
-            status: "matched".into(),
-        }),
-        CheckResult::Mismatch => {
-            let old_fingerprints = existing_host_fingerprints(&known_hosts, config);
-            if !config.trust_host_key {
-                return Err(format!(
-                    "HOST_KEY_MISMATCH|{}|{}",
-                    fingerprint,
-                    old_fingerprints.join(";")
-                ));
-            }
-            // 用户已确认替换：先移除同名旧条目，再写入新密钥
-            if let Ok(hosts) = known_hosts.hosts() {
-                for host in hosts {
-                    if let Some(name) = host.name() {
-                        if name_covers_host(name, config) {
-                            let _ = known_hosts.remove(&host);
-                        }
-                    }
-                }
-            }
-            write_host_key(&mut known_hosts, &kh_path, &host_entry, key, key_type)?;
-
-            // 复核：若仍不一致（例如同名条目被哈希化存储，无法按名移除），
-            // 明确告知用户手动清理，避免“看似已信任却仍连不上”
-            match known_hosts.check_port(&config.host, config.port, key) {
-                CheckResult::Match => Ok(HostKeyInfo {
-                    fingerprint,
-                    status: "replaced".into(),
-                }),
-                _ => Err(format!(
-                    "主机密钥已尝试更新，但 ~/.ssh/known_hosts 中仍存在冲突记录（可能为哈希存储）。\n新指纹：{}\n请手动执行 ssh-keygen -R {} 后重试",
-                    fingerprint, config.host
-                )),
-            }
-        }
-        CheckResult::NotFound => {
-            if !config.trust_host_key {
-                return Err(format!("HOST_KEY_UNKNOWN|{}", fingerprint));
-            }
-            write_host_key(&mut known_hosts, &kh_path, &host_entry, key, key_type)?;
-            Ok(HostKeyInfo {
-                fingerprint,
-                status: "trusted".into(),
-            })
-        }
-        CheckResult::Failure => Err("主机密钥校验失败（known_hosts 不可用）".into()),
-    }
-}
-
-/// 把主机公钥写入 known_hosts 文件
-fn write_host_key(
-    known_hosts: &mut ssh2::KnownHosts,
-    kh_path: &Path,
-    host_entry: &str,
-    key: &[u8],
-    key_type: ssh2::HostKeyType,
-) -> Result<(), String> {
-    if let Some(parent) = kh_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("创建 ~/.ssh 目录失败: {}", e))?;
-    }
-    known_hosts
-        .add(host_entry, key, host_entry, key_type.into())
-        .map_err(|e| format!("写入 known_hosts 失败: {}", e))?;
-    known_hosts
-        .write_file(kh_path, KnownHostFileKind::OpenSSH)
-        .map_err(|e| format!("保存 known_hosts 失败: {}", e))
-}
-
 /// 真实连通性测试：TCP 建连 + SSH 握手 + 主机密钥校验 + 身份认证，返回真实耗时。
 pub fn test_connection(config: &SshConnectConfig) -> Result<ConnectionTestResult, String> {
     let start = Instant::now();
-    let (_sess, host_key) = connect_and_auth(config)?;
+    let conn = Conn::connect(config)?;
     let latency_ms = start.elapsed().as_millis() as u64;
+    let host_key = conn.host_key().clone();
+    // 测试连接不保留会话：立刻断开，避免在远端堆积空闲连接
+    conn.disconnect();
     Ok(ConnectionTestResult {
         latency_ms,
         host_key_fingerprint: host_key.fingerprint,
@@ -1192,23 +983,12 @@ echo "C2 $(grep '^cpu ' /proc/stat 2>/dev/null)"
 
 pub fn probe_host_info(config: &SshConnectConfig) -> Result<HostProbeResult, String> {
     let start = Instant::now();
-    let (sess, _host_key) = connect_and_auth(config)?;
+    let conn = Conn::connect(config)?;
     let ping_ms = start.elapsed().as_millis() as u64;
 
-    // 探测阶段走阻塞模式并设置超时，避免远端不响应时线程永久挂起
-    sess.set_timeout(SFTP_IO_TIMEOUT_MS);
-    let mut channel = sess
-        .channel_session()
-        .map_err(|e| format!("打开探测通道失败: {}", e))?;
-    channel
-        .exec(PROBE_SCRIPT)
-        .map_err(|e| format!("执行探测脚本失败: {}", e))?;
-
-    let mut output = String::new();
-    channel
-        .read_to_string(&mut output)
-        .map_err(|e| format!("读取探测结果失败: {}", e))?;
-    let _ = channel.wait_close();
+    // 探测脚本自带 0.4s 采样间隔，超时兜底避免远端不响应时线程永久挂起
+    let output = conn.exec_with_timeout(PROBE_SCRIPT, Duration::from_secs(10))?;
+    conn.disconnect();
 
     Ok(parse_probe_output(&output, ping_ms))
 }
@@ -1422,7 +1202,6 @@ fn parse_remote_metrics(
 
     (metrics, new_snap)
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1447,15 +1226,6 @@ mod tests {
         assert_eq!(sanitize_host("C:\\temp/foo"), "C__temp_foo");
         assert_eq!(sanitize_host("   "), "unknown-host");
         assert_eq!(sanitize_host("root@10.0.0.1"), "root@10.0.0.1");
-    }
-
-    #[test]
-    fn fingerprint_matches_openssh_format_for_empty_input() {
-        // SHA256("") 的 base64（无填充）是固定值，可用于校验指纹格式
-        assert_eq!(
-            fingerprint_sha256(b""),
-            "SHA256:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU"
-        );
     }
 
     #[test]
@@ -1498,32 +1268,6 @@ mod tests {
     }
 
     #[test]
-    fn name_covers_host_matches_plain_and_ported_entries() {
-        let base = SshConnectConfig {
-            host: "example.com".into(),
-            port: 22,
-            username: "root".into(),
-            auth_type: "password".into(),
-            password: None,
-            private_key: None,
-            passphrase: None,
-            trust_host_key: false,
-            cols: 80,
-            rows: 24,
-        };
-        assert!(name_covers_host("example.com", &base));
-        assert!(name_covers_host("example.com,10.0.0.1", &base));
-        assert!(!name_covers_host("example.org", &base));
-
-        let custom = SshConnectConfig {
-            port: 2222,
-            ..base
-        };
-        assert!(name_covers_host("[example.com]:2222", &custom));
-        assert!(!name_covers_host("example.com", &custom));
-    }
-
-    #[test]
     fn parse_probe_output_tolerates_missing_fields() {
         let result = parse_probe_output("OS_ID=\nOS_NAME=FreeBSD\n", 5);
         assert_eq!(result.os, None);
@@ -1556,78 +1300,6 @@ mod tests {
         assert_eq!(snap.net_tx_bytes, 20971520);
     }
 }
-
-fn authenticate(sess: &ssh2::Session, config: &SshConnectConfig) -> Result<(), String> {
-    match config.auth_type.as_str() {
-        "password" => sess
-            .userauth_password(&config.username, config.password.as_deref().unwrap_or(""))
-            .map_err(|e| format!("密码认证失败: {}", e)),
-        "key" => {
-            let key_input = config.private_key.as_deref().unwrap_or("").trim();
-            if key_input.is_empty() {
-                return Err("未配置私钥内容或文件路径".into());
-            }
-
-            // 私钥既可能是文件路径，也可能是粘贴的密钥内容
-            let key_is_file = Path::new(key_input).is_file();
-            let key_path = if key_is_file {
-                PathBuf::from(key_input)
-            } else {
-                let dir = std::env::temp_dir().join("snail-ssh-keys");
-                std::fs::create_dir_all(&dir).map_err(|e| format!("创建临时目录失败: {}", e))?;
-                let path = dir.join(format!("id_{}", Uuid::new_v4()));
-                std::fs::write(&path, key_input.as_bytes())
-                    .map_err(|e| format!("写入临时私钥失败: {}", e))?;
-                path
-            };
-
-            let result = sess.userauth_pubkey_file(
-                &config.username,
-                None,
-                &key_path,
-                config.passphrase.as_deref(),
-            );
-            if !key_is_file {
-                let _ = std::fs::remove_file(&key_path);
-            }
-            result.map_err(|e| format!("私钥认证失败: {}", e))
-        }
-        "agent" => sess
-            .userauth_agent(&config.username)
-            .map_err(|e| format!("SSH Agent 认证失败: {}", e)),
-        other => Err(format!("不支持的认证方式: {}", other)),
-    }
-}
-
-fn resolve_addr(host: &str, port: u16) -> Result<SocketAddr, String> {
-    (host, port)
-        .to_socket_addrs()
-        .map_err(|e| format!("无法解析主机地址 {}: {}", host, e))?
-        .next()
-        .ok_or_else(|| format!("主机 {} 无可用地址", host))
-}
-
-/// 重试 libssh2 调用直到成功或超时（非阻塞模式下 EAGAIN 属于正常态，需要重试）
-fn wait_retry<T, F>(mut f: F, timeout: Duration) -> Result<T, ssh2::Error>
-where
-    F: FnMut() -> Result<T, ssh2::Error>,
-{
-    let start = Instant::now();
-    loop {
-        match f() {
-            Ok(value) => return Ok(value),
-            Err(e) => {
-                let retryable = matches!(e.code(), ssh2::ErrorCode::Session(code) if code == LIBSSH2_EAGAIN);
-                if !retryable || start.elapsed() > timeout {
-                    return Err(e);
-                }
-                std::thread::sleep(IO_POLL_INTERVAL);
-            }
-        }
-    }
-}
-
-/// 增量 UTF-8 解码：只输出完整字符，被切断的多字节序列留待下一批数据
 fn decode_stream(pending: &mut Vec<u8>, chunk: &[u8]) -> String {
     pending.extend_from_slice(chunk);
 
@@ -1664,4 +1336,126 @@ fn decode_stream(pending: &mut Vec<u8>, chunk: &[u8]) -> String {
         }
     }
     out
+}
+
+/// 真实服务器上的 shell 输出泵验证（需要环境变量，默认 ignore）。
+/// 覆盖：首屏抓取 / 按键写入 / 窗口调整 / 主动关闭，以及同连接上的 CWD 探测 exec。
+#[cfg(test)]
+mod live_tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct CollectSink {
+        events: Mutex<Vec<(String, String)>>,
+    }
+
+    impl ShellEventSink for CollectSink {
+        fn send(&self, event: &str, payload: String) {
+            self.events.lock().push((event.to_string(), payload));
+        }
+    }
+
+    impl CollectSink {
+        fn joined(&self, event: &str) -> String {
+            self.events
+                .lock()
+                .iter()
+                .filter(|(name, _)| name == event)
+                .map(|(_, payload)| payload.clone())
+                .collect()
+        }
+    }
+
+    fn live_config() -> Option<SshConnectConfig> {
+        let host = std::env::var("SNAIL_TEST_HOST").ok()?;
+        Some(SshConnectConfig {
+            host,
+            port: std::env::var("SNAIL_TEST_PORT")
+                .ok()
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(22),
+            username: std::env::var("SNAIL_TEST_USER").unwrap_or_default(),
+            auth_type: std::env::var("SNAIL_TEST_AUTH").unwrap_or_else(|_| "key".into()),
+            password: std::env::var("SNAIL_TEST_PASSWORD").ok(),
+            private_key: std::env::var("SNAIL_TEST_KEY").ok(),
+            passphrase: None,
+            trust_host_key: false,
+            cols: 120,
+            rows: 30,
+        })
+    }
+
+    #[test]
+    #[ignore]
+    fn live_shell_pump_roundtrip() {
+        let Some(config) = live_config() else {
+            return;
+        };
+        let conn = Conn::connect(&config).expect("connect");
+        let sink = Arc::new(CollectSink::default());
+
+        let (tx, banner_cwd) = rt::block_on({
+            let sink = Arc::clone(&sink);
+            async {
+                let mut channel = Conn::open_shell(conn.handle(), config.cols, config.rows)
+                    .await
+                    .expect("shell");
+                let banner = read_initial_output(&mut channel).await;
+                // 同一条连接上的 CWD 探测（自动跟随目录依赖它）
+                let cwd = conn
+                    .exec_async(CWD_DETECT_SCRIPT, crate::conn::EXEC_TIMEOUT)
+                    .await
+                    .expect("cwd probe");
+                let (tx, rx) = tokio_mpsc::channel(SHELL_COMMAND_CAPACITY);
+                spawn_shell_pump(
+                    channel,
+                    rx,
+                    sink,
+                    "stdout".into(),
+                    "closed".into(),
+                    Arc::new(AtomicBool::new(true)),
+                    Arc::new(Mutex::new(None)),
+                );
+                (tx, (banner, cwd))
+            }
+        });
+
+        let (banner, cwd_output) = banner_cwd;
+        println!("banner_len = {} cwd_output = {:?}", banner.len(), cwd_output);
+        assert!(!banner.is_empty(), "首屏输出应抓到 MOTD 或提示符");
+        let cwd = cwd_output
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .last()
+            .expect("cwd 探测无输出");
+        assert!(cwd.starts_with('/'), "cwd 探测应返回绝对路径，实际 {}", cwd);
+
+        // 写入：回显 + 标记
+        tx.try_send(ShellCmd::Write(
+            b"printf 'SNAIL_PUMP_%s\n' OK\n".to_vec(),
+        ))
+        .expect("send write");
+        // 窗口调整：不应打断会话
+        tx.try_send(ShellCmd::Resize {
+            cols: 100,
+            rows: 24,
+        })
+        .expect("send resize");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if sink.joined("stdout").contains("SNAIL_PUMP_OK") {
+                break;
+            }
+            assert!(Instant::now() < deadline, "等待远端回显超时");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        tx.try_send(ShellCmd::Close).expect("send close");
+        std::thread::sleep(Duration::from_millis(200));
+        println!("stdout = {:?}", sink.joined("stdout"));
+        println!("closed = {:?}", sink.joined("closed"));
+        conn.disconnect();
+    }
 }

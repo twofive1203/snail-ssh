@@ -1,6 +1,4 @@
-use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use ssh2::{OpenFlags, OpenType};
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -8,11 +6,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
 
+use crate::conn::Conn;
+use crate::sftp_compat::{FileStat, OpenFlags, OpenType, RenameFlags, Sftp};
+
 use crate::transfer::{resume_offset, TransferSignal, TRANSFER_CANCELLED};
 
 /// 在线编辑器单次读取上限，避免把超大文件整个读进内存
 const MAX_EDITABLE_FILE_SIZE: u64 = 8 * 1024 * 1024;
-/// 上传在途窗口。libssh2 只对一次 write 传入的缓冲做 FXP_WRITE 流水线（单包约 30KB），
+/// 上传在途窗口。russh-sftp 每次 write 内部按 32KB 分包、并发 16 个请求流水线发送，
 /// 窗口要接近 SSH channel 窗口（常见 2MB）才喂得满；取 4MB 以覆盖略大的服务端窗口。
 const UPLOAD_WINDOW_SIZE: usize = 4 * 1024 * 1024;
 /// 每轮从磁盘补进窗口的上限。单次 write 会阻塞到新数据发出并收到一个 ACK，
@@ -20,7 +21,7 @@ const UPLOAD_WINDOW_SIZE: usize = 4 * 1024 * 1024;
 const UPLOAD_FILL_CHUNK: usize = 256 * 1024;
 /// 已消费前缀超过该值且不少于缓冲一半时压实，避免每次 ACK 都搬移整个窗口。
 const UPLOAD_COMPACT_THRESHOLD: usize = 1024 * 1024;
-/// 下载读缓冲。libssh2 按本次缓冲的 4 倍预发 FXP_READ，1MB 对应约 4MB 在途。
+/// 下载读缓冲。russh-sftp 对一次 read 会并发预取多个请求，1MB 对应数 MB 在途。
 /// 暂停/取消要等这一次 read 返回，粒度就是这块缓冲。
 const DOWNLOAD_READ_SIZE: usize = 1024 * 1024;
 /// 进度事件最小上报间隔
@@ -113,11 +114,11 @@ impl ProgressReporter {
 }
 
 pub fn sftp_read_dir(
-    session_arc: Arc<Mutex<ssh2::Session>>,
+    session_arc: Arc<Conn>,
     remote_path: &str,
 ) -> Result<Vec<SftpFileItem>, String> {
-    let sess = session_arc.lock();
-    let sftp = sess.sftp().map_err(|e| format!("初始化 SFTP 失败: {}", e))?;
+    let conn = session_arc.as_ref();
+    let sftp = conn.sftp().map_err(|e| format!("初始化 SFTP 失败: {}", e))?;
     let mut entries = sftp
         .readdir(Path::new(remote_path))
         .map_err(|e| format!("读取远程目录失败: {}", e))?;
@@ -171,11 +172,11 @@ pub fn sftp_read_dir(
 }
 
 pub fn sftp_read_file(
-    session_arc: Arc<Mutex<ssh2::Session>>,
+    session_arc: Arc<Conn>,
     remote_path: &str,
 ) -> Result<String, String> {
-    let sess = session_arc.lock();
-    let sftp = sess.sftp().map_err(|e| e.to_string())?;
+    let conn = session_arc.as_ref();
+    let sftp = conn.sftp().map_err(|e| e.to_string())?;
     let mut file = sftp
         .open(Path::new(remote_path))
         .map_err(|e| format!("打开远程文件失败: {}", e))?;
@@ -197,12 +198,12 @@ pub fn sftp_read_file(
 }
 
 pub fn sftp_write_file(
-    session_arc: Arc<Mutex<ssh2::Session>>,
+    session_arc: Arc<Conn>,
     remote_path: &str,
     content: &str,
 ) -> Result<(), String> {
-    let sess = session_arc.lock();
-    let sftp = sess.sftp().map_err(|e| e.to_string())?;
+    let conn = session_arc.as_ref();
+    let sftp = conn.sftp().map_err(|e| e.to_string())?;
     let mut file = sftp
         .create(Path::new(remote_path))
         .map_err(|e| format!("创建/覆盖远程文件失败: {}", e))?;
@@ -214,27 +215,27 @@ pub fn sftp_write_file(
 }
 
 pub fn sftp_mkdir(
-    session_arc: Arc<Mutex<ssh2::Session>>,
+    session_arc: Arc<Conn>,
     remote_path: &str,
 ) -> Result<(), String> {
-    let sess = session_arc.lock();
-    let sftp = sess.sftp().map_err(|e| e.to_string())?;
+    let conn = session_arc.as_ref();
+    let sftp = conn.sftp().map_err(|e| e.to_string())?;
     sftp.mkdir(Path::new(remote_path), 0o755)
         .map_err(|e| format!("创建目录失败: {}", e))
 }
 
 pub fn sftp_remove_file(
-    session_arc: Arc<Mutex<ssh2::Session>>,
+    session_arc: Arc<Conn>,
     remote_path: &str,
 ) -> Result<(), String> {
-    let sess = session_arc.lock();
-    let sftp = sess.sftp().map_err(|e| e.to_string())?;
+    let conn = session_arc.as_ref();
+    let sftp = conn.sftp().map_err(|e| e.to_string())?;
     remove_path_recursive(&sftp, Path::new(remote_path))
 }
 
 /// 递归删除：目录会先清空子项再删除自身。
 /// 使用 lstat 而非 stat，避免把指向目录的软链接当成目录递归下去。
-fn remove_path_recursive(sftp: &ssh2::Sftp, path: &Path) -> Result<(), String> {
+fn remove_path_recursive(sftp: &Sftp, path: &Path) -> Result<(), String> {
     let stat = match sftp.lstat(path) {
         Ok(stat) => stat,
         // 已不存在（并发删除）视作成功
@@ -260,22 +261,21 @@ fn remove_path_recursive(sftp: &ssh2::Sftp, path: &Path) -> Result<(), String> {
 
 /// 家目录探测超时。SFTP 会话默认 30s，这里收短，避免打开文件区时被登录脚本卡住。
 const HOME_PROBE_TIMEOUT_MS: u32 = 5_000;
-const SFTP_SESSION_TIMEOUT_MS: u32 = 30_000;
 
 /// 远端登录用户的家目录，用作文件工作区 / SFTP 视图的默认位置。
 ///
 /// 优先读登录环境的 `$HOME`（并确认 SFTP 能访问该目录）。
 /// 仅 SFTP、受限 shell 无法 exec 时，回退为子系统当前目录（OpenSSH 通常也是家目录，但部分服务端会停在 `/`）。
-pub fn sftp_home_dir(session_arc: Arc<Mutex<ssh2::Session>>) -> Result<String, String> {
-    let sess = session_arc.lock();
-    if let Some(home) = probe_login_home(&sess) {
-        if let Ok(sftp) = sess.sftp() {
+pub fn sftp_home_dir(session_arc: Arc<Conn>) -> Result<String, String> {
+    let conn = session_arc.as_ref();
+    if let Some(home) = probe_login_home(conn) {
+        if let Ok(sftp) = conn.sftp() {
             if let Some(dir) = canonical_dir(&sftp, &home) {
                 return Ok(dir);
             }
         }
     }
-    let sftp = sess.sftp().map_err(|e| e.to_string())?;
+    let sftp = conn.sftp().map_err(|e| e.to_string())?;
     let cwd = sftp
         .realpath(Path::new("."))
         .map_err(|e| format!("获取远端家目录失败: {}", e))?;
@@ -284,23 +284,15 @@ pub fn sftp_home_dir(session_arc: Arc<Mutex<ssh2::Session>>) -> Result<String, S
 
 /// 在同一条 SSH 连接上开瞬态 exec，读登录环境的 `$HOME`。
 /// 失败返回 None，由调用方回退，不把文件区打开卡死。
-fn probe_login_home(sess: &ssh2::Session) -> Option<String> {
-    sess.set_timeout(HOME_PROBE_TIMEOUT_MS);
-    let parsed = (|| {
-        let mut channel = sess.channel_session().ok()?;
-        // 标记行：避免登录横幅或包装脚本把其它输出混进 stdout
-        channel
-            .exec("printf 'SNAIL_HOME:%s\n' \"$HOME\"")
-            .ok()?;
-        let mut output = String::new();
-        // 超时也尽量解已经读到的标记行
-        let _ = channel.read_to_string(&mut output);
-        let _ = channel.close();
-        let _ = channel.wait_close();
-        parse_home_marker(&output)
-    })();
-    sess.set_timeout(SFTP_SESSION_TIMEOUT_MS);
-    parsed
+fn probe_login_home(conn: &Conn) -> Option<String> {
+    // 标记行：避免登录横幅或包装脚本把其它输出混进 stdout
+    let output = conn
+        .exec_with_timeout(
+            "printf 'SNAIL_HOME:%s\n' \"$HOME\"",
+            Duration::from_millis(HOME_PROBE_TIMEOUT_MS as u64),
+        )
+        .ok()?;
+    parse_home_marker(&output)
 }
 
 fn parse_home_marker(output: &str) -> Option<String> {
@@ -318,7 +310,7 @@ fn parse_home_marker(output: &str) -> Option<String> {
 }
 
 /// 把候选路径规范化，并确认它是 SFTP 可见的目录。
-fn canonical_dir(sftp: &ssh2::Sftp, path: &str) -> Option<String> {
+fn canonical_dir(sftp: &Sftp, path: &str) -> Option<String> {
     if !path.starts_with('/') {
         return None;
     }
@@ -337,7 +329,7 @@ fn canonical_dir(sftp: &ssh2::Sftp, path: &str) -> Option<String> {
 }
 
 /// 由 SFTP 条目统计信息构造列表项（read_dir / stat 共用同一套格式化规则）
-fn build_file_item(name: &str, stat: &ssh2::FileStat) -> SftpFileItem {
+fn build_file_item(name: &str, stat: &FileStat) -> SftpFileItem {
     let is_dir = stat.is_dir();
     let size_bytes = stat.size.unwrap_or(0);
     let perm = stat.perm.unwrap_or(0);
@@ -364,8 +356,8 @@ fn build_file_item(name: &str, stat: &ssh2::FileStat) -> SftpFileItem {
 }
 
 /// 只填 uid/gid/perm 的 stat，size/时间保持 None，避免误改文件大小
-fn metadata_patch(uid: Option<u32>, gid: Option<u32>, perm: Option<u32>) -> ssh2::FileStat {
-    ssh2::FileStat {
+fn metadata_patch(uid: Option<u32>, gid: Option<u32>, perm: Option<u32>) -> FileStat {
+    FileStat {
         size: None,
         uid,
         gid,
@@ -377,19 +369,19 @@ fn metadata_patch(uid: Option<u32>, gid: Option<u32>, perm: Option<u32>) -> ssh2
 
 /// 重命名 / 移动。overwrite=false 时目标已存在会由远端报错，不静默覆盖。
 pub fn sftp_rename(
-    session_arc: Arc<Mutex<ssh2::Session>>,
+    session_arc: Arc<Conn>,
     from: &str,
     to: &str,
     overwrite: bool,
 ) -> Result<(), String> {
-    let sess = session_arc.lock();
-    let sftp = sess.sftp().map_err(|e| format!("初始化 SFTP 失败: {}", e))?;
+    let conn = session_arc.as_ref();
+    let sftp = conn.sftp().map_err(|e| format!("初始化 SFTP 失败: {}", e))?;
     let flags = if overwrite {
-        ssh2::RenameFlags::OVERWRITE
+        RenameFlags::OVERWRITE
     } else {
         // 不传 ATOMIC/NATIVE：这两个只是 hint，部分服务端会直接拒绝；
         // flags=0 时目标已存在会由服务端报错，正是我们要的非覆盖语义。
-        ssh2::RenameFlags::empty()
+        RenameFlags::empty()
     };
     sftp.rename(Path::new(from), Path::new(to), Some(flags))
         .map_err(|e| format!("重命名失败: {}", e))
@@ -397,19 +389,19 @@ pub fn sftp_rename(
 
 /// 修改权限位（八进制，含 setuid/setgid/sticky 的低 12 位）
 pub fn sftp_chmod(
-    session_arc: Arc<Mutex<ssh2::Session>>,
+    session_arc: Arc<Conn>,
     path: &str,
     mode: u32,
 ) -> Result<(), String> {
-    let sess = session_arc.lock();
-    let sftp = sess.sftp().map_err(|e| format!("初始化 SFTP 失败: {}", e))?;
+    let conn = session_arc.as_ref();
+    let sftp = conn.sftp().map_err(|e| format!("初始化 SFTP 失败: {}", e))?;
     sftp.setstat(Path::new(path), metadata_patch(None, None, Some(mode & 0o7777)))
         .map_err(|e| format!("修改权限失败: {}", e))
 }
 
 /// 修改属主 / 属组（数字 id，None 表示不改该项）。非 root 会返回远端原始权限错误。
 pub fn sftp_chown(
-    session_arc: Arc<Mutex<ssh2::Session>>,
+    session_arc: Arc<Conn>,
     path: &str,
     uid: Option<u32>,
     gid: Option<u32>,
@@ -417,19 +409,19 @@ pub fn sftp_chown(
     if uid.is_none() && gid.is_none() {
         return Err("未指定新的属主或属组".into());
     }
-    let sess = session_arc.lock();
-    let sftp = sess.sftp().map_err(|e| format!("初始化 SFTP 失败: {}", e))?;
+    let conn = session_arc.as_ref();
+    let sftp = conn.sftp().map_err(|e| format!("初始化 SFTP 失败: {}", e))?;
     sftp.setstat(Path::new(path), metadata_patch(uid, gid, None))
         .map_err(|e| format!("修改属主/属组失败: {}", e))
 }
 
 /// 新建空白文件。目标已存在时直接报错，不静默覆盖。
 pub fn sftp_touch(
-    session_arc: Arc<Mutex<ssh2::Session>>,
+    session_arc: Arc<Conn>,
     path: &str,
 ) -> Result<(), String> {
-    let sess = session_arc.lock();
-    let sftp = sess.sftp().map_err(|e| format!("初始化 SFTP 失败: {}", e))?;
+    let conn = session_arc.as_ref();
+    let sftp = conn.sftp().map_err(|e| format!("初始化 SFTP 失败: {}", e))?;
     if sftp.lstat(Path::new(path)).is_ok() {
         return Err(format!("目标已存在: {}", path));
     }
@@ -444,11 +436,11 @@ pub fn sftp_touch(
 
 /// 单条目属性（供属性弹窗复用）
 pub fn sftp_stat(
-    session_arc: Arc<Mutex<ssh2::Session>>,
+    session_arc: Arc<Conn>,
     path: &str,
 ) -> Result<SftpFileItem, String> {
-    let sess = session_arc.lock();
-    let sftp = sess.sftp().map_err(|e| format!("初始化 SFTP 失败: {}", e))?;
+    let conn = session_arc.as_ref();
+    let sftp = conn.sftp().map_err(|e| format!("初始化 SFTP 失败: {}", e))?;
     let stat = sftp
         .stat(Path::new(path))
         .map_err(|e| format!("读取属性失败: {}", e))?;
@@ -459,7 +451,7 @@ pub fn sftp_stat(
     Ok(build_file_item(&name, &stat))
 }
 
-/// 上传在途缓冲：前端是 libssh2 尚未确认的字节，尾部是新读入的数据。
+/// 上传在途缓冲：前缀是尚未确认的字节，尾部是新读入的数据。
 /// 每次 write 必须从「第一个未确认字节」开始，不能只传新增部分；否则库内部会跳过错误的前缀。
 struct UploadWindow {
     buf: Vec<u8>,
@@ -538,7 +530,7 @@ fn pause_or_cancel(
 /// 续传起点按"远端已存在且比本地源短"计算；`reporter` 的 total 为完整文件大小，
 /// 续传时 `advance(offset)` 让进度从已有位置起算。
 fn transfer_upload_one(
-    sftp: &ssh2::Sftp,
+    sftp: &Sftp,
     local: &Path,
     remote: &Path,
     reporter: &mut ProgressReporter,
@@ -623,7 +615,7 @@ fn transfer_upload_one(
 
 /// 下载单个文件（供单文件与目录下载复用）：支持取消/暂停与断点续传。
 fn transfer_download_one(
-    sftp: &ssh2::Sftp,
+    sftp: &Sftp,
     remote: &Path,
     local: &Path,
     reporter: &mut ProgressReporter,
@@ -658,7 +650,7 @@ fn transfer_download_one(
         reporter.advance(offset);
     }
 
-    // 读缓冲越大，libssh2 预读越深（约 4 倍）。预读状态跨 read 调用保留，不会在块边界排空。
+    // 读缓冲越大，SFTP 层预读越深。预读状态跨 read 调用保留，不会在块边界排空。
     let mut buf = vec![0u8; DOWNLOAD_READ_SIZE];
     loop {
         pause_or_cancel(signal, reporter, app)?;
@@ -683,7 +675,7 @@ fn transfer_download_one(
 }
 
 pub fn sftp_upload_file(
-    session_arc: Arc<Mutex<ssh2::Session>>,
+    session_arc: Arc<Conn>,
     local_path: &str,
     remote_path: &str,
     task_id: &str,
@@ -691,8 +683,8 @@ pub fn sftp_upload_file(
     app_handle: AppHandle,
 ) -> Result<(), String> {
     let total_size = fs::metadata(local_path).map(|m| m.len()).unwrap_or(0);
-    let sess = session_arc.lock();
-    let sftp = sess.sftp().map_err(|e| format!("初始化 SFTP 失败: {}", e))?;
+    let conn = session_arc.as_ref();
+    let sftp = conn.sftp().map_err(|e| format!("初始化 SFTP 失败: {}", e))?;
 
     let mut reporter = ProgressReporter::new(task_id, total_size);
     transfer_upload_one(
@@ -708,15 +700,15 @@ pub fn sftp_upload_file(
 }
 
 pub fn sftp_download_file(
-    session_arc: Arc<Mutex<ssh2::Session>>,
+    session_arc: Arc<Conn>,
     remote_path: &str,
     local_path: &str,
     task_id: &str,
     signal: Arc<TransferSignal>,
     app_handle: AppHandle,
 ) -> Result<(), String> {
-    let sess = session_arc.lock();
-    let sftp = sess.sftp().map_err(|e| format!("初始化 SFTP 失败: {}", e))?;
+    let conn = session_arc.as_ref();
+    let sftp = conn.sftp().map_err(|e| format!("初始化 SFTP 失败: {}", e))?;
     let total_size = sftp
         .stat(Path::new(remote_path))
         .ok()
@@ -738,7 +730,7 @@ pub fn sftp_download_file(
 
 /// 统一下载入口：按远端条目类型分派单文件 / 目录（前端无需判断类型）。
 pub fn sftp_download_path(
-    session_arc: Arc<Mutex<ssh2::Session>>,
+    session_arc: Arc<Conn>,
     remote_path: &str,
     local_path: &str,
     task_id: &str,
@@ -746,8 +738,8 @@ pub fn sftp_download_path(
     app_handle: AppHandle,
 ) -> Result<(), String> {
     let is_dir = {
-        let sess = session_arc.lock();
-        let sftp = sess.sftp().map_err(|e| format!("初始化 SFTP 失败: {}", e))?;
+        let conn = session_arc.as_ref();
+        let sftp = conn.sftp().map_err(|e| format!("初始化 SFTP 失败: {}", e))?;
         sftp.stat(Path::new(remote_path))
             .map(|s| s.is_dir())
             .map_err(|e| format!("读取远程信息失败: {}", e))?
@@ -767,15 +759,15 @@ struct DownloadEntry {
 
 /// 目录递归下载：保留远端目录结构，进度按实际会传输的字节总数统计。
 pub fn sftp_download_dir(
-    session_arc: Arc<Mutex<ssh2::Session>>,
+    session_arc: Arc<Conn>,
     remote_path: &str,
     local_path: &str,
     task_id: &str,
     signal: Arc<TransferSignal>,
     app_handle: AppHandle,
 ) -> Result<(), String> {
-    let sess = session_arc.lock();
-    let sftp = sess.sftp().map_err(|e| format!("初始化 SFTP 失败: {}", e))?;
+    let conn = session_arc.as_ref();
+    let sftp = conn.sftp().map_err(|e| format!("初始化 SFTP 失败: {}", e))?;
 
     // 先枚举待传输文件并统计总字节数，否则进度条无法给出百分比。
     // 复用同一份列表，避免统计与传输两套递归逻辑出现分歧。
@@ -824,7 +816,7 @@ pub fn sftp_download_dir(
 /// 只跟随指向普通文件的软链接；指向目录的软链接与 fifo/socket/设备文件均跳过，
 /// 前者避免递归成环，后者避免 open 时无限阻塞。
 fn collect_download_entries(
-    sftp: &ssh2::Sftp,
+    sftp: &Sftp,
     remote: &Path,
     local: &Path,
     out: &mut Vec<DownloadEntry>,
@@ -891,7 +883,7 @@ struct UploadEntry {
 /// 统一上传入口：按本地元数据自动分派单文件 / 目录，前端无需判断类型。
 /// `remote_dir` 为目标父目录，文件或目录都以自身的 basename 落进去。
 pub fn sftp_upload_path(
-    session_arc: Arc<Mutex<ssh2::Session>>,
+    session_arc: Arc<Conn>,
     local_path: &str,
     remote_dir: &str,
     task_id: &str,
@@ -925,7 +917,7 @@ pub fn sftp_upload_path(
 
 /// 目录递归上传：保留本地目录结构，进度按实际会传输的字节总数统计。
 pub fn sftp_upload_dir(
-    session_arc: Arc<Mutex<ssh2::Session>>,
+    session_arc: Arc<Conn>,
     local_path: &str,
     remote_dir: &str,
     task_id: &str,
@@ -938,8 +930,8 @@ pub fn sftp_upload_dir(
         .ok_or_else(|| "无法确定本地目录名称".to_string())?;
     let remote_root = Path::new(remote_dir).join(base_name);
 
-    let sess = session_arc.lock();
-    let sftp = sess.sftp().map_err(|e| format!("初始化 SFTP 失败: {}", e))?;
+    let conn = session_arc.as_ref();
+    let sftp = conn.sftp().map_err(|e| format!("初始化 SFTP 失败: {}", e))?;
 
     // 大目录枚举可能耗时：先发一条 scanning 事件，避免用户误以为卡死
     let _ = app_handle.emit(
@@ -1034,7 +1026,7 @@ fn collect_upload_entries(
 }
 
 /// 逐级创建远端目录（ssh2 没有 mkdir -p），已存在则忽略。
-fn ensure_remote_dir(sftp: &ssh2::Sftp, dir: &Path) -> Result<(), String> {
+fn ensure_remote_dir(sftp: &Sftp, dir: &Path) -> Result<(), String> {
     let mut current = PathBuf::new();
     for component in dir.components() {
         match component {
