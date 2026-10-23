@@ -33,13 +33,17 @@
     </div>
 
     <!-- 任务列表 -->
-    <div class="flex-1 overflow-y-auto p-3 space-y-2.5 custom-scrollbar">
+    <div
+      ref="listEl"
+      class="flex-1 overflow-y-auto p-3 space-y-2.5 custom-scrollbar"
+      style="overflow-anchor: none"
+    >
       <div v-if="tasks.length === 0" class="p-8 text-center text-xs text-slate-500 font-mono">
         暂无活跃传输任务
       </div>
 
       <div
-        v-for="task in tasks"
+        v-for="task in orderedTasks"
         :key="task.id"
         class="p-2.5 rounded-lg bg-surface-card border border-surface-border/80 space-y-2"
         :class="{ 'opacity-65': task.status !== 'running' && task.status !== 'paused' }"
@@ -121,7 +125,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, nextTick, ref, watch } from 'vue'
 import { ArrowUpCircle, ArrowDownCircle, X, Pause, Play, Square, RotateCcw } from 'lucide-vue-next'
 import type { TransferTask } from '@/types'
 
@@ -139,6 +143,31 @@ defineEmits<{
   (e: 'cancel-task', task: TransferTask): void
   (e: 'retry-task', task: TransferTask): void
 }>()
+
+const listEl = ref<HTMLElement | null>(null)
+
+// 进行中的始终排在已结束记录前面，避免抽屉弹开时眼睛落在上一次的「传输完成」上。
+const orderedTasks = computed(() => {
+  const active: TransferTask[] = []
+  const finished: TransferTask[] = []
+  for (const task of props.tasks) {
+    if (task.status === 'running' || task.status === 'paused') active.push(task)
+    else finished.push(task)
+  }
+  return active.concat(finished)
+})
+
+const scrollToLatest = async () => {
+  await nextTick()
+  if (listEl.value) listEl.value.scrollTop = 0
+}
+
+watch(
+  () => [props.open, props.tasks[0]?.id, props.tasks.length] as const,
+  ([open]) => {
+    if (open) void scrollToLatest()
+  }
+)
 
 const runningCount = computed(() => props.tasks.filter(t => t.status === 'running').length)
 const pausedCount = computed(() => props.tasks.filter(t => t.status === 'paused').length)

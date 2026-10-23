@@ -783,6 +783,15 @@ const formatBytes = (bytes: number) => {
   return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`
 }
 
+/** 比较两次传输是不是同一会话、同一本地文件、同一远端目标。斜杠差异不算不同路径。 */
+const isSameTransfer = (a: TransferTask, b: TransferTask): boolean => {
+  if (a.type !== b.type || !a.context || !b.context) return false
+  const norm = (p: string) => p.replace(/\\/g, '/').replace(/\/+$/, '')
+  return a.context.sessionId === b.context.sessionId
+    && norm(a.context.localPath) === norm(b.context.localPath)
+    && norm(a.context.remotePath) === norm(b.context.remotePath)
+}
+
 const createTransferTask = (
   name: string,
   type: 'upload' | 'download',
@@ -799,6 +808,11 @@ const createTransferTask = (
     status: 'running',
     context
   })
+  // 同路径再传时，抽屉会被上一次已结束的「传输完成」卡片占住。
+  // 进行中 / 暂停的不动，只拿掉已结束的同身份记录，让新任务从 0% 开始显示进度。
+  transferTasks.value = transferTasks.value.filter(
+    existing => existing.status === 'running' || existing.status === 'paused' || !isSameTransfer(existing, task)
+  )
   transferTasks.value.unshift(task)
   transfersOpen.value = true
   return task
@@ -810,15 +824,18 @@ const runTransfer = async (task: TransferTask, start: (taskId: string) => Promis
   task.speed = task.progress > 0 ? '继续中...' : '准备中...'
 
   const unlisten = await onSftpProgress(task.id, (payload) => {
-    task.progress = payload.progress
-    task.speed = payload.speed
-    task.size = `${formatBytes(payload.transferred)} / ${formatBytes(payload.total)}`
+    // 事件名已按 taskId 隔离；再按队列里的对象写，避免闭包拿到的代理和列表里的不是同一个。
+    if (payload.taskId !== task.id) return
+    const current = transferTasks.value.find(t => t.id === payload.taskId) ?? task
+    current.progress = payload.progress
+    current.speed = payload.speed
+    current.size = `${formatBytes(payload.transferred)} / ${formatBytes(payload.total)}`
     if (payload.status === 'paused') {
-      task.status = 'paused'
+      current.status = 'paused'
     } else if (payload.status === 'cancelled') {
-      task.status = 'cancelled'
-    } else if (payload.status === 'running' && task.status !== 'paused') {
-      task.status = 'running'
+      current.status = 'cancelled'
+    } else if ((payload.status === 'running' || payload.status === 'scanning') && current.status !== 'paused') {
+      current.status = 'running'
     }
   })
 
