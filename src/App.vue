@@ -225,6 +225,7 @@ const demoSession: HostSession = {
   terminalTabs: [
     {
       id: 'tab-0',
+      uiId: 'ui-tab-0',
       hostId: 'prod-k8s-master-01',
       title: '终端 1',
       sub: 'root@47.98.112.24',
@@ -241,6 +242,9 @@ const demoSession: HostSession = {
 }
 
 const sessions = ref<HostSession[]>(isTauri() ? [] : [demoSession])
+
+/** 终端标签的稳定 UI 标识：重连换后端会话 id 时 xterm 实例与回显历史不丢 */
+const makeTabUiId = () => `ui-tab-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
 
 // 传输队列
 const transfersOpen = ref(false)
@@ -482,6 +486,7 @@ const handleConnectHost = async (host: HostItem, mode: 'split' | 'sftp' = 'split
     terminalTabs: [
       {
         id: sessionId,
+        uiId: makeTabUiId(),
         hostId: host.id,
         title: '终端 1',
         sub: `${host.username}@${host.host}`,
@@ -551,7 +556,12 @@ const handleCloseSession = (sessionId: string) => {
 // 远端断开
 const handleSessionClosed = (session: HostSession, tabId: string, reason: string) => {
   const tab = session.terminalTabs.find(t => t.id === tabId)
-  if (tab) tab.connected = false
+  // 主动关闭的标签 / 已被重连替换的旧会话：找不到就不提示，避免误报断开
+  if (!tab) return
+  tab.connected = false
+  tab.closeReason = reason
+  // 重连流程本身就是先关旧会话：这时的断线事件属于预期，不弹提示
+  if (tab.reconnecting) return
   triggerToast(`终端连接已断开: ${reason}`, 'warning')
 }
 
@@ -584,6 +594,7 @@ const handleAddTerminalTab = async (session: HostSession) => {
   const idx = session.terminalTabs.length + 1
   session.terminalTabs.push({
     id: newId,
+    uiId: makeTabUiId(),
     hostId: session.host.id,
     title: `终端 ${idx}`,
     sub: `${session.host.username}@${session.host.host}`,
@@ -597,21 +608,43 @@ const handleDuplicateTerminalTab = (session: HostSession) => {
   handleAddTerminalTab(session)
 }
 
+/** 断线重连：只换后端会话 id，`uiId` 不变 —— 终端回显历史保留，文件区跟随切换 */
 const handleReconnectTerminalTab = async (session: HostSession, index: number) => {
   const tab = session.terminalTabs[index]
-  if (!tab) return
-  if (isTauri() && tab.id.startsWith('ssh-')) {
-    closeSshSessionApi(tab.id).catch(() => {})
+  if (!tab || tab.reconnecting) return
+
+  const oldId = tab.id
+  tab.reconnecting = true
+  try {
+    if (isTauri() && oldId.startsWith('ssh-')) {
+      closeSshSessionApi(oldId).catch(() => {})
+    }
+    let newId = oldId
+    if (isTauri()) {
+      const resId = await openSession(session.host)
+      if (!resId) {
+        triggerToast(`重连 ${tab.title} 失败`, 'error')
+        return
+      }
+      newId = resId
+    }
+    // 重连期间标签可能被关掉：把刚建好的会话收掉，避免泄漏一条 SSH 连接
+    if (!session.terminalTabs.includes(tab)) {
+      if (isTauri() && newId.startsWith('ssh-')) closeSshSessionApi(newId).catch(() => {})
+      return
+    }
+    tab.id = newId
+    tab.connected = true
+    tab.closeReason = undefined
+    // 文件工作区/传输跟着主终端会话走：重连的正是它们绑定的会话时一并切到新 id
+    if (session.sftpSessionId === oldId) {
+      session.sftpSessionId = newId
+      sftpRefreshSignal.value++
+    }
+    triggerToast(`已重新连接终端 ${tab.title}`, 'success')
+  } finally {
+    tab.reconnecting = false
   }
-  let newId = tab.id
-  if (isTauri()) {
-    const resId = await openSession(session.host)
-    if (!resId) return
-    newId = resId
-  }
-  tab.id = newId
-  tab.connected = true
-  triggerToast(`已重新连接终端 ${tab.title}`, 'success')
 }
 
 const handleRenameTerminalTab = async (session: HostSession, index: number) => {

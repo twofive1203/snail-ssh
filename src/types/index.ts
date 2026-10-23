@@ -24,10 +24,19 @@ export interface HostItem {
 
 export interface TerminalTab {
   id: string
+  /**
+   * 前端稳定的标签标识：重连会换 `id`（后端会话 id），但 UI key 与 xterm 实例
+   * 靠 `uiId` 保持不变，这样重连后仍能看到断开前的回显历史。
+   */
+  uiId: string
   hostId: string
   title: string
   sub: string
   connected: boolean
+  /** 断线原因（仅 `connected === false` 时有意义） */
+  closeReason?: string
+  /** 正在重建连接（避免重复点击重连） */
+  reconnecting?: boolean
   cwd?: string
   /** 是否让左侧文件工作区跟随本标签页的终端目录（Tab 维度，默认关闭） */
   autoFollowTerminal?: boolean

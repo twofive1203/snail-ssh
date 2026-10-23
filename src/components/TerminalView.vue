@@ -256,6 +256,35 @@
         </button>
       </div>
 
+      <!-- 断线提示条：固定在顶部不遮挡历史回显，一键重建连接（重连后沿用同一个 xterm） -->
+      <div
+        v-if="disconnectedTab"
+        class="absolute top-2 left-1/2 -translate-x-1/2 z-30 flex items-center gap-2 pl-2.5 pr-1.5 py-1.5 rounded-lg bg-surface-sidebar/95 backdrop-blur-xl border border-rose-500/40 shadow-2xl"
+      >
+        <RefreshCw class="w-4 h-4 text-rose-400 shrink-0" />
+        <div class="min-w-0">
+          <p class="text-xs text-slate-200 font-medium leading-tight">连接已断开</p>
+          <p class="text-[10px] font-mono text-slate-500 truncate max-w-[240px] leading-tight">
+            {{ disconnectedTab.closeReason || '远端会话已结束' }}
+          </p>
+        </div>
+        <button
+          @click="$emit('reconnect-tab', activeTabIndex)"
+          :disabled="disconnectedTab.reconnecting"
+          class="px-2 py-1 rounded text-[11px] font-medium bg-brand-500/15 text-emerald-300 border border-brand-500/40 hover:bg-brand-500/25 transition-colors disabled:opacity-50 disabled:cursor-not-allowed shrink-0"
+          title="保留当前回显，重新建立 SSH 会话"
+        >
+          {{ disconnectedTab.reconnecting ? '重连中...' : '重新连接' }}
+        </button>
+        <button
+          @click="$emit('close-tab', activeTabIndex)"
+          class="p-1 rounded text-slate-400 hover:text-white hover:bg-surface-elevated transition-colors shrink-0"
+          title="关闭该终端"
+        >
+          <X class="w-3.5 h-3.5" />
+        </button>
+      </div>
+
       <div
         v-if="tabs.length === 0"
         class="w-full h-full flex flex-col items-center justify-center gap-3 text-center"
@@ -268,8 +297,8 @@
 
       <div
         v-for="tab in tabs"
-        :key="tab.id"
-        :ref="el => setContainer(tab.id, el)"
+        :key="tab.uiId"
+        :ref="el => setContainer(tab.uiId, el)"
         class="w-full h-full"
         :style="{ display: tab.id === currentTabId ? 'block' : 'none' }"
         @contextmenu.prevent="openTermMenu($event)"
@@ -495,10 +524,23 @@ interface TerminalSession {
   rightClickSelection: string
   /** 远端 shell 是否已经自己打印过 Last login（用于避免客户端重复补打） */
   sawLastLogin: boolean
+  /** 终端容器归属的标签 UI 标识（重连不换） */
+  uiId: string
 }
 
 const containerMap = new Map<string, HTMLDivElement>()
 const sessions = new Map<string, TerminalSession>()
+/**
+ * 容器按稳定的 `tab.uiId` 索引：重连只换后端会话 id，xterm 挂载的 DOM 不变，
+ * 新旧会话可以复用同一个终端实例（历史回显不会丢）。
+ */
+const setContainer = (uiId: string, el: any) => {
+  if (el) {
+    containerMap.set(uiId, el as HTMLDivElement)
+  } else {
+    containerMap.delete(uiId)
+  }
+}
 const termSize = ref<{ cols: number; rows: number }>({ cols: 80, rows: 24 })
 
 // 关键字高亮配置是全局单例（useHighlightSettings），这里只读开关状态用于 UI
@@ -520,13 +562,11 @@ const currentTabId = computed(() => props.tabs[props.activeTabIndex]?.id ?? '')
 const currentTab = computed(() => props.tabs[props.activeTabIndex])
 const currentSession = computed(() => sessions.get(currentTabId.value))
 
-const setContainer = (tabId: string, el: any) => {
-  if (el) {
-    containerMap.set(tabId, el as HTMLDivElement)
-  } else {
-    containerMap.delete(tabId)
-  }
-}
+/** 该标签是否是当前断线、需要展示重连入口的标签 */
+const disconnectedTab = computed(() => {
+  const tab = currentTab.value
+  return tab && !tab.connected ? tab : null
+})
 
 // ==========================================
 // 命令历史 / 联想补全
@@ -835,6 +875,7 @@ const sendCommandDraft = async () => {
   const tab = currentTab.value
   const text = commandDraft.value
   if (!tab || !text.trim()) return
+  if (rejectIfDisconnected(tab)) return
 
   const danger = detectDangerousCommand(text)
   if (danger && currentGroup.value.danger) {
@@ -978,7 +1019,8 @@ const createSession = (tab: TerminalTab, container: HTMLDivElement): TerminalSes
       onToast: (msg, type) => emit('toast', msg, type ?? 'info')
     }),
     container, inputBuffer: '', lineBuffer: '', unlisten: [], writeFailed: false, rightClickSelection: '',
-    sawLastLogin: false
+    sawLastLogin: false,
+    uiId: tab.uiId
   }
 
   term.open(container)
@@ -1050,6 +1092,8 @@ const createSession = (tab: TerminalTab, container: HTMLDivElement): TerminalSes
 
   // 绑定用户输入
   term.onData((data) => {
+    // 断开的会话已经没人收数据了，不再把按键往里塞（重连后 tab.connected 会重新置 true）
+    if (!tab.connected) return
     if (data.includes('\r')) {
       emit('terminal-enter', tab.id)
     }
@@ -1179,11 +1223,14 @@ const announceLastLoginIfMissing = async (tab: TerminalTab, session: TerminalSes
 
 const bindSessionEvents = async (tab: TerminalTab, session: TerminalSession) => {
   if (isTauri()) {
+    // 绑定时的后端会话 id：重连后 tab.id 会换，旧会话迟到的 closed 事件
+    // 不能再用 tab.id，否则会把刚重连好的标签误标为断开
+    const boundId = tab.id
     // 建连时的首屏（Last login / MOTD / 首个提示符）已被后端扣下，否则会在前端注册监听前丢失。
     // 顺序必须是「先注册监听 → 再取回首屏 → 最后放行实时输出」，否则提示符会跑到 MOTD 前面
     const pendingChunks: string[] = []
     let live = false
-    const unlistenStdout = await onSshStdout(tab.id, (chunk) => {
+    const unlistenStdout = await onSshStdout(boundId, (chunk) => {
       if (LAST_LOGIN_RE.test(chunk)) session.sawLastLogin = true
       if (live) {
         session.term.write(chunk)
@@ -1191,10 +1238,10 @@ const bindSessionEvents = async (tab: TerminalTab, session: TerminalSession) => 
       }
       pendingChunks.push(chunk)
     })
-    const unlistenClosed = await onSshClosed(tab.id, (reason) => {
+    const unlistenClosed = await onSshClosed(boundId, (reason) => {
       session.term.write(`\r\n\x1b[33m[会话结束] ${reason}\x1b[0m\r\n`)
-      setTabLogPath(tab.id, null)
-      emit('session-closed', tab.id, reason)
+      setTabLogPath(boundId, null)
+      emit('session-closed', boundId, reason)
     })
     session.unlisten.push(unlistenStdout, unlistenClosed)
 
@@ -1224,9 +1271,37 @@ const bindSessionEvents = async (tab: TerminalTab, session: TerminalSession) => 
   }
 }
 
-/** 按标签页同步 xterm 实例：新增则创建，移除则销毁 */
+/** 按标签页同步 xterm 实例：新增则创建，移除则销毁；断线重连则原地迁移 */
 const syncSessions = async () => {
   await nextTick()
+
+  // 重连只换了后端会话 id，uiId 没变：先把旧键下的 session 迁到新键，
+  // 这样 xterm 不会被销毁重建，断开前的输出还能看到
+  const keyByUiId = new Map<string, string>()
+  for (const [key, session] of sessions) keyByUiId.set(session.uiId, key)
+  for (const tab of props.tabs) {
+    const oldKey = keyByUiId.get(tab.uiId)
+    if (!oldKey || oldKey === tab.id) continue
+    const session = sessions.get(oldKey)
+    if (!session) continue
+    sessions.delete(oldKey)
+    sessions.set(tab.id, session)
+    // 旧后端会话已经关了：先摘监听，再绑到新会话上
+    session.unlisten.forEach(fn => fn())
+    session.unlisten = []
+    session.sawLastLogin = false
+    if (suggestTabId.value === oldKey) closeSuggestions()
+    // 旧会话的日志文件已经封存，不能把旧路径当成新会话的 REC 状态；
+    // 若用户开启过自动记录，下面的 bindSessionEvents 会为新会话重新开一个文件
+    if (loggingPaths.value[oldKey]) setTabLogPath(oldKey, null)
+    session.term.write('\r\n\x1b[32m[已重新连接] 新的 SSH 会话已建立\x1b[0m\r\n')
+    await bindSessionEvents(tab, session)
+    // 新会话的 PTY 尺寸可能不等于当前终端：主动同步一次，否则宽字符会折行错位
+    if (isTauri()) {
+      resizeSshSessionApi(tab.id, session.term.cols, session.term.rows).catch(() => {})
+    }
+    if (tab.id === currentTabId.value) session.term.focus()
+  }
 
   for (const [tabId, session] of sessions) {
     if (props.tabs.some(t => t.id === tabId)) continue
@@ -1240,7 +1315,7 @@ const syncSessions = async () => {
 
   for (const tab of props.tabs) {
     if (sessions.has(tab.id)) continue
-    const container = containerMap.get(tab.id)
+    const container = containerMap.get(tab.uiId)
     if (!container) continue
     const session = createSession(tab, container)
     sessions.set(tab.id, session)
@@ -1422,6 +1497,13 @@ watch([searchQuery, searchCaseSensitive, searchWholeWord, searchRegex], () => {
   if (searchOpen.value) runSearch('next')
 })
 
+/** 断开的会话已经没人接数据：入口处先拦一道，提示用户重新连接 */
+const rejectIfDisconnected = (tab: TerminalTab | undefined): boolean => {
+  if (!tab || tab.connected) return false
+  emitToast('连接已断开，请先点「重新连接」', 'warning')
+  return true
+}
+
 /** 统一的会话写入入口（真实 SSH 与预览降级共用） */
 const writeToSession = (tabId: string, data: string) => {
   const session = sessions.get(tabId)
@@ -1583,6 +1665,7 @@ const sendSnippetCommand = (cmd: string) => {
   const session = currentSession.value
   const tab = currentTab.value
   if (!session || !tab) return
+  if (rejectIfDisconnected(tab)) return
   if (isTauri()) {
     writeSshSessionApi(tab.id, cmd).catch((err: any) => {
       session.term.write(`\r\n\x1b[31m[写入失败] ${err?.message || err}\x1b[0m\r\n`)
