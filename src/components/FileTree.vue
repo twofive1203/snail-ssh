@@ -325,7 +325,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, watch, nextTick } from 'vue'
+import { ref, computed, watch, nextTick, onUnmounted } from 'vue'
 import {
   FolderGit2,
   PanelLeftClose,
@@ -1021,14 +1021,26 @@ watch(
   { immediate: true }
 )
 
+// 批量上传/下载时每个文件完成都会推一次 refreshSignal：合并成一次刷新，
+// 避免同一目录被重复读取，也让失效会话的重连重试不被重复请求掩盖。
+let refreshTimer: ReturnType<typeof setTimeout> | null = null
+
 watch(
   () => props.refreshSignal,
   () => {
-    if (props.sessionId && pathReady.value) {
-      refreshCurrent()
-    }
+    if (!props.sessionId || !pathReady.value) return
+    if (refreshTimer) clearTimeout(refreshTimer)
+    refreshTimer = setTimeout(() => {
+      refreshTimer = null
+      if (props.sessionId && pathReady.value) void refreshCurrent()
+    }, 250)
   }
 )
+
+onUnmounted(() => {
+  if (refreshTimer) clearTimeout(refreshTimer)
+  refreshTimer = null
+})
 
 const syncing = ref(false)
 

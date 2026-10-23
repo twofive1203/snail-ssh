@@ -355,7 +355,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted, watch, nextTick } from 'vue'
+import { ref, computed, onMounted, onUnmounted, watch, nextTick } from 'vue'
 import type { ContextMenuItem, HostItem, RemoteFileRef, SftpFileItem } from '@/types'
 import {
   sftpReadDirApi,
@@ -983,13 +983,25 @@ defineExpose({
   refresh: loadFiles
 })
 
-// 传输完成后刷新当前目录，让新上传/下载的文件立刻可见
+// 传输完成后刷新当前目录，让新上传/下载的文件立刻可见。
+// 批量传输时每个文件都会触发一次：合并防抖，避免重复读目录与重复报错。
+let refreshTimer: ReturnType<typeof setTimeout> | null = null
+
 watch(
   () => props.refreshSignal,
   (val, old) => {
     if (val === undefined || old === undefined) return
     if (!props.activeSessionId) return
-    loadFiles()
+    if (refreshTimer) clearTimeout(refreshTimer)
+    refreshTimer = setTimeout(() => {
+      refreshTimer = null
+      if (props.activeSessionId) void loadFiles()
+    }, 250)
   }
 )
+
+onUnmounted(() => {
+  if (refreshTimer) clearTimeout(refreshTimer)
+  refreshTimer = null
+})
 </script>

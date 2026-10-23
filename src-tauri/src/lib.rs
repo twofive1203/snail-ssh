@@ -58,9 +58,35 @@ where
         let result = job(session, signal);
         // 成功/失败/取消都要清理，否则注册表会随任务数增长
         registry.finish(&task_id);
+        // 通道被对端关掉时丢弃这条 SFTP 连接，否则用户点重试仍会打在同一条死连接上
+        if let Err(err) = &result {
+            if sftp::is_session_closed_error(err) {
+                manager.reset_sftp_session(&session_id);
+            }
+        }
         result
     })
     .await
+}
+
+/// 原样执行一次 SFTP 操作；若失败原因是 SFTP 通道已被关闭（服务端关子系统、
+/// 连接空闲被回收等），丢弃这条连接重建后重试一次。
+///
+/// 只有幂等的读写/元数据操作走这里：上传下载涉及进度与续传状态，失败由用户重试。
+fn run_sftp<T, F>(manager: SshManager, session_id: String, job: F) -> Result<T, String>
+where
+    F: Fn(Arc<Conn>) -> Result<T, String>,
+{
+    let session = manager.get_sftp_session(&session_id)?;
+    match job(Arc::clone(&session)) {
+        Err(err) if sftp::is_session_closed_error(&err) => {
+            eprintln!("[snail-ssh] SFTP 通道已失效（{}），重建连接后重试", err);
+            manager.reset_sftp_session(&session_id);
+            let retried = manager.get_sftp_session(&session_id)?;
+            job(retried)
+        }
+        other => other,
+    }
 }
 
 // ==========================================
@@ -313,10 +339,7 @@ async fn sftp_home_dir(
     ssh_manager: State<'_, SshManager>,
 ) -> Result<String, String> {
     let manager = ssh_manager.inner().clone();
-    run_blocking(move || {
-        let session = manager.get_sftp_session(&session_id)?;
-        sftp::sftp_home_dir(session)
-    })
+    run_blocking(move || run_sftp(manager, session_id, move |session| sftp::sftp_home_dir(session)))
     .await
 }
 
@@ -327,10 +350,7 @@ async fn sftp_read_dir(
     ssh_manager: State<'_, SshManager>,
 ) -> Result<Vec<SftpFileItem>, String> {
     let manager = ssh_manager.inner().clone();
-    run_blocking(move || {
-        let session = manager.get_sftp_session(&session_id)?;
-        sftp::sftp_read_dir(session, &path)
-    })
+    run_blocking(move || run_sftp(manager, session_id, move |session| sftp::sftp_read_dir(session, &path)))
     .await
 }
 
@@ -341,10 +361,7 @@ async fn sftp_read_file(
     ssh_manager: State<'_, SshManager>,
 ) -> Result<String, String> {
     let manager = ssh_manager.inner().clone();
-    run_blocking(move || {
-        let session = manager.get_sftp_session(&session_id)?;
-        sftp::sftp_read_file(session, &path)
-    })
+    run_blocking(move || run_sftp(manager, session_id, move |session| sftp::sftp_read_file(session, &path)))
     .await
 }
 
@@ -356,10 +373,7 @@ async fn sftp_write_file(
     ssh_manager: State<'_, SshManager>,
 ) -> Result<(), String> {
     let manager = ssh_manager.inner().clone();
-    run_blocking(move || {
-        let session = manager.get_sftp_session(&session_id)?;
-        sftp::sftp_write_file(session, &path, &content)
-    })
+    run_blocking(move || run_sftp(manager, session_id, move |session| sftp::sftp_write_file(session, &path, &content)))
     .await
 }
 
@@ -370,10 +384,7 @@ async fn sftp_mkdir(
     ssh_manager: State<'_, SshManager>,
 ) -> Result<(), String> {
     let manager = ssh_manager.inner().clone();
-    run_blocking(move || {
-        let session = manager.get_sftp_session(&session_id)?;
-        sftp::sftp_mkdir(session, &path)
-    })
+    run_blocking(move || run_sftp(manager, session_id, move |session| sftp::sftp_mkdir(session, &path)))
     .await
 }
 
@@ -384,10 +395,7 @@ async fn sftp_remove_file(
     ssh_manager: State<'_, SshManager>,
 ) -> Result<(), String> {
     let manager = ssh_manager.inner().clone();
-    run_blocking(move || {
-        let session = manager.get_sftp_session(&session_id)?;
-        sftp::sftp_remove_file(session, &path)
-    })
+    run_blocking(move || run_sftp(manager, session_id, move |session| sftp::sftp_remove_file(session, &path)))
     .await
 }
 
@@ -400,10 +408,7 @@ async fn sftp_rename(
     ssh_manager: State<'_, SshManager>,
 ) -> Result<(), String> {
     let manager = ssh_manager.inner().clone();
-    run_blocking(move || {
-        let session = manager.get_sftp_session(&session_id)?;
-        sftp::sftp_rename(session, &from, &to, overwrite)
-    })
+    run_blocking(move || run_sftp(manager, session_id, move |session| sftp::sftp_rename(session, &from, &to, overwrite)))
     .await
 }
 
@@ -415,10 +420,7 @@ async fn sftp_chmod(
     ssh_manager: State<'_, SshManager>,
 ) -> Result<(), String> {
     let manager = ssh_manager.inner().clone();
-    run_blocking(move || {
-        let session = manager.get_sftp_session(&session_id)?;
-        sftp::sftp_chmod(session, &path, mode)
-    })
+    run_blocking(move || run_sftp(manager, session_id, move |session| sftp::sftp_chmod(session, &path, mode)))
     .await
 }
 
@@ -431,10 +433,7 @@ async fn sftp_chown(
     ssh_manager: State<'_, SshManager>,
 ) -> Result<(), String> {
     let manager = ssh_manager.inner().clone();
-    run_blocking(move || {
-        let session = manager.get_sftp_session(&session_id)?;
-        sftp::sftp_chown(session, &path, uid, gid)
-    })
+    run_blocking(move || run_sftp(manager, session_id, move |session| sftp::sftp_chown(session, &path, uid, gid)))
     .await
 }
 
@@ -445,10 +444,7 @@ async fn sftp_touch(
     ssh_manager: State<'_, SshManager>,
 ) -> Result<(), String> {
     let manager = ssh_manager.inner().clone();
-    run_blocking(move || {
-        let session = manager.get_sftp_session(&session_id)?;
-        sftp::sftp_touch(session, &path)
-    })
+    run_blocking(move || run_sftp(manager, session_id, move |session| sftp::sftp_touch(session, &path)))
     .await
 }
 
@@ -459,10 +455,7 @@ async fn sftp_stat(
     ssh_manager: State<'_, SshManager>,
 ) -> Result<SftpFileItem, String> {
     let manager = ssh_manager.inner().clone();
-    run_blocking(move || {
-        let session = manager.get_sftp_session(&session_id)?;
-        sftp::sftp_stat(session, &path)
-    })
+    run_blocking(move || run_sftp(manager, session_id, move |session| sftp::sftp_stat(session, &path)))
     .await
 }
 

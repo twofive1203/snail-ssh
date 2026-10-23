@@ -630,6 +630,19 @@ impl SshManager {
         Ok(created)
     }
 
+    /// 丢弃该会话缓存的 SFTP 连接（SFTP 子系统通道已被关闭时调用）。
+    /// 下次 `get_sftp_session` 会重新建连，让后续读写自愈。
+    pub fn reset_sftp_session(&self, session_id: &str) {
+        let Ok(active) = self.get_active(session_id) else {
+            return;
+        };
+        let dropped = active.sftp_conn.lock().take();
+        if let Some(conn) = dropped {
+            // 这条连接可能已经半死，不等挥手，直接异步断开
+            rt::spawn(async move { conn.disconnect_async().await });
+        }
+    }
+
     /// 供探测命令读取会话对应的连接配置（用于一次性建连采集主机指标）
     pub fn get_config(&self, session_id: &str) -> Result<SshConnectConfig, String> {
         Ok(self.get_active(session_id)?.config.clone())

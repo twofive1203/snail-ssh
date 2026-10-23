@@ -27,6 +27,14 @@ const DOWNLOAD_READ_SIZE: usize = 1024 * 1024;
 /// 进度事件最小上报间隔
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(150);
 
+/// 判断错误是否属于“SFTP 通道已被关闭”。russh-sftp 在读写琭退出（对端关子系统、
+/// 连接空闲被回收、传输中断）后，后续请求统一返回 `session closed`；
+/// 这类错误只能靠重建会话恢复，调用方据此决定是否重连重试。
+pub fn is_session_closed_error(err: &str) -> bool {
+    let lower = err.to_lowercase();
+    lower.contains("session closed") || lower.contains("channel closed")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SftpFileItem {
     pub name: String,
@@ -610,6 +618,12 @@ fn transfer_upload_one(
         signal.set_transferred(reporter.transferred);
         reporter.report(app, "running", false);
     }
+
+    // 写请求是流水线发送的，write 返回只代表已入队：必须 flush 等所有 ACK 回来，
+    // 否则函数会先报“完成”而尾部数据实际未确认（还会把未完成的请求带到下一次操作）。
+    remote_file
+        .flush()
+        .map_err(|e| format!("传输中断: {}", e))?;
     Ok(())
 }
 
