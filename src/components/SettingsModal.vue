@@ -166,6 +166,30 @@
                   </span>
                 </span>
               </label>
+              <div class="pt-2 border-t border-surface-border/60 space-y-2">
+                <h3 class="text-xs font-semibold text-slate-200">鼠标</h3>
+                <label class="flex items-start gap-2.5 cursor-pointer">
+                  <input v-model="settings.selectToCopy" type="checkbox" class="accent-emerald-500 mt-0.5" />
+                  <span>
+                    <span class="text-xs text-slate-200 block">选中即复制</span>
+                    <span class="text-[10px] text-slate-500 block leading-relaxed">
+                      拖选、双击选词或三击选行后，自动把选中文本写入剪贴板，不弹提示。
+                      终端顶栏的选中按钮是同一个开关。
+                    </span>
+                  </span>
+                </label>
+                <label class="flex items-start gap-2.5 cursor-pointer">
+                  <input v-model="settings.pasteOnRightClick" type="checkbox" class="accent-emerald-500 mt-0.5" />
+                  <span>
+                    <span class="text-xs text-slate-200 block">右键粘贴</span>
+                    <span class="text-[10px] text-slate-500 block leading-relaxed">
+                      在终端里单击右键直接粘贴剪贴板，不再弹出菜单。
+                      需要复制、全选、查找或清屏时，按住 <span class="font-mono">Shift</span> 或 <span class="font-mono">Ctrl</span> 再右键。
+                      <span class="font-mono">Ctrl+Shift+V</span> 仍然可用。
+                    </span>
+                  </span>
+                </label>
+              </div>
             </section>
           </template>
 

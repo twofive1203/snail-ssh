@@ -256,4 +256,8 @@ export interface AppSettings {
   historySuggestEnabled: boolean
   /** 新建会话时默认展开底部远程监控条；关闭后仍可从文件树工具栏按会话手动开启 */
   remoteMonitorEnabled: boolean
+  /** 拖选 / 双击选词 / 三击选行后自动写入剪贴板，不弹提示 */
+  selectToCopy: boolean
+  /** 终端内右键直接粘贴；Shift 或 Ctrl 再右键仍打开菜单 */
+  pasteOnRightClick: boolean
 }

@@ -195,8 +195,23 @@ export const defaultSettings = (): AppSettings => ({
   groups: DEFAULT_GROUPS.map(g => ({ ...g })),
   commandBarEnabled: true,
   historySuggestEnabled: true,
-  remoteMonitorEnabled: true
+  remoteMonitorEnabled: true,
+  selectToCopy: true,
+  pasteOnRightClick: true
 })
+
+/** 旧版选中即复制只写在 localStorage；settings 缺字段时继承，避免升级把用户关过的开关又打开 */
+const LEGACY_SELECT_COPY_KEY = 'snail_ssh_select_to_copy'
+const legacySelectToCopy = (): boolean => {
+  try {
+    const raw = localStorage.getItem(LEGACY_SELECT_COPY_KEY)
+    if (raw === '0') return false
+    if (raw === '1') return true
+  } catch {
+    // localStorage 不可用时用默认值
+  }
+  return true
+}
 
 const STORAGE_KEY = 'snail_ssh_app_settings_v1'
 const SAVE_DEBOUNCE_MS = 400
@@ -249,7 +264,9 @@ export const normalizeSettings = (raw: any): AppSettings => {
       : base.groups,
     commandBarEnabled: typeof raw.commandBarEnabled === 'boolean' ? raw.commandBarEnabled : base.commandBarEnabled,
     historySuggestEnabled: typeof raw.historySuggestEnabled === 'boolean' ? raw.historySuggestEnabled : base.historySuggestEnabled,
-    remoteMonitorEnabled: typeof raw.remoteMonitorEnabled === 'boolean' ? raw.remoteMonitorEnabled : base.remoteMonitorEnabled
+    remoteMonitorEnabled: typeof raw.remoteMonitorEnabled === 'boolean' ? raw.remoteMonitorEnabled : base.remoteMonitorEnabled,
+    selectToCopy: typeof raw.selectToCopy === 'boolean' ? raw.selectToCopy : legacySelectToCopy(),
+    pasteOnRightClick: typeof raw.pasteOnRightClick === 'boolean' ? raw.pasteOnRightClick : base.pasteOnRightClick
   }
 }
 
@@ -268,6 +285,8 @@ const applySettings = (next: AppSettings) => {
   settings.commandBarEnabled = next.commandBarEnabled
   settings.historySuggestEnabled = next.historySuggestEnabled
   settings.remoteMonitorEnabled = next.remoteMonitorEnabled
+  settings.selectToCopy = next.selectToCopy
+  settings.pasteOnRightClick = next.pasteOnRightClick
   // 同步 watch 在下一个 tick 才跑，这里用微任务兜底恢复标志，避免漏掉用户紧接的修改
   void Promise.resolve().then(() => { applying = false })
 }

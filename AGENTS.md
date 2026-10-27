@@ -20,10 +20,10 @@
 ## 3. 数据落盘位置
 
 - `~/.snail-ssh/hosts.json`：主机元数据（凭证走系统钥匙串，`storage.rs` 分片存储，失败才回退明文并告警）。
-- `~/.snail-ssh/settings.json`：应用设置（终端外观、命令片段、目录书签、主机分组）；`settings.rs` 只做整块 JSON 的原子读写，结构由前端 `AppSettings` 约束，缺字段由前端补默认值。
+- `~/.snail-ssh/settings.json`：应用设置（终端外观、选中即复制、右键粘贴、命令片段、目录书签、主机分组）；`settings.rs` 只做整块 JSON 的原子读写，结构由前端 `AppSettings` 约束，缺字段由前端补默认值。
 - `~/.snail-ssh/history.json`：命令历史（每主机上限 500 条）。
 - `~/.snail-ssh/logs/<host>/<UTC 时间戳>_<会话短 ID>.log`：会话日志（明文、不轮转）。
-- `localStorage`：`snail_ssh_recent`、`snail_ssh_highlight_settings_v1`、`snail_ssh_import_remote_history`、`snail_ssh_select_to_copy`、`snail_ssh_session_log_auto`；浏览器预览降级时 `snail_ssh_app_settings_v1` 充当 settings.json 的替身。
+- `localStorage`：`snail_ssh_recent`、`snail_ssh_highlight_settings_v1`、`snail_ssh_import_remote_history`、`snail_ssh_session_log_auto`；浏览器预览降级时 `snail_ssh_app_settings_v1` 充当 settings.json 的替身。旧键 `snail_ssh_select_to_copy` 只在 `settings.json` 缺 `selectToCopy` 时迁移一次。
 
 ## 4. 文档纪律
 

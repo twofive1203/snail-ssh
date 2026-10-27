@@ -74,9 +74,9 @@
 
         <button
           @click="toggleSelectCopy"
-          :title="selectToCopyEnabled ? '关闭选中即复制' : '开启选中即复制（拖选后自动写入剪贴板）'"
+          :title="settings.selectToCopy ? '关闭选中即复制' : '开启选中即复制（拖选后自动写入剪贴板）'"
           class="p-1.5 rounded hover:bg-surface-elevated transition-colors"
-          :class="selectToCopyEnabled ? 'text-emerald-300 bg-emerald-500/10' : 'text-surface-subtle hover:text-white'"
+          :class="settings.selectToCopy ? 'text-emerald-300 bg-emerald-500/10' : 'text-surface-subtle hover:text-white'"
         >
           <TextSelect class="w-3.5 h-3.5" />
         </button>
@@ -146,7 +146,7 @@
       @close="tabMenu.open = false"
     />
 
-    <!-- 终端内右键菜单：复制 / 粘贴 / 全选 / 查找 / 清除屏幕 -->
+    <!-- 终端内右键菜单：复制 / 粘贴 / 全选 / 查找 / 清除屏幕。右键粘贴开启时需 Shift/Ctrl+右键 -->
     <ContextMenu
       :open="termMenu.open"
       :x="termMenu.x"
@@ -301,7 +301,7 @@
         :ref="el => setContainer(tab.uiId, el)"
         class="w-full h-full"
         :style="{ display: tab.id === currentTabId ? 'block' : 'none' }"
-        @contextmenu.prevent="openTermMenu($event)"
+        @contextmenu.prevent="onTerminalContextMenu($event)"
       ></div>
 
     </div>
@@ -547,16 +547,6 @@ const termSize = ref<{ cols: number; rows: number }>({ cols: 80, rows: 24 })
 const highlightEnabled = computed(() => highlightSettings.enabled)
 const highlightSettingsOpen = ref(false)
 
-// 选中即复制开关（默认开，存 localStorage）
-const SELECT_COPY_KEY = 'snail_ssh_select_to_copy'
-const readSelectCopyEnabled = (): boolean => {
-  try {
-    return localStorage.getItem(SELECT_COPY_KEY) !== '0'
-  } catch {
-    return true
-  }
-}
-const selectToCopyEnabled = ref(readSelectCopyEnabled())
 
 const currentTabId = computed(() => props.tabs[props.activeTabIndex]?.id ?? '')
 const currentTab = computed(() => props.tabs[props.activeTabIndex])
@@ -1001,6 +991,8 @@ const createSession = (tab: TerminalTab, container: HTMLDivElement): TerminalSes
     cursorStyle: settings.terminal.cursorStyle,
     theme: currentTerminalTheme().theme,
     allowProposedApi: true,
+    // 右键留给「粘贴 / 菜单」，不要顺手选中光标下的单词，否则会盖掉剪贴板
+    rightClickSelectsWord: false,
   })
 
   const fit = new FitAddon()
@@ -1041,7 +1033,7 @@ const createSession = (tab: TerminalTab, container: HTMLDivElement): TerminalSes
   let dragging = false
   let lastCopied = ''
   const copySelectionToClipboard = () => {
-    if (!selectToCopyEnabled.value) return
+    if (!settings.selectToCopy) return
     const text = term.getSelection()
     if (!text || text === lastCopied) return
     lastCopied = text
@@ -1053,14 +1045,17 @@ const createSession = (tab: TerminalTab, container: HTMLDivElement): TerminalSes
     dragging = true
     lastCopied = ''
   })
-  container.addEventListener('mouseup', () => {
+  container.addEventListener('mouseup', (e) => {
+    if (e.button !== 0) return
     dragging = false
     copySelectionToClipboard()
   })
   // 拖到终端外松开时容器收不到 mouseup，靠 document 兜底（xterm 也在 document 上收尾选择）
-  const onDocumentMouseUp = () => {
+  const onDocumentMouseUp = (e: MouseEvent) => {
     if (!dragging) return
     dragging = false
+    // 右键松开不复制，避免和右键粘贴抢剪贴板
+    if (e.button !== 0) return
     copySelectionToClipboard()
   }
   document.addEventListener('mouseup', onDocumentMouseUp)
@@ -1482,15 +1477,10 @@ const jumpToProblem = (direction: 1 | -1) => {
   session.term.focus()
 }
 
-/** 选中即复制开关：默认开，拖动/双击选中后自动写入剪贴板（不弹提示） */
+/** 选中即复制：与设置中心同一开关，拖动/双击选中后自动写入剪贴板（不弹提示） */
 const toggleSelectCopy = () => {
-  selectToCopyEnabled.value = !selectToCopyEnabled.value
-  try {
-    localStorage.setItem(SELECT_COPY_KEY, selectToCopyEnabled.value ? '1' : '0')
-  } catch {
-    // localStorage 不可用时仅本次会话生效
-  }
-  emitToast(selectToCopyEnabled.value ? '选中即复制已开启' : '选中即复制已关闭', 'info')
+  settings.selectToCopy = !settings.selectToCopy
+  emitToast(settings.selectToCopy ? '选中即复制已开启' : '选中即复制已关闭', 'info')
 }
 
 watch([searchQuery, searchCaseSensitive, searchWholeWord, searchRegex], () => {
@@ -1537,15 +1527,22 @@ const copySelection = async (tabId: string) => {
 }
 
 const pasteToTerminal = async (tabId: string) => {
+  const tab = props.tabs.find(t => t.id === tabId)
+  if (rejectIfDisconnected(tab)) return
+  const session = sessions.get(tabId)
+  if (!session) return
   try {
     const text = await navigator.clipboard.readText()
     if (!text) {
       emitToast('剪贴板为空', 'warning')
       return
     }
-    writeToSession(tabId, text)
+    // xterm.paste 会把换行规范成 CR，并在远端开启 bracketed paste 时包上边界，再经 onData 写到会话
+    session.term.paste(text)
+    session.term.clearSelection()
+    session.term.focus()
   } catch {
-    emitToast('无法读取剪贴板，请使用 Ctrl+V 粘贴', 'warning')
+    emitToast('无法读取剪贴板，请使用 Ctrl+Shift+V 粘贴', 'warning')
   }
 }
 
@@ -1565,9 +1562,22 @@ const openTermMenu = (event: MouseEvent) => {
   termMenu.value = { open: true, x: event.clientX, y: event.clientY, tabId: currentTabId.value, hasSelection: !!selection }
 }
 
+/** 右键粘贴开启时直接粘贴；Shift / Ctrl 右键仍打开完整菜单 */
+const onTerminalContextMenu = (event: MouseEvent) => {
+  if (!currentSession.value) return
+  const pasteDirect = settings.pasteOnRightClick && !event.shiftKey && !event.ctrlKey && !event.metaKey
+  if (!pasteDirect) {
+    openTermMenu(event)
+    return
+  }
+  const tab = currentTab.value
+  if (!tab) return
+  void pasteToTerminal(tab.id)
+}
+
 const termMenuItems = computed<ContextMenuItem[]>(() => [
   { key: 'copy', label: '复制', icon: Copy, hint: 'Ctrl+Shift+C', disabled: !termMenu.value.hasSelection },
-  { key: 'paste', label: '粘贴', icon: ClipboardPaste, hint: 'Ctrl+Shift+V' },
+  { key: 'paste', label: '粘贴', icon: ClipboardPaste, hint: settings.pasteOnRightClick ? '右键' : 'Ctrl+Shift+V' },
   { key: 'select-all', label: '全选', icon: TextSelect },
   { divider: true },
   { key: 'toggle-highlight', label: highlightEnabled.value ? '关闭语法高亮' : '开启语法高亮', icon: Highlighter },
