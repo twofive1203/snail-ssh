@@ -30,3 +30,4 @@ keyring = { version = "4", default-features = false, features = ["v1"] }
 # 主机密钥指纹（SHA256 base64），用于 known_hosts 校验展示
 sha2 = "0.10"
 base64 = "0.22"
+rand = "0.10"

@@ -40,8 +40,10 @@ cd src-tauri && cargo check      # Rust 侧；history.rs 有单测可跑 cargo t
 
 改了既有文件前，按项目习惯先备份到 `backups/<任务名>/`（`backups/` 已在 .gitignore 中）。未执行的验证需如实说明"已完成静态检查，未执行运行验证"。
 
-## 6. 现有占位功能（点击只弹提示，勿当已实现）
+## 6. 已从占位改为可用的连通功能
 
-跳板机/代理、SSH 密钥保险箱、端口转发隧道、主机导入导出。
+跳板机/代理、SSH 密钥保险箱、端口转发隧道、OpenSSH config 导入导出已经接入。不要再把这些入口当成只弹提示的占位。
+
+限制仍在：不执行 `ProxyCommand`，不导入 FinalShell / Termius / Xshell 专有格式，动态转发无认证。细节见 `README.md` 的已知限制。
 
 （命令片段库、自定义分组、设置中心、终端主题/字体定制已实现，见 `SettingsModal.vue` 与 `composables/useAppSettings.ts`。）

@@ -24,6 +24,7 @@
 * **真实监控指标**：连接成功后自动执行远端探测脚本，回填系统发行版、CPU/内存/磁盘利用率与 TCP+SSH 握手延迟；未探测过的主机不再展示伪造数值（浏览器 Web 预览模式除外，该模式使用内置演示数据 `demoSession`）。
 * **分组与标签检索**：按生产集群 (Prod)、测试环境 (Stage)、个人实验机 (Cloud) 三个固定分组过滤；搜索框同时匹配主机名、IP 与 Tag。分组本身的新增 / 重命名 / 删除尚未实现（侧边栏「+」为占位）。
 * **快捷直连入口**：卡片上提供一键 `连接 SSH` 与 `SFTP`。
+* **迁移与连通**：主机可配置跳板链（引用已保存主机）和 SOCKS5 / HTTP 代理；可配置 Local / Remote / Dynamic 端口转发；可从 `~/.ssh/config` 导入并导出不含密钥的 config；侧边栏提供密钥保险箱（生成 / 导入 ed25519 与 RSA、查看 known_hosts）和独立隧道。认证方式增加 keyboard-interactive / OTP。
 * **新建/编辑服务器弹窗 (Modal)**：支持主机别名、分组、IP、端口、认证方式（密码 / 私钥 PEM 或路径 / SSH Agent）与真实连通性测试。
 * **资产持久化存储**：主机元数据存于 `~/.snail-ssh/hosts.json`，密码、私钥与口令存入系统钥匙串（Windows 凭据管理器 / macOS Keychain / Linux Secret Service），配置文件中不落明文凭据。私钥体积超单条凭据上限时自动分片存储。
 
@@ -97,16 +98,13 @@
 
 ---
 
-## ⚠️ 尚未实现 / 已知限制
+## ⚠️ 已知限制
 
-界面中以下入口为占位，点击仅提示「尚未实现」，请勿当作可用功能：
-
-* 跳板机 & 代理（Jump Host / ProxyJump）
-* SSH 密钥保险箱（密钥对生成与导入）
-* 端口转发 & 隧道（Local / Remote / Dynamic）
-* 主机配置导入 / 导出（SSH Config、FinalShell、Termius）
-
-其它限制：
+* 跳板机只支持已保存主机组成的 `ProxyJump` 链（最多 8 跳）和 SOCKS5 / HTTP CONNECT 出站代理。`ProxyCommand` 会在导入时忽略，不会在本机执行。
+* 端口转发支持 Local / Remote / Dynamic（本地 SOCKS5）。启用的转发会在连接该主机时自动启动，也可从侧边栏单独拉起。远端转发要求 sshd 允许 `AllowTcpForwarding`；同一本地端口不能被两个隧道同时占用。动态转发不做认证，请只绑定 `127.0.0.1`。
+* 主机导入目前只读 OpenSSH `ssh_config`。`Match` / `Include` 不展开。FinalShell / Termius / Xshell 的专有格式尚未支持。导出不写密码和私钥内容。
+* 密钥保险箱可生成 ed25519 / RSA，或导入已有私钥，文件落在 `~/.snail-ssh/keys/`。known_hosts 可查看和删除。交互式认证（keyboard-interactive / OTP）会弹出提问，3 分钟未填写即失败。
+* 确认主机密钥时只信任当前这一跳。不要用一次确认放行整条没看过指纹的链路。
 
 * SSH 栈已从 libssh2 换成 russh：Windows 上也支持 ed25519 / OpenSSH 证书主机密钥（旧版只支持 RSA 主机密钥，遇到仅提供证书主机密钥的服务器会握手失败）。证书主机密钥按 `~/.ssh/known_hosts` 中的裸公钥或 `@cert-authority` 记录校验，`@revoked` 一律拒绝。
 * 「SSH Agent」认证在 Windows 上只支持 Pageant（russh 的 Unix socket 代理仅 Unix 编译）；本机 OpenSSH 的 `ssh-agent` 服务未运行时该方式会失败，建议改用私钥认证，私钥填绝对路径（例如 `C:\Users\<用户名>\.ssh\id_rsa`）。

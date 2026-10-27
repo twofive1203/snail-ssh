@@ -30,8 +30,8 @@
           @switch-view="handleSidebarSwitchView"
           @filter-group="val => selectedGroup = val"
           @connect-host="handleConnectSsh"
-          @open-vault="triggerToast('SSH 密钥保险箱尚未实现', 'info')"
-          @open-tunnels="triggerToast('端口转发隧道尚未实现', 'info')"
+          @open-vault="vaultOpen = true"
+          @open-tunnels="tunnelsOpen = true"
           @open-settings="openSettings"
         />
 
@@ -45,7 +45,7 @@
             @edit-host="handleEditHost"
             @delete-host="handleDeleteHost"
             @open-new-host="openNewHostModal"
-            @import-export="triggerToast('主机导入/导出尚未实现', 'info')"
+            @import-export="importOpen = true"
           />
         </main>
       </div>
@@ -95,12 +95,17 @@
     <HostModal
       :open="hostModalVisible"
       :host-data="editingHost"
+      :hosts="hosts"
       :mode="hostModalMode"
       @close="closeHostModal"
       @save="handleSaveHost"
       @connect-quick="handleQuickConnect"
       @toast="triggerToast"
     />
+    <KeyVaultModal :open="vaultOpen" @close="vaultOpen = false" @toast="triggerToast" @use-key="useVaultKey" />
+    <TunnelModal :open="tunnelsOpen" :hosts="hosts" @close="tunnelsOpen = false" @toast="triggerToast" />
+    <ImportExportModal :open="importOpen" :hosts="hosts" @close="importOpen = false" @toast="triggerToast" @imported="loadHosts" />
+    <AuthPromptModal :prompt="authPrompt" @done="authPrompt = null" />
 
     <!-- 弹窗 2: 在线文件代码编辑器 -->
     <EditorModal
@@ -166,6 +171,10 @@ import SessionWorkspace from '@/components/SessionWorkspace.vue'
 import TransferDrawer from '@/components/TransferDrawer.vue'
 import CommandPalette from '@/components/CommandPalette.vue'
 import HostModal from '@/components/HostModal.vue'
+import KeyVaultModal from '@/components/KeyVaultModal.vue'
+import TunnelModal from '@/components/TunnelModal.vue'
+import ImportExportModal from '@/components/ImportExportModal.vue'
+import AuthPromptModal from '@/components/AuthPromptModal.vue'
 import EditorModal from '@/components/EditorModal.vue'
 import DialogHost from '@/components/DialogHost.vue'
 import SettingsModal from '@/components/SettingsModal.vue'
@@ -173,12 +182,16 @@ import Toast from '@/components/Toast.vue'
 import { confirmDialog, promptDialog, dialogState } from '@/composables/useDialog'
 import { useRecentHosts, MAX_RECENT_DISPLAY } from '@/composables/useRecentHosts'
 import { loadSettings, groupById, settings } from '@/composables/useAppSettings'
-import type { FileDragDropEvent, HostItem, HostSession, RemoteFileRef, SftpFileItem, TransferContext, TransferTask, ToastMessage } from '@/types'
+import type { AuthPromptEvent, FileDragDropEvent, HostItem, HostSession, RemoteFileRef, SftpFileItem, TransferContext, TransferTask, ToastMessage, TrustedEndpoint } from '@/types'
+import { parseHostKeyError } from '@/utils/hostKey'
 import {
   getHostsApi,
   saveHostApi,
   deleteHostApi,
   createSshSessionApi,
+  onSshAuthPrompt,
+  onForwardStatus,
+  submitSshAuthPromptApi,
   closeSshSessionApi,
   probeHostInfoApi,
   sftpUploadPathApi,
@@ -261,6 +274,12 @@ const editingFilePath = ref('')
 const currentEditingSessionId = ref('')
 const settingsOpen = ref(false)
 const settingsTab = ref<string | undefined>(undefined)
+const vaultOpen = ref(false)
+const tunnelsOpen = ref(false)
+const importOpen = ref(false)
+const authPrompt = ref<AuthPromptEvent | null>(null)
+let authUnlisten: (() => void) | undefined
+let forwardUnlisten: (() => void) | undefined
 
 // Toast 状态
 const toastList = ref<ToastMessage[]>([])
@@ -359,63 +378,38 @@ const loadHosts = async () => {
 const probingHosts = new Set<string>()
 
 const openSession = async (host: HostItem, cols = 80, rows = 24): Promise<string | null> => {
-  try {
-    const res = await createSshSessionApi(host, cols, rows, false)
-    return res.sessionId
-  } catch (e: any) {
-    const msg = String(e?.message || e)
-    if (msg.startsWith('HOST_KEY_MISMATCH|')) {
-      const parts = msg.split('|')
-      const newFp = parts[1] || '未知'
-      const oldFps = (parts[2] || '').split(';').filter(Boolean)
+  const trusted: TrustedEndpoint[] = []
+  for (let attempt = 0; attempt < 8; attempt++) {
+    try {
+      const res = await createSshSessionApi(host, cols, rows, trusted, hosts.value)
+      return res.sessionId
+    } catch (e: any) {
+      const msg = String(e?.message || e)
+      const challenge = parseHostKeyError(msg)
+      if (!challenge) {
+        triggerToast(`SSH 连接失败: ${msg}`, 'error')
+        return null
+      }
+      const where = challenge.host ? `${challenge.host}:${challenge.port ?? ''}` : `${host.host}:${host.port}`
       const proceed = await confirmDialog({
-        title: '主机密钥不一致',
-        variant: 'danger',
-        message:
-          `${host.name}（${host.host}:${host.port}）的主机密钥与 ~/.ssh/known_hosts 记录不一致。\n` +
-          '这可能是服务器重装/更换了密钥，也可能是中间人攻击。',
-        detail:
-          `本次服务器提供的指纹：\n${newFp}\n\n已知记录：\n${oldFps.join('\n') || '（无法读取）'}`,
-        confirmText: '确认更换并继续',
+        title: challenge.kind === 'mismatch' ? '主机密钥不一致' : '首次连接该主机',
+        variant: challenge.kind === 'mismatch' ? 'danger' : 'warning',
+        message: challenge.kind === 'mismatch'
+          ? `${where} 的主机密钥与 ~/.ssh/known_hosts 不一致。这可能是服务器重装，也可能是中间人攻击。`
+          : `首次见到 ${where} 的主机密钥。是否只信任这一跳并写入 ~/.ssh/known_hosts？`,
+        detail: `指纹：\n${challenge.fingerprint}${challenge.oldFingerprints.length ? `\n\n已知记录：\n${challenge.oldFingerprints.join('\n')}` : ''}`,
+        confirmText: '信任这一跳并继续',
         cancelText: '取消连接'
       })
-      if (!proceed) {
-        triggerToast('已取消连接：主机密钥不一致', 'warning')
-        return null
-      }
-      try {
-        const res = await createSshSessionApi(host, cols, rows, true)
-        return res.sessionId
-      } catch (e2: any) {
-        triggerToast(`SSH 连接失败: ${e2?.message || e2}`, 'error')
-        return null
-      }
-    }
-    const unknown = msg.match(/HOST_KEY_UNKNOWN\|(.+)/)
-    if (unknown) {
-      const trust = await confirmDialog({
-        title: '首次连接该主机',
-        variant: 'warning',
-        message: `首次连接 ${host.name}（${host.host}:${host.port}）。\n是否信任该主机密钥并写入 ~/.ssh/known_hosts？`,
-        detail: `主机密钥指纹：\n${unknown[1]}`,
-        confirmText: '信任并继续',
-        cancelText: '取消连接'
-      })
-      if (!trust) {
+      if (!proceed || !challenge.host || challenge.port == null) {
         triggerToast('已取消连接：未信任主机密钥', 'warning')
         return null
       }
-      try {
-        const res = await createSshSessionApi(host, cols, rows, true)
-        return res.sessionId
-      } catch (e2: any) {
-        triggerToast(`SSH 连接失败: ${e2?.message || e2}`, 'error')
-        return null
-      }
+      trusted.push({ host: challenge.host, port: challenge.port })
     }
-    triggerToast(`SSH 连接失败: ${msg}`, 'error')
-    return null
   }
+  triggerToast('跳板链路的主机密钥确认次数过多，已停止', 'error')
+  return null
 }
 
 // 连接成功后异步采集真实指标
@@ -1125,6 +1119,15 @@ const setupGlobalKeybindings = () => {
   })
 }
 
+const useVaultKey = async (path: string) => {
+  try {
+    await navigator.clipboard.writeText(path)
+    triggerToast('私钥路径已复制，可粘贴到主机的私钥字段', 'success')
+  } catch {
+    triggerToast(path, 'info')
+  }
+}
+
 onMounted(async () => {
   // 设置要先于主机列表加载：分组颜色/名称参与首屏渲染，晚到会闪一下默认值
   await loadSettings()
@@ -1132,12 +1135,19 @@ onMounted(async () => {
   setupGlobalKeybindings()
   if (isTauri()) {
     dragUnlisten = await onFileDragDrop(handleFileDragEvent)
+    authUnlisten = await onSshAuthPrompt((payload) => { authPrompt.value = payload })
+    forwardUnlisten = await onForwardStatus((payload) => {
+      for (const note of payload.notes || []) triggerToast(note, note.includes('失败') ? 'warning' : 'info')
+    })
   }
   triggerToast('SnailSSH 桌面客户端已就绪！支持 Ctrl+K 全局搜索、Ctrl+, 设置中心', 'success')
 })
 
 onBeforeUnmount(() => {
   dragUnlisten?.()
+  authUnlisten?.()
+  forwardUnlisten?.()
+  if (authPrompt.value) submitSshAuthPromptApi(authPrompt.value.requestId, null).catch(() => {})
   if (!isTauri()) return
   for (const s of sessions.value) {
     for (const tab of s.terminalTabs) {

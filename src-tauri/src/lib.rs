@@ -1,19 +1,27 @@
+mod authprompt;
 mod conn;
+mod forward;
 mod history;
+mod model;
+mod net;
 mod rt;
 mod settings;
 mod sftp;
 mod sftp_compat;
 mod ssh;
+mod sshconfig;
 mod storage;
 mod transfer;
+mod vault;
 
+use authprompt::AuthPrompter;
 use conn::Conn;
 use history::HistoryEntry;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sftp::SftpFileItem;
 use ssh::{ConnectionTestResult, HostProbeResult, RemoteSystemMetrics, SshConnectConfig, SshManager};
+use std::collections::HashMap;
 use std::sync::Arc;
 use storage::HostItem;
 use tauri::{AppHandle, Manager, State};
@@ -202,8 +210,11 @@ async fn close_ssh_session(
 // SSH 连通性测试与主机探测命令
 // ==========================================
 #[tauri::command]
-async fn test_ssh_connection(config: SshConnectConfig) -> Result<ConnectionTestResult, String> {
-    run_blocking(move || ssh::test_connection(&config)).await
+async fn test_ssh_connection(
+    config: SshConnectConfig,
+    app_handle: AppHandle,
+) -> Result<ConnectionTestResult, String> {
+    run_blocking(move || ssh::test_connection(&config, Some(AuthPrompter::new(app_handle)))).await
 }
 
 #[tauri::command]
@@ -214,7 +225,8 @@ async fn probe_host_info(
     let manager = ssh_manager.inner().clone();
     run_blocking(move || {
         let config = manager.get_config(&session_id)?;
-        ssh::probe_host_info(&config)
+        let app = manager.session_app(&session_id)?;
+        ssh::probe_host_info(&config, Some(AuthPrompter::new(app)))
     })
     .await
 }
@@ -555,12 +567,152 @@ fn sftp_transfer_control(
     transfer_registry.control(&task_id, &action)
 }
 
+#[derive(Clone)]
+struct TunnelManager {
+    items: Arc<parking_lot::Mutex<HashMap<String, TunnelEntry>>>,
+}
+
+struct TunnelEntry {
+    label: String,
+    conn: Arc<Conn>,
+    notes: Vec<String>,
+}
+
+impl TunnelManager {
+    fn new() -> Self {
+        Self {
+            items: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct TunnelStatus {
+    id: String,
+    label: String,
+    notes: Vec<String>,
+}
+
+#[tauri::command]
+async fn start_tunnel(
+    config: SshConnectConfig,
+    app_handle: AppHandle,
+    tunnels: State<'_, TunnelManager>,
+) -> Result<TunnelStatus, String> {
+    let tunnels = tunnels.inner().clone();
+    run_blocking(move || {
+        let label = format!("{}@{}:{}", config.username, config.host, config.port);
+        let forwards = config.forwards.clone();
+        let conn = rt::block_on(Conn::connect_async(
+            config,
+            Some(AuthPrompter::new(app_handle)),
+        ))?;
+        let notes = rt::block_on(conn.start_forwards(&forwards));
+        let id = format!("tunnel-{}", uuid::Uuid::new_v4());
+        tunnels.items.lock().insert(
+            id.clone(),
+            TunnelEntry {
+                label: label.clone(),
+                conn,
+                notes: notes.clone(),
+            },
+        );
+        Ok(TunnelStatus { id, label, notes })
+    })
+    .await
+}
+
+#[tauri::command]
+async fn stop_tunnel(id: String, tunnels: State<'_, TunnelManager>) -> Result<(), String> {
+    let tunnels = tunnels.inner().clone();
+    run_blocking(move || {
+        let removed = tunnels.items.lock().remove(&id);
+        if let Some(entry) = removed {
+            rt::block_on(entry.conn.disconnect_async());
+        }
+        Ok(())
+    })
+    .await
+}
+
+#[tauri::command]
+fn list_tunnels(tunnels: State<'_, TunnelManager>) -> Vec<TunnelStatus> {
+    tunnels
+        .items
+        .lock()
+        .iter()
+        .map(|(id, entry)| TunnelStatus {
+            id: id.clone(),
+            label: entry.label.clone(),
+            notes: entry.notes.clone(),
+        })
+        .collect()
+}
+
+#[tauri::command]
+async fn preview_ssh_config(path: Option<String>) -> Result<sshconfig::ImportPreview, String> {
+    run_blocking(move || sshconfig::preview_ssh_config(path)).await
+}
+
+#[tauri::command]
+async fn export_hosts_ssh_config(path: String) -> Result<(), String> {
+    run_blocking(move || {
+        let text = sshconfig::export_ssh_config(&storage::load_hosts());
+        std::fs::write(&path, text).map_err(|e| format!("写入 {} 失败: {}", path, e))
+    })
+    .await
+}
+
+#[tauri::command]
+fn list_ssh_keys() -> Result<Vec<vault::SshKeyInfo>, String> {
+    vault::list_keys()
+}
+
+#[tauri::command]
+async fn generate_ssh_key(
+    name: String,
+    algorithm: String,
+    passphrase: Option<String>,
+) -> Result<vault::GeneratedKey, String> {
+    run_blocking(move || vault::generate_key(&name, &algorithm, passphrase.as_deref())).await
+}
+
+#[tauri::command]
+async fn import_ssh_key(
+    name: String,
+    material: String,
+    passphrase: Option<String>,
+) -> Result<vault::SshKeyInfo, String> {
+    run_blocking(move || vault::import_key(&name, &material, passphrase.as_deref())).await
+}
+
+#[tauri::command]
+fn delete_ssh_key(id: String) -> Result<(), String> {
+    vault::delete_key(&id)
+}
+
+#[tauri::command]
+fn list_known_hosts() -> Result<Vec<conn::KnownHostEntry>, String> {
+    conn::list_known_hosts()
+}
+
+#[tauri::command]
+fn delete_known_host(hosts: String, fingerprint: String) -> Result<(), String> {
+    conn::delete_known_host(&hosts, &fingerprint)
+}
+
+#[tauri::command]
+fn submit_ssh_auth_prompt(request_id: String, responses: Option<Vec<String>>) -> Result<(), String> {
+    authprompt::submit(&request_id, responses)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(SshManager::new())
         .manage(TransferRegistry::new())
+        .manage(TunnelManager::new())
         .setup(|app| {
             if let Some(icon) = app.default_window_icon() {
                 for window in app.webview_windows().values() {
@@ -610,6 +762,18 @@ pub fn run() {
             sftp_download_dir,
             sftp_download_path,
             sftp_transfer_control,
+            start_tunnel,
+            stop_tunnel,
+            list_tunnels,
+            preview_ssh_config,
+            export_hosts_ssh_config,
+            list_ssh_keys,
+            generate_ssh_key,
+            import_ssh_key,
+            delete_ssh_key,
+            list_known_hosts,
+            delete_known_host,
+            submit_ssh_auth_prompt,
         ])
         .run(tauri::generate_context!())
         .expect("运行 SnailSSH 客户端失败");

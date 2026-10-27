@@ -1,4 +1,6 @@
+use crate::authprompt::AuthPrompter;
 use crate::conn::Conn;
+use crate::model::{JumpHop, PortForward, ProxyConfig};
 use crate::rt;
 use parking_lot::Mutex;
 use russh::ChannelMsg;
@@ -47,6 +49,13 @@ pub struct SshConnectConfig {
     pub trust_host_key: bool,
     pub cols: u32,
     pub rows: u32,
+    /// 从近到远的跳板。第一跳走 proxy（若有），之后每跳是上一条连接上的 direct-tcpip。
+    #[serde(default)]
+    pub jumps: Vec<JumpHop>,
+    #[serde(default)]
+    pub proxy: Option<ProxyConfig>,
+    #[serde(default)]
+    pub forwards: Vec<PortForward>,
 }
 
 /// 主机密钥校验结果，随连接/测试结果返回给前端展示。
@@ -394,6 +403,8 @@ pub struct ActiveSession {
     banner: Arc<Mutex<String>>,
     /// 会话日志槽：开着时输出泵把脱敏后的内容 try_send 给专用 writer 线程
     log_sink: Arc<Mutex<Option<LogSink>>>,
+    /// 后续 SFTP / 探测要重新认证时，用它向界面提问（OTP）
+    app: AppHandle,
 }
 
 /// 终端 shell 的写输入 / 改窗口 / 关闭指令
@@ -436,6 +447,7 @@ impl SshManager {
         let stdout_event = format!("ssh-stdout-{}", session_id);
         let closed_event = format!("ssh-closed-{}", session_id);
 
+        let forward_session_id = session_id.clone();
         let (conn, shell) = rt::block_on({
             let config = config.clone();
             let is_alive = Arc::clone(&is_alive);
@@ -443,7 +455,17 @@ impl SshManager {
             let banner = Arc::clone(&banner);
             let app = app_handle.clone();
             async move {
-                let conn = Conn::connect_async(config.clone()).await?;
+                let conn = Conn::connect_async(config.clone(), Some(AuthPrompter::new(app.clone()))).await?;
+                let forward_notes = conn.start_forwards(&config.forwards).await;
+                if !forward_notes.is_empty() {
+                    let _ = app.emit(
+                        "ssh-forward-status",
+                        serde_json::json!({
+                            "sessionId": forward_session_id,
+                            "notes": forward_notes,
+                        }),
+                    );
+                }
                 let mut channel =
                     Conn::open_shell(conn.handle(), config.cols, config.rows).await?;
 
@@ -478,9 +500,14 @@ impl SshManager {
             is_alive,
             banner,
             log_sink,
+            app: app_handle.clone(),
         });
         self.sessions.lock().insert(session_id.clone(), active);
         Ok(session_id)
+    }
+
+    pub fn session_app(&self, session_id: &str) -> Result<AppHandle, String> {
+        Ok(self.get_active(session_id)?.app.clone())
     }
 
     fn get_active(&self, session_id: &str) -> Result<Arc<ActiveSession>, String> {
@@ -619,7 +646,10 @@ impl SshManager {
         }
 
         // 建连期间不持有会话表锁，避免阻塞其他会话操作
-        let created = Conn::connect(&active.config)?;
+        let mut config = active.config.clone();
+        // SFTP 是第二条连接，不重复绑定同一批本地端口
+        config.forwards.clear();
+        let created = Conn::connect_prompted(&config, AuthPrompter::new(active.app.clone()))?;
 
         let mut slot = active.sftp_conn.lock();
         if let Some(existing) = slot.as_ref() {
@@ -963,9 +993,14 @@ fi
 echo "$CWD"
 "#;
 /// 真实连通性测试：TCP 建连 + SSH 握手 + 主机密钥校验 + 身份认证，返回真实耗时。
-pub fn test_connection(config: &SshConnectConfig) -> Result<ConnectionTestResult, String> {
+pub fn test_connection(config: &SshConnectConfig, prompter: Option<AuthPrompter>) -> Result<ConnectionTestResult, String> {
     let start = Instant::now();
-    let conn = Conn::connect(config)?;
+    let mut config = config.clone();
+    config.forwards.clear();
+    let conn = match prompter {
+        Some(prompter) => Conn::connect_prompted(&config, prompter)?,
+        None => Conn::connect(&config)?,
+    };
     let latency_ms = start.elapsed().as_millis() as u64;
     let host_key = conn.host_key().clone();
     // 测试连接不保留会话：立刻断开，避免在远端堆积空闲连接
@@ -994,9 +1029,14 @@ sleep 0.4
 echo "C2 $(grep '^cpu ' /proc/stat 2>/dev/null)"
 "#;
 
-pub fn probe_host_info(config: &SshConnectConfig) -> Result<HostProbeResult, String> {
+pub fn probe_host_info(config: &SshConnectConfig, prompter: Option<AuthPrompter>) -> Result<HostProbeResult, String> {
     let start = Instant::now();
-    let conn = Conn::connect(config)?;
+    let mut config = config.clone();
+    config.forwards.clear();
+    let conn = match prompter {
+        Some(prompter) => Conn::connect_prompted(&config, prompter)?,
+        None => Conn::connect(&config)?,
+    };
     let ping_ms = start.elapsed().as_millis() as u64;
 
     // 探测脚本自带 0.4s 采样间隔，超时兜底避免远端不响应时线程永久挂起
@@ -1395,6 +1435,9 @@ mod live_tests {
             trust_host_key: false,
             cols: 120,
             rows: 30,
+            jumps: Vec::new(),
+            proxy: None,
+            forwards: Vec::new(),
         })
     }
 

@@ -4,15 +4,22 @@ import { open as openDialog, save as saveDialog } from '@tauri-apps/plugin-dialo
 import { getCurrentWebview } from '@tauri-apps/api/webview'
 import type {
   AppSettings,
+  AuthPromptEvent,
   CommandHistoryEntry,
   ConnectionTestResult,
   FileDragDropEvent,
   HostItem,
   HostProbeResult,
+  ImportPreview,
+  KnownHostEntry,
   RemoteSystemMetrics,
   SftpFileItem,
-  SftpProgressPayload
+  SftpProgressPayload,
+  SshKeyInfo,
+  TrustedEndpoint,
+  TunnelStatus
 } from '@/types'
+import { buildSshConfig } from '@/utils/connectConfig'
 
 // 检测是否处于 Tauri 环境
 export const isTauri = (): boolean => {
@@ -210,22 +217,12 @@ export async function createSshSessionApi(
   host: HostItem,
   cols: number,
   rows: number,
-  trustHostKey = false
+  trusted: TrustedEndpoint[] = [],
+  hosts: HostItem[] = []
 ): Promise<{ sessionId: string }> {
   if (isTauri()) {
     return await invoke<{ sessionId: string }>('create_ssh_session', {
-      config: {
-        host: host.host,
-        port: host.port,
-        username: host.username,
-        auth_type: host.authType,
-        password: host.password || null,
-        private_key: host.privateKey || null,
-        passphrase: host.passphrase || null,
-        trust_host_key: trustHostKey,
-        cols,
-        rows,
-      }
+      config: buildSshConfig(host, hosts.length ? hosts : [host], cols, rows, trusted)
     })
   }
   // 浏览器预览也需保证 sessionId 唯一，否则同一主机多开时 tab 会互相覆盖
@@ -235,24 +232,14 @@ export async function createSshSessionApi(
 // 真实连通性测试：TCP + 握手 + 主机密钥校验 + 认证，返回真实耗时（仅 Tauri 环境可用）
 export async function testSshConnectionApi(
   host: HostItem,
-  trustHostKey = false
+  trusted: TrustedEndpoint[] = [],
+  hosts: HostItem[] = []
 ): Promise<ConnectionTestResult> {
   if (!isTauri()) {
     throw new Error('浏览器预览模式无法测试真实连接，请使用 Tauri 桌面客户端')
   }
   return await invoke<ConnectionTestResult>('test_ssh_connection', {
-    config: {
-      host: host.host,
-      port: host.port,
-      username: host.username,
-      auth_type: host.authType,
-      password: host.password || null,
-      private_key: host.privateKey || null,
-      passphrase: host.passphrase || null,
-      trust_host_key: trustHostKey,
-      cols: 80,
-      rows: 24,
-    }
+    config: buildSshConfig(host, hosts.length ? hosts : [host], 80, 24, trusted)
   })
 }
 
@@ -712,4 +699,76 @@ export async function onSftpProgress(taskId: string, callback: (payload: SftpPro
     })
   }
   return () => {}
+}
+
+export async function onSshAuthPrompt(callback: (payload: AuthPromptEvent) => void): Promise<UnlistenFn> {
+  if (!isTauri()) return () => {}
+  return await listen<AuthPromptEvent>('ssh-auth-prompt', (event) => callback(event.payload))
+}
+
+export async function onForwardStatus(callback: (payload: { sessionId?: string; notes: string[] }) => void): Promise<UnlistenFn> {
+  if (!isTauri()) return () => {}
+  return await listen<{ sessionId?: string; notes: string[] }>('ssh-forward-status', (event) => callback(event.payload))
+}
+
+export async function submitSshAuthPromptApi(requestId: string, responses: string[] | null): Promise<void> {
+  if (!isTauri()) return
+  await invoke('submit_ssh_auth_prompt', { requestId, responses })
+}
+
+export async function previewSshConfigApi(path?: string): Promise<ImportPreview> {
+  if (!isTauri()) throw new Error('浏览器预览无法读取本机 ssh config')
+  return await invoke<ImportPreview>('preview_ssh_config', { path: path || null })
+}
+
+export async function exportHostsSshConfigApi(path: string): Promise<void> {
+  if (!isTauri()) throw new Error('浏览器预览无法导出文件')
+  await invoke('export_hosts_ssh_config', { path })
+}
+
+export async function listSshKeysApi(): Promise<SshKeyInfo[]> {
+  if (!isTauri()) return []
+  return await invoke<SshKeyInfo[]>('list_ssh_keys')
+}
+
+export async function generateSshKeyApi(name: string, algorithm: string, passphrase?: string): Promise<SshKeyInfo & { publicKey: string }> {
+  if (!isTauri()) throw new Error('浏览器预览无法生成密钥')
+  return await invoke('generate_ssh_key', { name, algorithm, passphrase: passphrase || null })
+}
+
+export async function importSshKeyApi(name: string, material: string, passphrase?: string): Promise<SshKeyInfo> {
+  if (!isTauri()) throw new Error('浏览器预览无法导入密钥')
+  return await invoke<SshKeyInfo>('import_ssh_key', { name, material, passphrase: passphrase || null })
+}
+
+export async function deleteSshKeyApi(id: string): Promise<void> {
+  if (!isTauri()) return
+  await invoke('delete_ssh_key', { id })
+}
+
+export async function listKnownHostsApi(): Promise<KnownHostEntry[]> {
+  if (!isTauri()) return []
+  return await invoke<KnownHostEntry[]>('list_known_hosts')
+}
+
+export async function deleteKnownHostApi(hosts: string, fingerprint: string): Promise<void> {
+  if (!isTauri()) return
+  await invoke('delete_known_host', { hosts, fingerprint })
+}
+
+export async function startTunnelApi(host: HostItem, hosts: HostItem[], trusted: TrustedEndpoint[] = []): Promise<TunnelStatus> {
+  if (!isTauri()) throw new Error('浏览器预览无法启动隧道')
+  return await invoke<TunnelStatus>('start_tunnel', {
+    config: buildSshConfig(host, hosts, 80, 24, trusted)
+  })
+}
+
+export async function stopTunnelApi(id: string): Promise<void> {
+  if (!isTauri()) return
+  await invoke('stop_tunnel', { id })
+}
+
+export async function listTunnelsApi(): Promise<TunnelStatus[]> {
+  if (!isTauri()) return []
+  return await invoke<TunnelStatus[]>('list_tunnels')
 }

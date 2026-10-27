@@ -1,4 +1,33 @@
-export type AuthType = 'password' | 'key' | 'agent'
+export type AuthType = 'password' | 'key' | 'agent' | 'keyboard'
+
+export interface ProxyConfig {
+  kind: 'socks5' | 'http' | string
+  host: string
+  port: number
+  username?: string
+  password?: string
+}
+
+export interface JumpHop {
+  host: string
+  port: number
+  username: string
+  authType: string
+  password?: string | null
+  privateKey?: string | null
+  passphrase?: string | null
+  trustHostKey?: boolean
+}
+
+export interface PortForward {
+  id: string
+  kind: 'local' | 'remote' | 'dynamic' | string
+  bindHost: string
+  bindPort: number
+  targetHost: string
+  targetPort: number
+  enabled: boolean
+}
 
 export interface HostItem {
   id: string
@@ -12,6 +41,10 @@ export interface HostItem {
   passphrase?: string
   group: string
   tags: string[]
+  /** 按连接顺序经过的跳板主机 id */
+  jumpHostIds?: string[]
+  proxy?: ProxyConfig | null
+  forwards?: PortForward[]
   os?: string
   osName?: string
   status?: 'online' | 'offline' | 'unknown'
@@ -117,6 +150,53 @@ export interface TransferTask {
 }
 
 /** 后端真实连通性测试结果 */
+export interface TrustedEndpoint {
+  host: string
+  port: number
+}
+
+export interface SshKeyInfo {
+  id: string
+  name: string
+  algorithm: string
+  fingerprint: string
+  publicKey: string
+  path: string
+  createdAt: string
+}
+
+export interface KnownHostEntry {
+  hosts: string
+  marker?: string | null
+  keyType: string
+  fingerprint: string
+}
+
+export interface ImportPreview {
+  hosts: HostItem[]
+  warnings: string[]
+  sourcePath: string
+}
+
+export interface TunnelStatus {
+  id: string
+  label: string
+  notes: string[]
+}
+
+export interface AuthPromptField {
+  prompt: string
+  secret: boolean
+}
+
+export interface AuthPromptEvent {
+  requestId: string
+  hostLabel: string
+  name: string
+  instructions: string
+  prompts: AuthPromptField[]
+}
+
 export interface ConnectionTestResult {
   latencyMs: number
   hostKeyFingerprint: string

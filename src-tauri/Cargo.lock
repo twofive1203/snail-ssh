@@ -4395,6 +4395,7 @@ dependencies = [
  "dirs 5.0.1",
  "keyring",
  "parking_lot",
+ "rand",
  "russh",
  "russh-sftp",
  "serde",

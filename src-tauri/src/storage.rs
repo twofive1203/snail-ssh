@@ -1,3 +1,4 @@
+use crate::model::{PortForward, ProxyConfig};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
@@ -40,6 +41,13 @@ pub struct HostItem {
     pub disk: Option<u32>,
     #[serde(default, rename = "updatedAt")]
     pub updated_at: Option<String>,
+    /// 按顺序经过的跳板主机 id。连接时由前端展开成带凭证的跳，避免这里再存一份密钥。
+    #[serde(default, rename = "jumpHostIds")]
+    pub jump_host_ids: Vec<String>,
+    #[serde(default)]
+    pub proxy: Option<ProxyConfig>,
+    #[serde(default)]
+    pub forwards: Vec<PortForward>,
 }
 
 /// 单台主机的敏感凭证集合，序列化后整体存入系统钥匙串的一条凭据中，
@@ -52,6 +60,8 @@ struct HostSecrets {
     private_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     passphrase: Option<String>,
+    #[serde(default, rename = "proxyPassword", skip_serializing_if = "Option::is_none")]
+    proxy_password: Option<String>,
 }
 
 impl HostSecrets {
@@ -60,11 +70,15 @@ impl HostSecrets {
             password: host.password.clone(),
             private_key: host.private_key.clone(),
             passphrase: host.passphrase.clone(),
+            proxy_password: host.proxy.as_ref().and_then(|p| p.password.clone()),
         }
     }
 
     fn is_empty(&self) -> bool {
-        self.password.is_none() && self.private_key.is_none() && self.passphrase.is_none()
+        self.password.is_none()
+            && self.private_key.is_none()
+            && self.passphrase.is_none()
+            && self.proxy_password.is_none()
     }
 
     /// 以钥匙串为准回填内存中的主机对象
@@ -72,6 +86,11 @@ impl HostSecrets {
         host.password = self.password.clone();
         host.private_key = self.private_key.clone();
         host.passphrase = self.passphrase.clone();
+        if let Some(password) = &self.proxy_password {
+            if let Some(proxy) = host.proxy.as_mut() {
+                proxy.password = Some(password.clone());
+            }
+        }
     }
 }
 
@@ -224,6 +243,9 @@ fn strip_secrets(host: &HostItem) -> HostItem {
             stored.password = None;
             stored.private_key = None;
             stored.passphrase = None;
+            if let Some(proxy) = stored.proxy.as_mut() {
+                proxy.password = None;
+            }
         }
         Err(err) => {
             eprintln!(
@@ -304,6 +326,9 @@ mod tests {
             mem: Some(34),
             disk: Some(56),
             updated_at: Some("刚刚".into()),
+            jump_host_ids: Vec::new(),
+            proxy: None,
+            forwards: Vec::new(),
         };
         // 无凭证时不应报错，且探测指标保留
         let stored = strip_secrets(&host);

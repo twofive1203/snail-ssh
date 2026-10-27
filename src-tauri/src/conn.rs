@@ -7,6 +7,10 @@
 //! 2. 主机密钥校验改为自己读写 `~/.ssh/known_hosts`（libssh2 的 KnownHosts
 //!    绑定在它自己的会话对象上），保持 OpenSSH 的记录格式与 `[host]:port` 语义。
 
+use crate::authprompt::{AuthPrompter, PromptField};
+use crate::forward::{self, ForwardControl, RemoteTarget};
+use crate::model::{expand_tilde, JumpHop};
+use crate::net;
 use crate::rt;
 use crate::ssh::{HostKeyInfo, SshConnectConfig};
 use base64::Engine as _;
@@ -18,7 +22,8 @@ use russh::keys::ssh_key::{
     certificate::CertType, public::KeyData, Algorithm, Certificate, HashAlg,
 };
 use russh::keys::{PrivateKeyWithHashAlg, PublicKeyOrCertificate};
-use russh::{Channel, ChannelMsg, Preferred};
+use russh::{Channel, ChannelMsg, ChannelOpenFailure, MethodKind, Preferred};
+use std::sync::Arc as StdArc;
 use russh_sftp::client::SftpSession;
 use sha2::{Digest, Sha256};
 use std::borrow::Cow;
@@ -26,8 +31,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// TCP 建连超时（与旧实现一致）
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// 一次性 exec 的读取超时：超时返回已读到的内容，避免探测脚本挂住调用方
 pub const EXEC_TIMEOUT: Duration = Duration::from_secs(5);
 /// SFTP 子系统的单次操作超时
@@ -43,6 +46,7 @@ pub struct HostKeyVerifier {
     config: SshConnectConfig,
     rejection: Arc<Mutex<Option<String>>>,
     info: Arc<Mutex<Option<HostKeyInfo>>>,
+    forwards: StdArc<ForwardControl>,
 }
 
 impl client::Handler for HostKeyVerifier {
@@ -63,6 +67,32 @@ impl client::Handler for HostKeyVerifier {
             }
         }
     }
+
+    async fn server_channel_open_forwarded_tcpip(
+        &mut self,
+        channel: Channel<client::Msg>,
+        _connected_address: &str,
+        connected_port: u32,
+        _originator_address: &str,
+        _originator_port: u32,
+        reply: client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        if let Some(target) = self.forwards.lookup_remote(connected_port) {
+            reply.accept().await;
+            rt::spawn(async move {
+                match tokio::net::TcpStream::connect((target.target_host.as_str(), target.target_port)).await {
+                    Ok(tcp) => forward::bridge_channel_tcp(channel, tcp).await,
+                    Err(_) => {
+                        let _ = channel.close().await;
+                    }
+                }
+            });
+        } else {
+            let _ = reply.reject(ChannelOpenFailure::AdministrativelyProhibited).await;
+        }
+        Ok(())
+    }
 }
 
 /// 每条 SSH 连接（终端 shell 与 SFTP 各一条，与旧实现保持同样的连接拓扑）
@@ -70,53 +100,107 @@ pub struct Conn {
     handle: Handle<HostKeyVerifier>,
     host_key: HostKeyInfo,
     sftp: Mutex<Option<Arc<SftpSession>>>,
+    /// 跳板连接必须和目标连接活得一样久，否则 direct-tcpip 通道会一起拆掉。
+    upstreams: Vec<Handle<HostKeyVerifier>>,
+    forwards: StdArc<ForwardControl>,
 }
 
 impl Conn {
     /// 同步建连（内部驱动异步实现），供阻塞命令线程调用。
     pub fn connect(config: &SshConnectConfig) -> Result<Arc<Conn>, String> {
-        rt::block_on(Self::connect_async(config.clone()))
+        rt::block_on(Self::connect_async(config.clone(), None))
     }
 
-    pub async fn connect_async(config: SshConnectConfig) -> Result<Arc<Conn>, String> {
-        let tcp = tokio::time::timeout(
-            CONNECT_TIMEOUT,
-            tokio::net::TcpStream::connect((config.host.as_str(), config.port)),
-        )
-        .await
-        .map_err(|_| "TCP 连接超时（10s）".to_string())?
-        .map_err(|e| format!("TCP 连接失败: {}", e))?;
-        // 关闭 Nagle，降低交互式输入的往返延迟
-        let _ = tcp.set_nodelay(true);
+    pub fn connect_prompted(
+        config: &SshConnectConfig,
+        prompter: AuthPrompter,
+    ) -> Result<Arc<Conn>, String> {
+        rt::block_on(Self::connect_async(config.clone(), Some(prompter)))
+    }
 
-        let rejection: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-        let info: Arc<Mutex<Option<HostKeyInfo>>> = Arc::new(Mutex::new(None));
-        let handler = HostKeyVerifier {
-            config: config.clone(),
-            rejection: Arc::clone(&rejection),
-            info: Arc::clone(&info),
-        };
+    pub async fn connect_async(
+        config: SshConnectConfig,
+        prompter: Option<AuthPrompter>,
+    ) -> Result<Arc<Conn>, String> {
+        if config.jumps.len() > 8 {
+            return Err("跳板机最多支持 8 跳".into());
+        }
+        let mut chain: Vec<SshConnectConfig> = config.jumps.iter().map(jump_to_config).collect();
+        let mut target = config.clone();
+        target.jumps.clear();
+        chain.push(target);
 
-        let mut handle = client::connect_stream(client_config(), tcp, handler)
-            .await
-            .map_err(|e| {
-                // 主机密钥未通过时 russh 只报“连接被拒绝”，真实原因在这里
-                let reason = rejection.lock().clone();
-                reason.unwrap_or_else(|| format!("SSH 握手失败: {}", e))
-            })?;
+        let mut prev: Option<Handle<HostKeyVerifier>> = None;
+        let mut upstreams = Vec::new();
+        let mut final_parts: Option<(Handle<HostKeyVerifier>, HostKeyInfo, StdArc<ForwardControl>)> = None;
 
-        authenticate(&mut handle, &config).await?;
+        for (index, hop) in chain.iter().enumerate() {
+            let is_last = index + 1 == chain.len();
+            let forwards = ForwardControl::new();
+            let opened = if let Some(prev_handle) = prev.as_ref() {
+                let channel = prev_handle
+                    .channel_open_direct_tcpip(
+                        hop.host.clone(),
+                        u32::from(hop.port),
+                        "127.0.0.1",
+                        0,
+                    )
+                    .await
+                    .map_err(|e| {
+                        format!(
+                            "经跳板打开到 {}:{} 的通道失败: {}",
+                            hop.host, hop.port, e
+                        )
+                    })?;
+                handshake(channel.into_stream(), hop, prompter.clone(), StdArc::clone(&forwards)).await
+            } else {
+                let tcp = net::dial(&hop.host, hop.port, config.proxy.as_ref()).await?;
+                handshake(tcp, hop, prompter.clone(), StdArc::clone(&forwards)).await
+            };
+            let (handle, host_key) = match opened {
+                Ok(parts) => parts,
+                Err(err) => return Err(annotate_host_key_error(err, &hop.host, hop.port)),
+            };
+            if let Some(old) = prev.take() {
+                upstreams.push(old);
+            }
+            if is_last {
+                final_parts = Some((handle, host_key, forwards));
+            } else {
+                prev = Some(handle);
+            }
+        }
 
-        let host_key = info.lock().clone().unwrap_or(HostKeyInfo {
-            fingerprint: String::new(),
-            status: "trusted".into(),
-        });
-
+        let (handle, host_key, forwards) = final_parts.ok_or("没有可连接的目标主机")?;
         Ok(Arc::new(Conn {
             handle,
             host_key,
             sftp: Mutex::new(None),
+            upstreams,
+            forwards,
         }))
+    }
+
+    /// 启动本连接上已启用的端口转发。失败的条目记在返回值里，不拆掉已经建立的 SSH 会话。
+    pub async fn start_forwards(self: &Arc<Self>, specs: &[crate::model::PortForward]) -> Vec<String> {
+        let mut notes = Vec::new();
+        for spec in specs.iter().filter(|item| item.enabled) {
+            if let Err(err) = forward::validate_forward(spec) {
+                notes.push(format!("{}: {}", spec.id, err));
+                continue;
+            }
+            let result = match spec.kind.as_str() {
+                "local" => self.spawn_local_forward(spec).await,
+                "dynamic" => self.spawn_dynamic_forward(spec).await,
+                "remote" => self.spawn_remote_forward(spec).await,
+                other => Err(format!("未知转发类型: {}", other)),
+            };
+            match result {
+                Ok(note) => notes.push(note),
+                Err(err) => notes.push(format!("{}: {}", spec.id, err)),
+            }
+        }
+        notes
     }
 
     pub fn host_key(&self) -> &HostKeyInfo {
@@ -239,11 +323,201 @@ impl Conn {
     }
 
     pub async fn disconnect_async(&self) {
+        self.forwards.stop();
+        forward::release_owner(&forward_owner(self));
+        for (addr, port) in self.forwards.remote_binds() {
+            let _ = self.handle.cancel_tcpip_forward(addr, port).await;
+        }
         let _ = self
             .handle
             .disconnect(russh::Disconnect::ByApplication, "", "en")
             .await;
+        for upstream in &self.upstreams {
+            let _ = upstream
+                .disconnect(russh::Disconnect::ByApplication, "", "en")
+                .await;
+        }
     }
+
+    async fn spawn_local_forward(self: &Arc<Self>, spec: &crate::model::PortForward) -> Result<String, String> {
+        let bind = format!("{}:{}", spec.bind_host, spec.bind_port);
+        forward::reserve_local_bind(&bind, &forward_owner(self))?;
+        let listener = tokio::net::TcpListener::bind((spec.bind_host.as_str(), spec.bind_port))
+            .await
+            .map_err(|e| {
+                forward::release_bind(&bind);
+                format!("绑定 {} 失败: {}", bind, e)
+            })?;
+        let conn = Arc::clone(self);
+        let target_host = spec.target_host.clone();
+        let target_port = spec.target_port;
+        let mut stop = self.forwards.subscribe();
+        rt::spawn(async move {
+            loop {
+                tokio::select! {
+                    changed = stop.changed() => {
+                        if changed.is_err() || *stop.borrow() {
+                            break;
+                        }
+                    }
+                    accepted = listener.accept() => {
+                        let Ok((tcp, peer)) = accepted else { break; };
+                        let conn = Arc::clone(&conn);
+                        let target_host = target_host.clone();
+                        rt::spawn(async move {
+                            let opened = conn.handle().channel_open_direct_tcpip(
+                                target_host,
+                                u32::from(target_port),
+                                peer.ip().to_string(),
+                                u32::from(peer.port()),
+                            ).await;
+                            if let Ok(channel) = opened {
+                                forward::bridge_channel_tcp(channel, tcp).await;
+                            }
+                        });
+                    }
+                }
+            }
+        });
+        Ok(format!("本地转发 {} → {}:{}", bind, spec.target_host, spec.target_port))
+    }
+
+    async fn spawn_dynamic_forward(self: &Arc<Self>, spec: &crate::model::PortForward) -> Result<String, String> {
+        let bind = format!("{}:{}", spec.bind_host, spec.bind_port);
+        forward::reserve_local_bind(&bind, &forward_owner(self))?;
+        let listener = tokio::net::TcpListener::bind((spec.bind_host.as_str(), spec.bind_port))
+            .await
+            .map_err(|e| {
+                forward::release_bind(&bind);
+                format!("绑定 {} 失败: {}", bind, e)
+            })?;
+        let conn = Arc::clone(self);
+        let mut stop = self.forwards.subscribe();
+        rt::spawn(async move {
+            loop {
+                tokio::select! {
+                    changed = stop.changed() => {
+                        if changed.is_err() || *stop.borrow() {
+                            break;
+                        }
+                    }
+                    accepted = listener.accept() => {
+                        let Ok((mut tcp, peer)) = accepted else { break; };
+                        let conn = Arc::clone(&conn);
+                        rt::spawn(async move {
+                            let request = match forward::read_socks5_request(&mut tcp).await {
+                                Ok(request) => request,
+                                Err(_) => return,
+                            };
+                            let opened = conn.handle().channel_open_direct_tcpip(
+                                request.0.clone(),
+                                u32::from(request.1),
+                                peer.ip().to_string(),
+                                u32::from(peer.port()),
+                            ).await;
+                            match opened {
+                                Ok(channel) => {
+                                    let _ = forward::write_socks5_reply(&mut tcp, true).await;
+                                    forward::bridge_channel_tcp(channel, tcp).await;
+                                }
+                                Err(_) => {
+                                    let _ = forward::write_socks5_reply(&mut tcp, false).await;
+                                }
+                            }
+                        });
+                    }
+                }
+            }
+        });
+        Ok(format!("动态转发（SOCKS5）{}", bind))
+    }
+
+    async fn spawn_remote_forward(&self, spec: &crate::model::PortForward) -> Result<String, String> {
+        let assigned = self
+            .handle
+            .tcpip_forward(spec.bind_host.clone(), u32::from(spec.bind_port))
+            .await
+            .map_err(|e| format!("远端拒绝监听 {}:{}: {}", spec.bind_host, spec.bind_port, e))?;
+        let port = if assigned == 0 { u32::from(spec.bind_port) } else { assigned };
+        self.forwards.register_remote(
+            port,
+            RemoteTarget {
+                listen_host: spec.bind_host.clone(),
+                target_host: spec.target_host.clone(),
+                target_port: spec.target_port,
+            },
+        );
+        Ok(format!(
+            "远端转发 {}:{} → {}:{}",
+            spec.bind_host, port, spec.target_host, spec.target_port
+        ))
+    }
+}
+
+fn forward_owner(conn: &Conn) -> String {
+    format!("{:p}", conn)
+}
+
+fn jump_to_config(hop: &JumpHop) -> SshConnectConfig {
+    SshConnectConfig {
+        host: hop.host.clone(),
+        port: hop.port,
+        username: hop.username.clone(),
+        auth_type: hop.auth_type.clone(),
+        password: hop.password.clone(),
+        private_key: hop.private_key.clone(),
+        passphrase: hop.passphrase.clone(),
+        trust_host_key: hop.trust_host_key,
+        cols: 80,
+        rows: 24,
+        jumps: Vec::new(),
+        proxy: None,
+        forwards: Vec::new(),
+    }
+}
+
+fn annotate_host_key_error(err: String, host: &str, port: u16) -> String {
+    if err.starts_with("HOST_KEY_UNKNOWN|") && err.matches('|').count() == 1 {
+        return format!("{}|{}|{}", err, host, port);
+    }
+    if err.starts_with("HOST_KEY_MISMATCH|") && err.matches('|').count() == 2 {
+        return format!("{}|{}|{}", err, host, port);
+    }
+    err
+}
+
+async fn handshake<R>(
+    stream: R,
+    config: &SshConnectConfig,
+    prompter: Option<AuthPrompter>,
+    forwards: StdArc<ForwardControl>,
+) -> Result<(Handle<HostKeyVerifier>, HostKeyInfo), String>
+where
+    R: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let rejection: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let info: Arc<Mutex<Option<HostKeyInfo>>> = Arc::new(Mutex::new(None));
+    let handler = HostKeyVerifier {
+        config: config.clone(),
+        rejection: Arc::clone(&rejection),
+        info: Arc::clone(&info),
+        forwards,
+    };
+    let mut handle = client::connect_stream(client_config(), stream, handler)
+        .await
+        .map_err(|e| {
+            rejection
+                .lock()
+                .clone()
+                .unwrap_or_else(|| format!("SSH 握手失败: {}", e))
+        })?;
+    let label = format!("{}@{}:{}", config.username, config.host, config.port);
+    authenticate(&mut handle, config, prompter.as_ref(), &label).await?;
+    let host_key = info.lock().clone().unwrap_or(HostKeyInfo {
+        fingerprint: String::new(),
+        status: "trusted".into(),
+    });
+    Ok((handle, host_key))
 }
 
 fn client_config() -> Arc<client::Config> {
@@ -278,11 +552,12 @@ fn load_private_key(config: &SshConnectConfig) -> Result<russh::keys::PrivateKey
     if raw.is_empty() {
         return Err("未配置私钥内容或文件路径".into());
     }
+    let expanded = expand_tilde(raw);
     let passphrase = config.passphrase.as_deref().filter(|p| !p.is_empty());
 
-    // 私钥既可能是文件路径，也可能是粘贴的密钥内容
-    if Path::new(raw).is_file() {
-        russh::keys::load_secret_key(raw, passphrase)
+    // 私钥既可能是文件路径，也可能是粘贴的密钥内容。`~` 要先展开，ssh config 导入常用这种写法。
+    if Path::new(&expanded).is_file() {
+        russh::keys::load_secret_key(&expanded, passphrase)
             .map_err(|e| format!("读取私钥失败: {}", e))
     } else {
         let key = russh::keys::PrivateKey::from_openssh(raw)
@@ -302,11 +577,17 @@ fn load_private_key(config: &SshConnectConfig) -> Result<russh::keys::PrivateKey
 async fn authenticate(
     handle: &mut Handle<HostKeyVerifier>,
     config: &SshConnectConfig,
+    prompter: Option<&AuthPrompter>,
+    host_label: &str,
 ) -> Result<(), String> {
     if let Ok(result) = handle.authenticate_none(&config.username).await {
         if result.success() {
             return Ok(());
         }
+    }
+
+    if config.auth_type == "keyboard" {
+        return keyboard_interactive(handle, config, prompter, host_label).await;
     }
 
     match config.auth_type.as_str() {
@@ -316,10 +597,12 @@ async fn authenticate(
                 .await
                 .map_err(|e| format!("密码认证失败: {}", e))?;
             if result.success() {
-                Ok(())
-            } else {
-                Err("身份认证未通过，请检查账号密码".into())
+                return Ok(());
             }
+            if needs_keyboard_followup(&result) {
+                return keyboard_interactive(handle, config, prompter, host_label).await;
+            }
+            Err("身份认证未通过，请检查账号密码".into())
         }
         "key" => {
             let key = Arc::new(load_private_key(config)?);
@@ -402,6 +685,68 @@ async fn agent_authenticate(
     Err("SSH Agent 认证失败: 代理中的身份均未通过".into())
 }
 
+fn needs_keyboard_followup(result: &russh::client::AuthResult) -> bool {
+    match result {
+        russh::client::AuthResult::Failure {
+            remaining_methods,
+            partial_success,
+        } => {
+            *partial_success
+                && remaining_methods
+                    .iter()
+                    .any(|method| *method == MethodKind::KeyboardInteractive)
+        }
+        _ => false,
+    }
+}
+
+/// 服务端用 keyboard-interactive 要密码或 OTP。空提问直接回空答案，有的网关会先发一轮空包。
+async fn keyboard_interactive(
+    handle: &mut Handle<HostKeyVerifier>,
+    config: &SshConnectConfig,
+    prompter: Option<&AuthPrompter>,
+    host_label: &str,
+) -> Result<(), String> {
+    let mut reply = handle
+        .authenticate_keyboard_interactive_start(&config.username, None)
+        .await
+        .map_err(|e| format!("交互式认证失败: {}", e))?;
+    for _ in 0..8 {
+        match reply {
+            client::KeyboardInteractiveAuthResponse::Success => return Ok(()),
+            client::KeyboardInteractiveAuthResponse::Failure { .. } => {
+                return Err("交互式认证未通过".into());
+            }
+            client::KeyboardInteractiveAuthResponse::InfoRequest {
+                name,
+                instructions,
+                prompts,
+            } => {
+                let fields: Vec<PromptField> = prompts
+                    .iter()
+                    .map(|prompt| PromptField {
+                        prompt: prompt.prompt.clone(),
+                        secret: !prompt.echo,
+                    })
+                    .collect();
+                let answers = if fields.is_empty() {
+                    Vec::new()
+                } else {
+                    let prompter = prompter.ok_or_else(|| {
+                        "服务器要求交互式认证（如 OTP），但当前没有界面可提问".to_string()
+                    })?;
+                    prompter.ask(host_label, &name, &instructions, &fields).await?
+                };
+                reply = handle
+                    .authenticate_keyboard_interactive_respond(answers)
+                    .await
+                    .map_err(|e| format!("交互式认证失败: {}", e))?;
+            }
+        }
+    }
+    Err("交互式认证轮次过多，已停止".into())
+}
+
 /// known_hosts 中的一条记录
 struct KnownEntry {
     names: Vec<String>,
@@ -414,6 +759,118 @@ fn known_hosts_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".ssh")
         .join("known_hosts")
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KnownHostEntry {
+    pub hosts: String,
+    pub marker: Option<String>,
+    pub key_type: String,
+    pub fingerprint: String,
+}
+
+pub fn list_known_hosts() -> Result<Vec<KnownHostEntry>, String> {
+    let path = known_hosts_path();
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("读取 known_hosts 失败: {}", e))?;
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let raw = line.trim();
+        if raw.is_empty() || raw.starts_with('#') {
+            continue;
+        }
+        let mut fields = raw.split_whitespace();
+        let first = match fields.next() {
+            Some(value) => value,
+            None => continue,
+        };
+        let (marker, hosts) = if first.starts_with('@') {
+            (Some(first.to_string()), match fields.next() {
+                Some(value) => value.to_string(),
+                None => continue,
+            })
+        } else {
+            (None, first.to_string())
+        };
+        let key_type = match fields.next() {
+            Some(value) => value.to_string(),
+            None => continue,
+        };
+        let key_b64 = match fields.next() {
+            Some(value) => value,
+            None => continue,
+        };
+        let Ok(blob) = base64::engine::general_purpose::STANDARD.decode(key_b64) else {
+            continue;
+        };
+        out.push(KnownHostEntry {
+            hosts,
+            marker,
+            key_type,
+            fingerprint: fingerprint_sha256(&blob),
+        });
+    }
+    Ok(out)
+}
+
+pub fn delete_known_host(hosts: &str, fingerprint: &str) -> Result<(), String> {
+    let path = known_hosts_path();
+    if !path.exists() {
+        return Ok(());
+    }
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("读取 known_hosts 失败: {}", e))?;
+    let mut kept = Vec::new();
+    let mut removed = false;
+    for line in text.lines() {
+        let raw = line.trim();
+        let drop_line = list_known_hosts_line_matches(raw, hosts, fingerprint);
+        if drop_line {
+            removed = true;
+            continue;
+        }
+        kept.push(line);
+    }
+    if !removed {
+        return Err("没有找到对应的 known_hosts 记录".into());
+    }
+    let mut content = kept.join("\n");
+    if !content.is_empty() {
+        content.push('\n');
+    }
+    std::fs::write(path, content).map_err(|e| format!("更新 known_hosts 失败: {}", e))
+}
+
+fn list_known_hosts_line_matches(raw: &str, hosts: &str, fingerprint: &str) -> bool {
+    if raw.is_empty() || raw.starts_with('#') {
+        return false;
+    }
+    let mut fields = raw.split_whitespace();
+    let first = match fields.next() {
+        Some(value) => value,
+        None => return false,
+    };
+    let names = if first.starts_with('@') {
+        match fields.next() {
+            Some(value) => value,
+            None => return false,
+        }
+    } else {
+        first
+    };
+    if names != hosts {
+        return false;
+    }
+    let _key_type = fields.next();
+    let Some(key_b64) = fields.next() else {
+        return false;
+    };
+    let Ok(blob) = base64::engine::general_purpose::STANDARD.decode(key_b64) else {
+        return false;
+    };
+    fingerprint_sha256(&blob) == fingerprint
 }
 
 fn parse_known_hosts(text: &str) -> Vec<KnownEntry> {
@@ -739,6 +1196,9 @@ mod tests {
             trust_host_key: false,
             cols: 80,
             rows: 24,
+            jumps: Vec::new(),
+            proxy: None,
+            forwards: Vec::new(),
         }
     }
 
@@ -837,6 +1297,9 @@ mod live_tests {
             trust_host_key: false,
             cols: 120,
             rows: 30,
+            jumps: Vec::new(),
+            proxy: None,
+            forwards: Vec::new(),
         })
     }
 
