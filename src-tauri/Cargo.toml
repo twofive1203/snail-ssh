@@ -3,6 +3,7 @@ name = "snail-ssh"
 version = "1.0.0"
 description = "现代化跨平台 SSH & SFTP 终端客户端"
 authors = ["SnailSSH Team"]
+license = "MIT"
 edition = "2021"
 
 [lib]

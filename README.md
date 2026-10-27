@@ -1,5 +1,7 @@
 # SnailSSH - 现代化跨平台 SSH & SFTP 桌面客户端
 
+[English](README.en.md) · [许可证](LICENSE) · [安全说明](SECURITY.md) · [参与贡献](CONTRIBUTING.md)
+
 > **下一代现代化、高性能、轻量级 SSH 终端与 SFTP 传输套件。**
 > 基于 **Tauri v2 + Rust 后端 + Vue 3 / TypeScript 前端** 架构，适配 Windows、macOS 与 Linux 三大主流操作系统。
 
