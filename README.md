@@ -24,7 +24,7 @@
 ### 1. 🖥️ 服务器资产管理 (Host Manager)
 * **卡片网格 (Grid) / 紧凑表格 (List)** 自由切换。
 * **真实监控指标**：连接成功后自动执行远端探测脚本，回填系统发行版、CPU/内存/磁盘利用率与 TCP+SSH 握手延迟；未探测过的主机不再展示伪造数值（浏览器 Web 预览模式除外，该模式使用内置演示数据 `demoSession`）。
-* **分组与标签检索**：按生产集群 (Prod)、测试环境 (Stage)、个人实验机 (Cloud) 三个固定分组过滤；搜索框同时匹配主机名、IP 与 Tag。分组本身的新增 / 重命名 / 删除尚未实现（侧边栏「+」为占位）。
+* **分组与标签检索**：按分组过滤主机，搜索框同时匹配主机名、IP 与 Tag。分组本身可在设置中心「主机分组」增删改（默认预置生产集群 / 测试环境 / 个人 VPS & 实验机三组，可改名、换色、标记「高风险」、删除）；侧边栏「+」直接跳转到该设置页。
 * **快捷直连入口**：卡片上提供一键 `连接 SSH` 与 `SFTP`。
 * **迁移与连通**：主机可配置跳板链（引用已保存主机）和 SOCKS5 / HTTP 代理；可配置 Local / Remote / Dynamic 端口转发；可从 `~/.ssh/config` 导入并导出不含密钥的 config；侧边栏提供密钥保险箱（生成 / 导入 ed25519 与 RSA、查看 known_hosts）和独立隧道。认证方式增加 keyboard-interactive / OTP。
 * **新建/编辑服务器弹窗 (Modal)**：支持主机别名、分组、IP、端口、认证方式（密码 / 私钥 PEM 或路径 / SSH Agent）与真实连通性测试。
@@ -162,25 +162,35 @@ snail-ssh/
 │   └── src/
 │       ├── main.rs         # 桌面客户端可执行入口
 │       ├── lib.rs          # Tauri 命令调度、状态注入与 generate_handler 注册表
+│       ├── model.rs        # 连接配置共享结构（主机资产 / 建连参数 / 转发 / 导入结果）
 │       ├── ssh.rs          # 会话层：PTY 申请、Shell 输出泵、首屏抓取、CWD 探测、会话日志与事件广播
 │       ├── conn.rs         # 连接层：russh 握手、认证（none/密码/私钥/Agent）、known_hosts 校验、一次性 exec、SFTP 会话
+│       ├── authprompt.rs   # keyboard-interactive / OTP 提问桥（事件发问、命令通道回收答案、超时失败）
+│       ├── net.rs          # 第一跳 TCP：直连或经 SOCKS5 / HTTP CONNECT 代理
+│       ├── forward.rs      # 端口转发运行时：本地/动态监听、远端转发查表、watch 信号停止
 │       ├── sftp_compat.rs  # SFTP 同步门面：把 russh-sftp 异步 API 适配为原有文件操作语义
 │       ├── rt.rs           # 网络层 tokio 运行时（阻塞线程 block_on 桥接 + 常驻任务 spawn）
 │       ├── sftp.rs         # SFTP 核心：目录遍历、文件读写、分块流式上传下载、进度与续传
 │       ├── transfer.rs     # 传输控制信号注册表（暂停 / 取消 / 续传检查点）
+│       ├── sshconfig.rs    # OpenSSH ssh_config 只读导入与无密钥导出（不执行 ProxyCommand）
+│       ├── vault.rs        # 本机密钥保险箱（~/.snail-ssh/keys）与 known_hosts 视图
 │       ├── history.rs      # 命令历史持久化（去重累计、频次裁剪、敏感命令过滤）
 │       ├── settings.rs     # 应用设置持久化（settings.json 原子写 + 容错读）
 │       └── storage.rs      # 主机资产持久化 + 系统钥匙串凭证分片存储
 ├── src/                    # 前端工程 (Vue 3 + TypeScript + TailwindCSS)
 │   ├── api/
 │   │   └── tauri.ts        # 前后端双模桥接层 (支持 Tauri 原生调用与降级 Mock)
-│   ├── components/         # 19 个 .vue 组件（UI 基础 / 会话工作区 / 资产与弹窗）
+│   ├── components/         # 23 个 .vue 组件（UI 基础 / 会话工作区 / 资产与弹窗）
 │   │   ├── TitleBar.vue        # 现代化窗口标题栏
 │   │   ├── Sidebar.vue         # 侧边栏与分组筛选
 │   │   ├── SessionWorkspace.vue     # 会话容器：文件树 + 分隔条 + 终端/SFTP + 底部监控条
 │   │   ├── RemoteMonitorBar.vue     # 底部实时指标条（CPU/内存/磁盘/网络/Uptime）
 │   │   ├── HostManager.vue     # 服务器资产卡片/列表管理器
 │   │   ├── HostModal.vue       # 新建/编辑/快速连接主机弹窗
+│   │   ├── ImportExportModal.vue    # OpenSSH config 导入 / 无密钥导出弹窗
+│   │   ├── KeyVaultModal.vue        # SSH 密钥保险箱（生成/导入 ed25519、RSA、known_hosts 视图）
+│   │   ├── TunnelModal.vue          # 端口转发 & 独立隧道管理弹窗
+│   │   ├── AuthPromptModal.vue      # keyboard-interactive / OTP 继续认证提问弹窗
 │   │   ├── CommandPalette.vue  # Ctrl+K 全局命令面板
 │   │   ├── TerminalView.vue    # xterm.js 终端会话组件（含独立命令输入框）
 │   │   ├── CommandSuggestBar.vue    # 终端底部命令联想候选条
@@ -193,7 +203,11 @@ snail-ssh/
 │   │   ├── TransferDrawer.vue  # 悬浮传输任务抽屉
 │   │   ├── ContextMenu.vue     # 通用右键菜单
 │   │   ├── DialogHost.vue      # 应用内确认/输入弹窗宿主
-│   │   └── Toast.vue           # 全局微动效提示框
+│   │   ├── Toast.vue           # 全局微动效提示框
+│   │   └── editor/             # 在线编辑器非组件模块（CodeMirror 装配 / 折叠 / 语言识别）
+│   │       ├── createRemoteEditor.ts
+│   │       ├── fold.ts
+│   │       └── language.ts
 │   ├── composables/
 │   │   ├── useDialog.ts            # 应用内确认/输入弹窗
 │   │   ├── useRecentHosts.ts       # 最近连接（localStorage）
@@ -201,7 +215,9 @@ snail-ssh/
 │   │   ├── useHighlightSettings.ts # 高亮规则配置、配色预设与持久化
 │   │   └── useTerminalHighlight.ts # 终端关键字高亮与可点击链接
 │   ├── utils/
-│   │   └── commandSafety.ts        # 危险命令启发式识别（生产环境发送前确认）
+│   │   ├── commandSafety.ts        # 危险命令启发式识别（生产环境发送前确认）
+│   │   ├── connectConfig.ts        # 跳板链展开 + 受信端点判定
+│   │   └── hostKey.ts              # 主机密钥确认错误解析（只信任当前一跳）
 │   ├── types/
 │   │   └── index.ts        # 全局 TypeScript 接口定义
 │   ├── App.vue             # 主界面总线（会话状态、全局快捷键、传输队列）
