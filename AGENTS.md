@@ -19,11 +19,11 @@
 
 ## 3. 数据落盘位置
 
-- `~/.snail-ssh/hosts.json`：主机元数据（凭证走系统钥匙串，`storage.rs` 分片存储，失败才回退明文并告警）。
-- `~/.snail-ssh/settings.json`：应用设置（终端外观、选中即复制、右键粘贴、命令片段、目录书签、主机分组）；`settings.rs` 只做整块 JSON 的原子读写，结构由前端 `AppSettings` 约束，缺字段由前端补默认值。
+- `~/.snail-ssh/hosts.json`：主机元数据（凭证走系统钥匙串，`storage.rs` 分片存储，失败才回退明文并告警）。磁盘结构是信封格式 `{ schemaVersion, hosts: [...] }`；读取兼容旧的裸数组并自动迁移。每次写盘前自动轮转为 `hosts.json.bak.1~3`（保留 3 份），主文件损坏时按 `.bak.1 → .bak.3` 回退。写入走 `hosts.json.tmp` + rename 原子替换，并用进程内锁串行化。
+- `~/.snail-ssh/settings.json`：应用设置（终端外观、选中即复制、右键粘贴、命令片段、目录书签、主机分组、最近连接 `recentHosts`）；`settings.rs` 只做整块 JSON 的原子读写，结构由前端 `AppSettings` 约束，缺字段由前端补默认值。
 - `~/.snail-ssh/history.json`：命令历史（每主机上限 500 条）。
-- `~/.snail-ssh/logs/<host>/<UTC 时间戳>_<会话短 ID>.log`：会话日志（明文、不轮转）。
-- `localStorage`：`snail_ssh_recent`、`snail_ssh_highlight_settings_v1`、`snail_ssh_highlight_enabled`（高亮总开关，仍在用；首次无 `highlight_settings` 时用它作初值）、`snail_ssh_import_remote_history`、`snail_ssh_session_log_auto`；浏览器预览降级时 `snail_ssh_app_settings_v1` 充当 settings.json 的替身，`snail_ssh_hosts` / `snail_ssh_history` 充当 `hosts.json` / `history.json` 的替身。旧键 `snail_ssh_select_to_copy` 只在 `settings.json` 缺 `selectToCopy` 时迁移一次。
+- `~/.snail-ssh/logs/<host>/<UTC 时间戳>_<会话短 ID>.log`：会话日志（明文）。单文件 50MB 滚动为 `.log.1`（只留一份），启动时清理 7 天前的日志。
+- `localStorage`：`snail_ssh_highlight_settings_v1`、`snail_ssh_highlight_enabled`（高亮总开关，仍在用；首次无 `highlight_settings` 时用它作初值）、`snail_ssh_import_remote_history`、`snail_ssh_session_log_auto`；浏览器预览降级时 `snail_ssh_app_settings_v1` 充当 settings.json 的替身，`snail_ssh_hosts` / `snail_ssh_history` 充当 `hosts.json` / `history.json` 的替身。旧键 `snail_ssh_select_to_copy` 只在 `settings.json` 缺 `selectToCopy` 时迁移一次；旧键 `snail_ssh_recent` 只在 `settings.json` 缺 `recentHosts` 时迁移一次，迁完即删除。
 
 ## 4. 文档纪律
 
