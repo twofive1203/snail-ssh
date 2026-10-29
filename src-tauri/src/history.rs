@@ -128,7 +128,9 @@ fn write_map(path: &Path, map: &HistoryMap) -> Result<(), String> {
         }
     }
     let json = serde_json::to_string_pretty(map).map_err(|e| e.to_string())?;
-    fs::write(path, json).map_err(|e| e.to_string())
+    fs::write(path, &json).map_err(|e| e.to_string())?;
+    crate::fsperm::restrict_file(path);
+    Ok(())
 }
 
 /// 读取某主机的命令历史，按 (count desc, lastUsedAt desc) 排序返回

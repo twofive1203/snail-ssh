@@ -1,6 +1,7 @@
 mod authprompt;
 mod conn;
 mod forward;
+mod fsperm;
 mod history;
 mod model;
 mod net;

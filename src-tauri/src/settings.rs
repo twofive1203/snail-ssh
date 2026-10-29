@@ -27,7 +27,10 @@ pub fn save_settings(settings: &Value) -> Result<(), String> {
     let tmp = path.with_extension("json.tmp");
     let json = serde_json::to_string_pretty(settings).map_err(|e| format!("序列化设置失败: {}", e))?;
     fs::write(&tmp, json).map_err(|e| format!("写入设置失败: {}", e))?;
-    fs::rename(&tmp, &path).map_err(|e| format!("保存设置失败: {}", e))
+    crate::fsperm::restrict_file(&tmp);
+    fs::rename(&tmp, &path).map_err(|e| format!("保存设置失败: {}", e))?;
+    crate::fsperm::restrict_file(&path);
+    Ok(())
 }
 
 #[cfg(test)]

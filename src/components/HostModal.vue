@@ -199,7 +199,7 @@
         </div>
 
         <div v-show="tab === 'forward'" class="space-y-3">
-          <p class="text-[11px] text-slate-500">启用的转发会在连接这台主机时自动启动，也可以从侧边栏单独拉起隧道。本地端口默认只监听 127.0.0.1。</p>
+          <p class="text-[11px] text-slate-500">启用的转发会在连接这台主机时自动启动，也可以从侧边栏单独拉起隧道。动态转发只能监听 127.0.0.1、localhost 或 ::1。</p>
           <div v-for="(forward, index) in form.forwards" :key="forward.id" class="grid grid-cols-6 gap-2 items-center">
             <select v-model="forward.kind" class="bg-surface-card border border-surface-border rounded px-1 py-1.5 text-[11px] text-white">
               <option value="local">本地</option>

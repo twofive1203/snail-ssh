@@ -30,10 +30,10 @@ Windows installers have been measured at about 4.6 MB (msi) and 3.1 MB (NSIS set
 
 Details and how to report a vulnerability are in [SECURITY.md](SECURITY.md).
 
-- Passwords, private keys, and passphrases are stored in the OS keychain (Windows Credential Manager, macOS Keychain, Linux Secret Service). If the keychain cannot be used, they fall back to plaintext in `~/.snail-ssh/hosts.json` and a warning is logged.
-- Host keys are checked against `~/.ssh/known_hosts`. The first connection asks you to confirm the SHA256 fingerprint. A mismatch blocks the connection. Confirming a key trusts that hop only.
-- Dynamic forwarding has no authentication. Bind it to `127.0.0.1` only.
-- Session logs under `~/.snail-ssh/logs/` are plaintext, are not rotated, and use heuristic redaction. Do not treat them as a complete secret filter.
+- Passwords, private keys, and passphrases are stored in the OS keychain (Windows Credential Manager, macOS Keychain, Linux Secret Service). If the keychain cannot be used, they fall back to plaintext in `~/.snail-ssh/hosts.json` and a warning is logged. The app then restricts `~/.snail-ssh` to the current user. That is not a substitute for the keychain.
+- Host keys are checked against `~/.ssh/known_hosts`, including hashed entries. Host certificates must have a valid signature from a trusted `@cert-authority`. Critical options this client does not enforce are rejected. The first connection asks you to confirm the SHA256 fingerprint. A mismatch blocks the connection. Confirming a key trusts that hop only and does not delete CA or revoked lines.
+- Dynamic forwarding has no authentication. It can listen only on `127.0.0.1`, `localhost`, or `::1`.
+- Session logs under `~/.snail-ssh/logs/` are plaintext and use heuristic redaction. Do not treat them as a complete secret filter.
 - `ProxyCommand` from imported OpenSSH config is ignored. This app does not execute it on your machine.
 
 ## Build

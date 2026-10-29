@@ -14,7 +14,9 @@ use crate::net;
 use crate::rt;
 use crate::ssh::{HostKeyInfo, SshConnectConfig};
 use base64::Engine as _;
+use hmac::{Hmac, KeyInit, Mac};
 use parking_lot::Mutex;
+use sha1::Sha1;
 use russh::client::{self, Handle};
 use russh::keys::agent::client::AgentClient;
 use russh::keys::agent::AgentIdentity;
@@ -912,12 +914,13 @@ fn parse_known_hosts(text: &str) -> Vec<KnownEntry> {
             Ok(blob) => blob,
             Err(_) => continue,
         };
-        // 哈希存储的条目（`|1|salt|hash`）无法按主机名比对，只保留密钥供指纹比对
-        let names = if names_field.starts_with("|1|") {
-            Vec::new()
-        } else {
-            names_field.split(',').map(|s| s.to_string()).collect()
-        };
+        // `|1|salt|mac` 留在名字里，匹配时用 HMAC-SHA1 正向比对，不需要还原主机名。
+        let names: Vec<String> = names_field
+            .split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
+            .collect();
         entries.push(KnownEntry {
             names,
             marker,
@@ -935,18 +938,33 @@ fn name_covers_host(name: &str, config: &SshConnectConfig) -> bool {
 }
 
 fn name_part_covers_host(name: &str, config: &SshConnectConfig) -> bool {
-    let port_entry = format!("[{}]:{}", config.host, config.port);
-    if name == port_entry {
+    if name.starts_with("|1|") {
+        return hashed_name_covers(name, config);
+    }
+    let token = known_host_token(config);
+    if name == token {
         return true;
     }
-    if config.port == 22 && name == config.host {
-        return true;
-    }
-    // 支持 OpenSSH 的通配写法（*.example.com / 10.0.0.?）
+    // 通配符对着同一条记号匹配：`*.example.com` 只覆盖 22 端口，
+    // 非默认端口要写成 `[*.example.com]:2222` 或 `[*.example.com]:*`。
     if name.contains('*') || name.contains('?') {
-        return wildcard_match(name, &config.host);
+        return wildcard_match(name, &token);
     }
     false
+}
+
+fn plain_key_line_covers(line: &str, config: &SshConnectConfig) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || trimmed.starts_with('#') {
+        return false;
+    }
+    let Some(first) = trimmed.split_whitespace().next() else {
+        return false;
+    };
+    if first.starts_with('@') {
+        return false;
+    }
+    name_covers_host(first, config)
 }
 
 fn wildcard_match(pattern: &str, value: &str) -> bool {
@@ -995,18 +1013,114 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
-/// 证书是否对本机有效：类型为 host、主机名在 principals 内、且在有效期内。
-fn certificate_covers_host(cert: &Certificate, config: &SshConnectConfig) -> bool {
-    if cert.cert_type() != CertType::Host {
+type HmacSha1 = Hmac<Sha1>;
+
+/// known_hosts 里用来比对的主机记号。非 22 端口必须带 `[host]:port`，
+/// 和 OpenSSH 写入、哈希时用的字符串一致。
+fn known_host_token(config: &SshConnectConfig) -> String {
+    if config.port == 22 {
+        config.host.clone()
+    } else {
+        format!("[{}]:{}", config.host, config.port)
+    }
+}
+
+fn b64_decode(text: &str) -> Option<Vec<u8>> {
+    base64::engine::general_purpose::STANDARD
+        .decode(text)
+        .ok()
+        .or_else(|| base64::engine::general_purpose::STANDARD_NO_PAD.decode(text).ok())
+}
+
+fn hmac_sha1(key: &[u8], data: &[u8]) -> Option<[u8; 20]> {
+    let mut mac = HmacSha1::new_from_slice(key).ok()?;
+    mac.update(data);
+    let bytes = mac.finalize().into_bytes();
+    let mut out = [0u8; 20];
+    out.copy_from_slice(bytes.as_slice());
+    Some(out)
+}
+
+/// `|1|salt|mac` 是 HMAC-SHA1(salt, host-token)。盐和摘要都解不出来就当对不上。
+fn hashed_name_covers(token: &str, config: &SshConnectConfig) -> bool {
+    let Some(rest) = token.strip_prefix("|1|") else {
         return false;
+    };
+    let Some((salt_b64, mac_b64)) = rest.split_once('|') else {
+        return false;
+    };
+    let Some(salt) = b64_decode(salt_b64) else {
+        return false;
+    };
+    let Some(expected) = b64_decode(mac_b64) else {
+        return false;
+    };
+    let Some(digest) = hmac_sha1(&salt, known_host_token(config).as_bytes()) else {
+        return false;
+    };
+    if expected.len() != digest.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (left, right) in expected.iter().zip(digest.iter()) {
+        diff |= left ^ right;
+    }
+    diff == 0
+}
+
+/// 写入 known_hosts 的主机名只允许字面主机。换行、逗号、通配符会变成额外信任行。
+fn host_label_can_be_recorded(host: &str) -> bool {
+    !host.is_empty()
+        && host.len() <= 255
+        && !host.starts_with('-')
+        && !host.ends_with('.')
+        && host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':' | '%'))
+}
+
+/// 受信 CA 已经对上之后，签名、critical options、类型、有效期和 principal 都必须通过。
+/// 签不过或主机名不符时直接拒绝，不能再掉回「首次信任」让用户把伪造密钥钉进去。
+fn authorize_host_certificate(
+    cert: &Certificate,
+    ca_blobs: &[Vec<u8>],
+    revoked_blobs: &[Vec<u8>],
+    config: &SshConnectConfig,
+) -> Result<bool, String> {
+    let ca_blob = key_data_blob(cert.signature_key());
+    if ca_blob.is_empty() {
+        return Ok(false);
+    }
+    if revoked_blobs.iter().any(|blob| blob == &ca_blob) {
+        return Err("签发该主机证书的 CA 已在 ~/.ssh/known_hosts 中标记为 @revoked，拒绝连接".into());
+    }
+    if !ca_blobs.iter().any(|blob| blob == &ca_blob) {
+        return Ok(false);
+    }
+    if cert.verify_signature().is_err() {
+        return Err("主机证书签名校验失败，拒绝连接".into());
+    }
+    // source-address 等 critical option 不认识就必须拒绝，不能当成没写。
+    if !cert.critical_options().is_empty() {
+        return Err(
+            "主机证书带有本客户端未执行的 critical options（例如 source-address），拒绝连接".into(),
+        );
+    }
+    if cert.cert_type() != CertType::Host {
+        return Err("远端出示的不是主机证书，拒绝连接".into());
     }
     let now = now_unix();
-    if now < cert.valid_after() || now > cert.valid_before() {
-        return false;
+    // PROTOCOL.certkeys：valid_before 是开区间上界。
+    if now < cert.valid_after() || now >= cert.valid_before() {
+        return Err("主机证书不在有效期内，拒绝连接".into());
     }
-    cert.valid_principals().iter().any(|principal| {
+    let principal_ok = cert.valid_principals().iter().any(|principal| {
         principal == &config.host || wildcard_match(principal, &config.host)
-    })
+    });
+    if !principal_ok {
+        return Err("主机证书的 principal 不包含当前主机，拒绝连接".into());
+    }
+    Ok(true)
 }
 
 /// 校验远端主机密钥/证书：
@@ -1033,10 +1147,10 @@ fn verify_host_key(
     let mut matched = false;
     let mut revoked = false;
     let mut old_fingerprints: Vec<String> = Vec::new();
-    let mut ca_digests: Vec<Vec<u8>> = Vec::new();
+    let mut ca_blobs: Vec<Vec<u8>> = Vec::new();
+    let mut revoked_blobs: Vec<Vec<u8>> = Vec::new();
     for entry in &entries {
-        let covers = entry.names.iter().any(|name| name_covers_host(name, config));
-        if !covers {
+        if !entry.names.iter().any(|name| name_covers_host(name, config)) {
             continue;
         }
         match entry.marker.as_deref() {
@@ -1044,13 +1158,16 @@ fn verify_host_key(
                 if entry.key_blob == plain_blob {
                     revoked = true;
                 }
+                revoked_blobs.push(entry.key_blob.clone());
                 continue;
             }
             Some("@cert-authority") => {
-                ca_digests.push(entry.key_blob.clone());
+                ca_blobs.push(entry.key_blob.clone());
                 continue;
             }
-            _ => {}
+            // 不认识的标记不当成普通主机密钥，避免把未知指令解释成已信任。
+            Some(_) => continue,
+            None => {}
         }
         if entry.key_blob == plain_blob {
             matched = true;
@@ -1068,14 +1185,10 @@ fn verify_host_key(
         ));
     }
 
-    // 服务器用证书证明身份时，等价于「证书里的公钥」可比对：
-    // 一是直接命中已知的裸公钥（OpenSSH 的 fallback 行为），二是由已知 CA 签发。
+    // 裸公钥命中仍然算信任。证书只有在 CA 公钥、签名和 principal 都通过时才算。
     if !matched {
         if let Some(cert) = certificate {
-            let ca_blob = key_data_blob(cert.signature_key());
-            if ca_digests.iter().any(|known| *known == ca_blob)
-                && certificate_covers_host(cert, config)
-            {
+            if authorize_host_certificate(cert, &ca_blobs, &revoked_blobs, config)? {
                 matched = true;
             }
         }
@@ -1088,11 +1201,7 @@ fn verify_host_key(
         });
     }
 
-    let host_entry = if config.port == 22 {
-        config.host.clone()
-    } else {
-        format!("[{}]:{}", config.host, config.port)
-    };
+    let host_entry = known_host_token(config);
 
     if !old_fingerprints.is_empty() {
         if !config.trust_host_key {
@@ -1102,7 +1211,8 @@ fn verify_host_key(
                 old_fingerprints.join(";")
             ));
         }
-        // 用户已确认替换：先移除同名旧条目，再写入新密钥
+        ensure_host_recordable(&config.host)?;
+        // 用户已确认替换：只删这条主机的普通密钥（含能对上的哈希行），不动 CA 和吊销行。
         rewrite_known_hosts_without(&kh_path, config, &text)?;
         append_known_host(&kh_path, &host_entry, &plain, &plain_blob)?;
         return Ok(HostKeyInfo {
@@ -1114,11 +1224,20 @@ fn verify_host_key(
     if !config.trust_host_key {
         return Err(format!("HOST_KEY_UNKNOWN|{}", fingerprint));
     }
+    ensure_host_recordable(&config.host)?;
     append_known_host(&kh_path, &host_entry, &plain, &plain_blob)?;
     Ok(HostKeyInfo {
         fingerprint,
         status: "trusted".into(),
     })
+}
+
+fn ensure_host_recordable(host: &str) -> Result<(), String> {
+    if host_label_can_be_recorded(host) {
+        Ok(())
+    } else {
+        Err("主机名含有不能写入 known_hosts 的字符，已拒绝保存".into())
+    }
 }
 
 fn append_known_host(
@@ -1127,6 +1246,9 @@ fn append_known_host(
     plain: &russh::keys::PublicKey,
     plain_blob: &[u8],
 ) -> Result<(), String> {
+    if host_entry.chars().any(|c| c.is_whitespace() || c.is_control() || c == ',') {
+        return Err("主机名含有不能写入 known_hosts 的字符，已拒绝保存".into());
+    }
     if let Some(parent) = kh_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("创建 ~/.ssh 目录失败: {}", e))?;
     }
@@ -1148,7 +1270,9 @@ fn append_known_host(
         .map_err(|e| format!("写入 known_hosts 失败: {}", e))
 }
 
-/// 删除指向当前主机的明文条目后重写 known_hosts（哈希条目保持原样，与旧实现一致）
+/// 用户确认更换密钥时，只删除这条主机的普通公钥行。
+/// `@cert-authority` / `@revoked` 即使通配符盖住当前主机也保留。
+/// 能用 HMAC 对上的 `|1|` 普通行一并删掉，否则旧密钥会继续被信任。
 fn rewrite_known_hosts_without(
     kh_path: &Path,
     config: &SshConnectConfig,
@@ -1156,22 +1280,10 @@ fn rewrite_known_hosts_without(
 ) -> Result<(), String> {
     let mut kept: Vec<&str> = Vec::new();
     for line in original.lines() {
-        let fields: Vec<&str> = line.split_whitespace().collect();
-        // 行格式：[@marker] hostnames keytype base64 [comment]
-        let name_index = if fields.first().is_some_and(|f| f.starts_with('@')) {
-            1
-        } else {
-            0
-        };
-        let covers = fields
-            .get(name_index)
-            .map(|names| {
-                !names.starts_with("|1|") && names.split(',').any(|name| name_covers_host(name, config))
-            })
-            .unwrap_or(false);
-        if !covers {
-            kept.push(line);
+        if plain_key_line_covers(line, config) {
+            continue;
         }
+        kept.push(line);
     }
     let mut content = kept.join("\n");
     if !content.is_empty() {
@@ -1272,6 +1384,141 @@ mod tests {
         assert!(kept.contains("AAAAKEEP"));
         assert!(kept.contains("AAAAHASHED"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wildcard_without_port_does_not_cover_other_ports() {
+        let config = SshConnectConfig {
+            host: "api.example.com".into(),
+            port: 2222,
+            ..base_config()
+        };
+        assert!(!name_covers_host("*.example.com", &config));
+        assert!(name_covers_host("[*.example.com]:*", &config));
+        assert!(name_covers_host("[*.example.com]:2222", &config));
+    }
+
+    #[test]
+    fn hashed_known_host_matches_only_the_same_token() {
+        let salt = b"snail-ssh-salt-20b!";
+        let config = base_config();
+        let mac = hmac_sha1(salt, b"example.com").unwrap();
+        let token = format!(
+            "|1|{}|{}",
+            base64::engine::general_purpose::STANDARD.encode(salt),
+            base64::engine::general_purpose::STANDARD.encode(mac)
+        );
+        assert!(name_covers_host(&token, &config));
+        let other = SshConnectConfig {
+            host: "other.example".into(),
+            ..config
+        };
+        assert!(!name_covers_host(&token, &other));
+        let ported = SshConnectConfig {
+            port: 2222,
+            ..base_config()
+        };
+        assert!(!name_covers_host(&token, &ported));
+    }
+
+    #[test]
+    fn rewrite_keeps_ca_and_revoked_lines() {
+        let dir = std::env::temp_dir().join(format!("snail-kh-keep-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("known_hosts");
+        let salt = b"snail-ssh-salt-20b!";
+        let mac = hmac_sha1(salt, b"example.com").unwrap();
+        let hashed = format!(
+            "|1|{}|{} ssh-ed25519 AAAAHASHED\n",
+            base64::engine::general_purpose::STANDARD.encode(salt),
+            base64::engine::general_purpose::STANDARD.encode(mac)
+        );
+        let original = format!(
+            "example.com ssh-ed25519 AAAAOLD\n{hashed}@cert-authority *.example.com ssh-ed25519 AAAACA\n@revoked example.com ssh-ed25519 AAAAREVOKED\nother.host ssh-ed25519 AAAAKEEP\n"
+        );
+        rewrite_known_hosts_without(&path, &base_config(), &original).unwrap();
+        let kept = std::fs::read_to_string(&path).unwrap();
+        assert!(!kept.contains("AAAAOLD"));
+        assert!(!kept.contains("AAAAHASHED"));
+        assert!(kept.contains("AAAACA"));
+        assert!(kept.contains("AAAAREVOKED"));
+        assert!(kept.contains("AAAAKEEP"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn host_label_rejects_known_hosts_metacharacters() {
+        assert!(host_label_can_be_recorded("example.com"));
+        assert!(host_label_can_be_recorded("fe80::1"));
+        assert!(!host_label_can_be_recorded("example.com\n*"));
+        assert!(!host_label_can_be_recorded("example.com,*.bank.com"));
+        assert!(!host_label_can_be_recorded("*.example.com"));
+    }
+
+    #[test]
+    fn host_certificate_requires_a_valid_signature() {
+        let mut rng = rand::rng();
+        let ca = russh::keys::PrivateKey::random(&mut rng, russh::keys::Algorithm::Ed25519).unwrap();
+        let subject =
+            russh::keys::PrivateKey::random(&mut rng, russh::keys::Algorithm::Ed25519).unwrap();
+        let now = now_unix();
+        let mut builder = russh::keys::ssh_key::certificate::Builder::new_with_random_nonce(
+            &mut rng,
+            subject.public_key(),
+            now.saturating_sub(30),
+            now.saturating_add(3600),
+        )
+        .unwrap();
+        builder.cert_type(CertType::Host).unwrap();
+        builder.valid_principal("example.com").unwrap();
+        let cert = builder.sign(&ca).unwrap();
+        let ca_blob = key_data_blob(cert.signature_key());
+        let config = base_config();
+
+        assert_eq!(
+            authorize_host_certificate(&cert, &[ca_blob.clone()], &[], &config).unwrap(),
+            true
+        );
+        assert_eq!(
+            authorize_host_certificate(&cert, &[], &[], &config).unwrap(),
+            false
+        );
+        assert!(authorize_host_certificate(&cert, &[ca_blob.clone()], &[ca_blob.clone()], &config).is_err());
+
+        let mut raw = cert.to_bytes().unwrap();
+        let last = raw.len() - 1;
+        raw[last] ^= 0x01;
+        let forged = Certificate::from_bytes(raw.as_slice()).unwrap();
+        assert!(authorize_host_certificate(&forged, &[ca_blob], &[], &config).is_err());
+
+        let mut restricted = russh::keys::ssh_key::certificate::Builder::new_with_random_nonce(
+            &mut rng,
+            subject.public_key(),
+            now.saturating_sub(30),
+            now.saturating_add(3600),
+        )
+        .unwrap();
+        restricted.cert_type(CertType::Host).unwrap();
+        restricted.valid_principal("example.com").unwrap();
+        restricted
+            .critical_option("source-address", "10.0.0.0/8")
+            .unwrap();
+        let restricted = restricted.sign(&ca).unwrap();
+        let restricted_ca = key_data_blob(restricted.signature_key());
+        assert!(authorize_host_certificate(&restricted, &[restricted_ca], &[], &config).is_err());
+
+        let mut other = russh::keys::ssh_key::certificate::Builder::new_with_random_nonce(
+            &mut rng,
+            subject.public_key(),
+            now.saturating_sub(30),
+            now.saturating_add(3600),
+        )
+        .unwrap();
+        other.cert_type(CertType::Host).unwrap();
+        other.valid_principal("other.example").unwrap();
+        let other = other.sign(&ca).unwrap();
+        let other_ca = key_data_blob(other.signature_key());
+        assert!(authorize_host_certificate(&other, &[other_ca], &[], &config).is_err());
     }
 }
 

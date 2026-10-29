@@ -103,12 +103,12 @@
 ## ⚠️ 已知限制
 
 * 跳板机只支持已保存主机组成的 `ProxyJump` 链（最多 8 跳）和 SOCKS5 / HTTP CONNECT 出站代理。`ProxyCommand` 会在导入时忽略，不会在本机执行。
-* 端口转发支持 Local / Remote / Dynamic（本地 SOCKS5）。启用的转发会在连接该主机时自动启动，也可从侧边栏单独拉起。远端转发要求 sshd 允许 `AllowTcpForwarding`；同一本地端口不能被两个隧道同时占用。动态转发不做认证，请只绑定 `127.0.0.1`。
+* 端口转发支持 Local / Remote / Dynamic（本地 SOCKS5）。启用的转发会在连接该主机时自动启动，也可从侧边栏单独拉起。远端转发要求 sshd 允许 `AllowTcpForwarding`；同一本地端口不能被两个隧道同时占用。动态转发不做认证，监听地址只能是 `127.0.0.1`、`localhost` 或 `::1`，其它地址会直接拒绝。
 * 主机导入目前只读 OpenSSH `ssh_config`。`Match` / `Include` 不展开。FinalShell / Termius / Xshell 的专有格式尚未支持。导出不写密码和私钥内容。
 * 密钥保险箱可生成 ed25519 / RSA，或导入已有私钥，文件落在 `~/.snail-ssh/keys/`。known_hosts 可查看和删除。交互式认证（keyboard-interactive / OTP）会弹出提问，3 分钟未填写即失败。
 * 确认主机密钥时只信任当前这一跳。不要用一次确认放行整条没看过指纹的链路。
 
-* SSH 栈已从 libssh2 换成 russh：Windows 上也支持 ed25519 / OpenSSH 证书主机密钥（旧版只支持 RSA 主机密钥，遇到仅提供证书主机密钥的服务器会握手失败）。证书主机密钥按 `~/.ssh/known_hosts` 中的裸公钥或 `@cert-authority` 记录校验，`@revoked` 一律拒绝。
+* SSH 栈已从 libssh2 换成 russh：Windows 上也支持 ed25519 / OpenSSH 证书主机密钥（旧版只支持 RSA 主机密钥，遇到仅提供证书主机密钥的服务器会握手失败）。证书主机密钥会先校验 CA 签名，再按 `~/.ssh/known_hosts` 中的裸公钥或 `@cert-authority` 记录决定是否信任；带有未执行的 critical options（如 `source-address`）直接拒绝。`@revoked` 一律拒绝。`HashKnownHosts` 的 `|1|` 行会做 HMAC-SHA1 比对。不带端口的通配符只匹配 22 端口。确认更换密钥时只删除该主机的普通公钥行，不会删掉 CA 或吊销行。
 * 「SSH Agent」认证在 Windows 上只支持 Pageant（russh 的 Unix socket 代理仅 Unix 编译）；本机 OpenSSH 的 `ssh-agent` 服务未运行时该方式会失败，建议改用私钥认证，私钥填绝对路径（例如 `C:\Users\<用户名>\.ssh\id_rsa`）。
 * 应用加了单实例保护：再次启动只会唤回已有窗口（还原最小化并聚焦），不会再开第二个进程。因此「双开两个窗口分别连不同主机」目前不支持。
 * 认证前会先尝试 `none`（与 OpenSSH 行为一致）：部分网关（用户名即连接令牌）不需要任何凭证即可登录。
@@ -119,7 +119,7 @@
 * 同一会话的传输独占其 SFTP 连接：传输（含暂停）期间该会话的文件列表刷新/浏览会被阻塞，需继续或取消后恢复。
 * 续传仅按目标文件长度判断：若目标文件被外部改成「等长但内容不同」，会被视为已传/从头重传，后端不做 mtime / hash 内容校验。
 * 目录上传/下载会跳过与源等大的文件（视为已传），不逐一做 md5 校验。
-* 系统钥匙串不可用时会回退为明文存入 `hosts.json`，并在日志中告警；应用启动后会主动探测一次钥匙串可用性，异常时在标题栏显示常驻徽标、在设置中心「存储与安全」给出原因与修复指引，不再只写日志。
+* 系统钥匙串不可用时会回退为明文存入 `hosts.json`，并在日志中告警；应用启动后会主动探测一次钥匙串可用性，异常时在标题栏显示常驻徽标、在设置中心「存储与安全」给出原因与修复指引，不再只写日志。`~/.snail-ssh` 会收成仅当前用户可读写（Unix `0700`/`0600`，Windows 在 `icacls` 可用时去掉继承），这不能代替钥匙串。
 * 最近连接列表已并入 `settings.json` 的 `recentHosts` 字段（随 `~/.snail-ssh/` 一起备份/迁移）；旧版本遗留的 `localStorage` 键 `snail_ssh_recent` 会在首次启动时一次性迁移并删除。
 * 快速连接为临时会话：不会保存到资产列表，凭据只存在于内存中，应用重启后需重新填写；同名 `hostId` 不会与已入库主机去重。
 * SFTP 列表中的属主/属组显示的是远端原始**数字 uid/gid**，不是用户名（`chown` 同样接受数字 id）。

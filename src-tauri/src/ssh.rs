@@ -212,6 +212,7 @@ impl SessionLogWriter {
         }
         match fs::File::create(&self.path) {
             Ok(file) => {
+                crate::fsperm::restrict_file(&self.path);
                 self.file = file;
                 self.written = 0;
                 true
@@ -425,10 +426,33 @@ fn value_end(value: &str) -> usize {
     i.max(1)
 }
 
+/// 同一片段里能看到 BEGIN/END 的私钥块整段丢掉。块被输出切开时，没有 BEGIN 的后半段仍可能漏过去。
+fn mask_private_key_blocks(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut hiding = false;
+    for line in text.split_inclusive('\n') {
+        let lower = line.to_ascii_lowercase();
+        if !hiding && lower.contains("-----begin") && lower.contains("private") {
+            hiding = !lower.contains("-----end");
+            out.push_str("[redacted private key]\n");
+            continue;
+        }
+        if hiding {
+            if lower.contains("-----end") {
+                hiding = false;
+            }
+            continue;
+        }
+        out.push_str(line);
+    }
+    out
+}
+
 /// 把 password/token/secret 之类的值替换为 `***`
 fn redact(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
+    let masked = mask_private_key_blocks(text);
+    let mut out = String::with_capacity(masked.len());
+    let mut rest = masked.as_str();
     loop {
         match find_next_secret(rest) {
             Some((_, value_start)) => {
@@ -836,11 +860,14 @@ impl SshManager {
             .join("logs")
             .join(sanitize_host(host_label));
         fs::create_dir_all(&dir).map_err(|e| format!("创建日志目录失败: {}", e))?;
+        crate::fsperm::restrict_dir(&crate::storage::app_data_dir().join("logs"));
+        crate::fsperm::restrict_dir(&dir);
 
         let short_id: String = session_id.trim_start_matches("ssh-").chars().take(8).collect();
         let started = now_secs();
         let path = dir.join(format!("{}_{}.log", format_timestamp(started), short_id));
         let file = fs::File::create(&path).map_err(|e| format!("创建日志文件失败: {}", e))?;
+        crate::fsperm::restrict_file(&path);
 
         let (tx, rx) = sync_channel::<String>(LOG_CHANNEL_CAPACITY);
         let header = format!(
@@ -1589,6 +1616,18 @@ mod tests {
         // 普通单词不应被误伤
         assert_eq!(redact("passwordless login is fine"), "passwordless login is fine");
         assert_eq!(redact("ls -al /var/log"), "ls -al /var/log");
+    }
+
+    #[test]
+    fn redact_drops_private_key_blocks() {
+        let begin = format!("-----{} {} {}-----", "BEGIN", "OPENSSH", "PRIVATE KEY");
+        let end = format!("-----{} {} {}-----", "END", "OPENSSH", "PRIVATE KEY");
+        let text = format!("before\n{begin}\nabc\n{end}\nafter\n");
+        let cleaned = redact(&text);
+        assert!(cleaned.contains("before"));
+        assert!(cleaned.contains("after"));
+        assert!(!cleaned.contains("abc"));
+        assert!(cleaned.contains("[redacted private key]"));
     }
 
     #[test]

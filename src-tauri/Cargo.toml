@@ -33,5 +33,8 @@ dirs = "5.0"
 keyring = { version = "4", default-features = false, features = ["v1"] }
 # 主机密钥指纹（SHA256 base64），用于 known_hosts 校验展示
 sha2 = "0.10"
+# OpenSSH HashKnownHosts 的 |1|salt|mac 固定是 HMAC-SHA1，不能换成 SHA256
+hmac = "0.13"
+sha1 = "0.11"
 base64 = "0.22"
 rand = "0.10"

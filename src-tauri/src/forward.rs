@@ -73,9 +73,19 @@ pub fn validate_forward(spec: &PortForward) -> Result<(), String> {
             }
             Ok(())
         }
-        "dynamic" => Ok(()),
+        "dynamic" => {
+            if !is_loopback_bind(&spec.bind_host) {
+                return Err("动态转发没有认证，只能监听 127.0.0.1、localhost 或 ::1".into());
+            }
+            Ok(())
+        },
         other => Err(format!("未知转发类型: {}", other)),
     }
+}
+
+fn is_loopback_bind(host: &str) -> bool {
+    let host = host.trim().trim_matches(|c| c == '[' || c == ']');
+    matches!(host, "127.0.0.1" | "localhost" | "::1")
 }
 
 /// 把 SSH 通道和一条 TCP 连接对拷，直到任一侧关闭。
@@ -228,5 +238,19 @@ mod tests {
             enabled: true,
         };
         assert!(validate_forward(&spec).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_dynamic_bind_outside_loopback() {
+        let spec = PortForward {
+            id: "1".into(),
+            kind: "dynamic".into(),
+            bind_host: "0.0.0.0".into(),
+            bind_port: 1080,
+            target_host: String::new(),
+            target_port: 0,
+            enabled: true,
+        };
+        assert!(validate_forward(&spec).is_err());
     }
 }

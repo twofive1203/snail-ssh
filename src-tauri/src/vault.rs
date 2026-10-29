@@ -95,6 +95,7 @@ pub fn delete_key(id: &str) -> Result<(), String> {
 fn write_key(name: &str, key: &russh::keys::PrivateKey) -> Result<SshKeyInfo, String> {
     let dir = keys_dir();
     fs::create_dir_all(&dir).map_err(|e| format!("创建密钥目录失败: {}", e))?;
+    crate::fsperm::restrict_dir(&dir);
     let id = format!("key-{}", uuid::Uuid::new_v4());
     let path = dir.join(&id);
     let openssh = key
@@ -150,7 +151,9 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
     }
     #[cfg(not(unix))]
     {
-        fs::write(path, bytes).map_err(|e| format!("写入私钥失败: {}", e))
+        fs::write(path, bytes).map_err(|e| format!("写入私钥失败: {}", e))?;
+        crate::fsperm::restrict_file(path);
+        Ok(())
     }
 }
 
@@ -178,9 +181,14 @@ fn read_index() -> Result<Vec<SshKeyInfo>, String> {
 }
 
 fn write_index(index: &[SshKeyInfo]) -> Result<(), String> {
-    fs::create_dir_all(keys_dir()).map_err(|e| e.to_string())?;
+    let dir = keys_dir();
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    crate::fsperm::restrict_dir(&dir);
     let text = serde_json::to_string_pretty(index).map_err(|e| e.to_string())?;
-    fs::write(index_path(), text).map_err(|e| e.to_string())
+    let path = index_path();
+    fs::write(&path, text).map_err(|e| e.to_string())?;
+    crate::fsperm::restrict_file(&path);
+    Ok(())
 }
 
 fn algorithm_name(key: &russh::keys::PrivateKey) -> String {

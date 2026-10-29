@@ -286,6 +286,9 @@ pub(crate) fn app_data_dir() -> PathBuf {
     if !base_dir.exists() {
         let _ = fs::create_dir_all(&base_dir);
     }
+    // 目录可能是以前以默认权限建出来的，进程内收紧一次即可。
+    static TIGHTENED: std::sync::Once = std::sync::Once::new();
+    TIGHTENED.call_once(|| crate::fsperm::restrict_dir(&base_dir));
     base_dir
 }
 
@@ -517,6 +520,7 @@ fn rotate_hosts_backups(dir: &Path) -> Result<(), String> {
     let target = hosts_backup_path(dir, 1);
     let _ = fs::remove_file(&target);
     fs::copy(&source, &target).map_err(|e| format!("备份 hosts.json 失败: {}", e))?;
+    crate::fsperm::restrict_file(&target);
     Ok(())
 }
 
@@ -533,13 +537,18 @@ fn write_hosts_atomic(dir: &Path, list: &[HostItem]) -> Result<(), String> {
     let json = serde_json::to_string_pretty(&envelope)
         .map_err(|e| format!("序列化主机配置失败: {}", e))?;
     fs::write(&tmp, json).map_err(|e| format!("写入主机配置失败: {}", e))?;
-    match fs::rename(&tmp, &path) {
+    crate::fsperm::restrict_file(&tmp);
+    let renamed = match fs::rename(&tmp, &path) {
         Ok(()) => Ok(()),
         Err(_) => {
             let _ = fs::remove_file(&path);
             fs::rename(&tmp, &path).map_err(|e| format!("保存主机配置失败: {}", e))
         }
+    };
+    if renamed.is_ok() {
+        crate::fsperm::restrict_file(&path);
     }
+    renamed
 }
 
 fn count_hosts_backups(dir: &Path) -> usize {
