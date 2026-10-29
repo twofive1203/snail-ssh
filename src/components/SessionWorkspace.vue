@@ -109,12 +109,13 @@
 
 <script setup lang="ts">
 import { ref, computed, watch, onBeforeUnmount, nextTick } from 'vue'
+import type { UnlistenFn } from '@tauri-apps/api/event'
 import FileTree from '@/components/FileTree.vue'
 import TerminalView from '@/components/TerminalView.vue'
 import RemoteMonitorBar from '@/components/RemoteMonitorBar.vue'
 import SftpView from '@/components/SftpView.vue'
 import type { HostItem, HostSession, RemoteFileRef, RemoteSystemMetrics, SftpFileItem } from '@/types'
-import { getRemoteMetricsApi } from '@/api/tauri'
+import { getMetricsTargetApi, getRemoteMetricsApi, isTauri, onSshMetrics, setMetricsTargetApi } from '@/api/tauri'
 
 const props = defineProps<{
   session: HostSession
@@ -154,7 +155,17 @@ const terminalHostKey = computed(
 // 远端监控状态与数据
 const remoteMetrics = ref<RemoteSystemMetrics | null>(null)
 const metricsLoading = ref(false)
-let monitorTimer: any = null
+// 当前指标订阅的注销句柄；Tauri 下指标由后端推事件，前端不再定时拉取
+let metricsUnlisten: UnlistenFn | null = null
+// 浏览器预览没有后端事件，只能用轻量定时器兜底，否则 demo 的监控条永远空白
+let previewTimer: number | null = null
+// 切换标签/开关面板很快时，靠递增的令牌丢弃旧订阅的回写，避免旧会话数据盖掉新会话
+let monitorToken = 0
+// 本组件真正下发到后端的采样目标；卸载时据此判断是否由自己收尾清空
+let ownedMetricsTarget: string | null = null
+// 每个会话上一帧指标：切回标签时先用缓存显示，避免等下一个采样周期（≤2.5s）才出数据。
+// 只缓存本组件见过的会话，随会话关闭回收，不会无限增长。
+const metricsBySession = new Map<string, RemoteSystemMetrics>()
 
 const isCollapsed = ref(props.session.sidebarCollapsed || false)
 const sidebarWidth = ref(props.session.sidebarWidth || 280)
@@ -164,6 +175,11 @@ const currentActiveTabCwd = computed(() => {
 })
 
 const activeTerminalTab = computed(() => props.session.terminalTabs[props.session.activeTerminalIndex])
+
+// 指标采样目标沿用现有取值顺序：活动终端标签的真实 SSH 会话优先
+const monitorSessionId = computed(
+  () => activeTerminalTab.value?.id || props.session.sftpSessionId || props.session.id
+)
 
 // 自动跟随挂在当前终端标签页上，同一会话内各标签页可独立开关
 const activeFollow = computed(() => activeTerminalTab.value?.autoFollowTerminal ?? false)
@@ -280,49 +296,88 @@ const resetWidth = () => {
   })
 }
 
-// 远程监控定时轮询与控制
-const fetchRemoteMetrics = async () => {
-  const activeTab = props.session.terminalTabs[props.session.activeTerminalIndex]
-  const sessionId = activeTab?.id || props.session.sftpSessionId || props.session.id
-  if (!sessionId) return
-
-  try {
-    metricsLoading.value = true
-    const res = await getRemoteMetricsApi(sessionId)
-    if (res) {
-      remoteMetrics.value = res
-    }
-  } catch (e) {
-    console.warn('获取远程监控指标失败:', e)
-  } finally {
-    metricsLoading.value = false
+// 远端监控：订阅后端指标事件 + 告知后端采样目标
+const teardownMonitoring = () => {
+  monitorToken += 1
+  if (metricsUnlisten) {
+    const unlisten = metricsUnlisten
+    metricsUnlisten = null
+    unlisten()
+  }
+  if (previewTimer !== null) {
+    clearInterval(previewTimer)
+    previewTimer = null
   }
 }
 
-const startMonitoring = () => {
-  stopMonitoring()
-  fetchRemoteMetrics()
-  monitorTimer = setInterval(() => {
-    if (props.isActive && props.session.remoteMonitorOpen) {
-      fetchRemoteMetrics()
+// 浏览器预览的兜底轮询：只在非 Tauri 环境启动，桌面端完全交给后端事件
+const startPreviewPolling = (sessionId: string, token: number) => {
+  const poll = async () => {
+    try {
+      const res = await getRemoteMetricsApi(sessionId)
+      if (token !== monitorToken) return
+      if (res) metricsBySession.set(sessionId, res)
+      remoteMetrics.value = res
+      metricsLoading.value = false
+    } catch (e) {
+      console.warn('获取远程监控指标失败:', e)
+      if (token === monitorToken) metricsLoading.value = false
     }
-  }, 2500)
+  }
+  void poll()
+  previewTimer = window.setInterval(poll, 2500)
 }
 
-const stopMonitoring = () => {
-  if (monitorTimer) {
-    clearInterval(monitorTimer)
-    monitorTimer = null
+// 采样目标是后端全局状态：只在自己仍持有时才清空，
+// 否则切标签这类同一 tick 内出现的「先接管再释放」会互相抹掉目标
+const releaseMetricsTarget = async (ownedSessionId: string | null) => {
+  ownedMetricsTarget = null
+  if (!ownedSessionId) return
+  await nextTick()
+  if (getMetricsTargetApi() === ownedSessionId) await setMetricsTargetApi(null)
+}
+
+const syncMonitoring = async () => {
+  teardownMonitoring()
+  const token = monitorToken
+  // 只有「活动且面板打开」才采样；切走的会话必须让后端停下，否则隐藏会话也在跑远程命令
+  const sessionId = props.isActive && props.session.remoteMonitorOpen ? monitorSessionId.value : null
+  if (!sessionId) {
+    metricsLoading.value = false
+    await releaseMetricsTarget(ownedMetricsTarget)
+    return
+  }
+
+  // 有上一帧缓存就直接显示（切换标签/关掉再打开面板不闪空白），没有才进 loading
+  remoteMetrics.value = metricsBySession.get(sessionId) ?? null
+  metricsLoading.value = !remoteMetrics.value
+  const unlisten = await onSshMetrics(sessionId, (metrics) => {
+    if (token !== monitorToken) return
+    metricsBySession.set(sessionId, metrics)
+    remoteMetrics.value = metrics
+    metricsLoading.value = false
+  })
+  // await 期间可能又发生一次切换，这次订阅已过期就当场收掉，不留泄漏
+  if (token !== monitorToken) {
+    unlisten()
+    return
+  }
+  metricsUnlisten = unlisten
+  ownedMetricsTarget = sessionId
+  await setMetricsTargetApi(sessionId)
+  // await 期间又切走/卸载：本次下发可能落在新目标之后，按归属补发一次清空
+  if (token !== monitorToken) {
+    if (ownedMetricsTarget === sessionId) await releaseMetricsTarget(sessionId)
+    return
+  }
+  if (!isTauri()) {
+    startPreviewPolling(sessionId, token)
   }
 }
 
 const handleToggleRemoteMonitor = () => {
+  // 重采样由下面监听 remoteMonitorOpen 的 watch 统一处理
   props.session.remoteMonitorOpen = !props.session.remoteMonitorOpen
-  if (props.session.remoteMonitorOpen) {
-    startMonitoring()
-  } else {
-    stopMonitoring()
-  }
   nextTick(() => {
     terminalRef.value?.fit()
   })
@@ -330,20 +385,16 @@ const handleToggleRemoteMonitor = () => {
 
 const handleCloseRemoteMonitor = () => {
   props.session.remoteMonitorOpen = false
-  stopMonitoring()
   nextTick(() => {
     terminalRef.value?.fit()
   })
 }
 
+// 三个依赖都要监听：开关面板、切走标签页、会话内切换终端标签都会改变采样目标
 watch(
-  () => [props.isActive, props.session.remoteMonitorOpen],
-  ([active, open]) => {
-    if (active && open) {
-      startMonitoring()
-    } else {
-      stopMonitoring()
-    }
+  () => [props.isActive, props.session.remoteMonitorOpen, monitorSessionId.value],
+  () => {
+    void syncMonitoring()
     nextTick(() => {
       terminalRef.value?.fit()
     })
@@ -387,7 +438,13 @@ const startResize = (e: MouseEvent) => {
 }
 
 onBeforeUnmount(() => {
-  stopMonitoring()
+  // 卸载（关闭会话）必须注销监听；但采样目标只在自己仍持有时清空：
+  // 关闭活动会话时新会话可能已抢先接管目标，一律发 null 会把它抹掉
+  const ownedSessionId = ownedMetricsTarget
+  teardownMonitoring()
+  void releaseMetricsTarget(ownedSessionId)
+  // 会话关闭后缓存永远不会再被读到，留着只是占内存
+  metricsBySession.clear()
   clearTimeout(enterDebounceTimer)
   window.removeEventListener('mousemove', onMouseMove)
   window.removeEventListener('mouseup', onMouseUp)

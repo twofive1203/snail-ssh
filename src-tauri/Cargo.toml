@@ -16,6 +16,9 @@ tauri-build = { version = "2.0", features = [] }
 [dependencies]
 tauri = { version = "2.0", features = [] }
 tauri-plugin-dialog = "2.0"
+# 单实例锁：双开会让两个进程同时写 ~/.snail-ssh/hosts.json 与 settings.json 互相覆盖，
+# 该插件用命名互斥量拦住第二个进程，并把二次启动转成唤回已有窗口
+tauri-plugin-single-instance = "2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 # SSH 传输层：libssh2 在 Windows 上只支持 RSA 主机密钥且不支持 OpenSSH 证书，

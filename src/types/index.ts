@@ -340,4 +340,35 @@ export interface AppSettings {
   selectToCopy: boolean
   /** 终端内右键直接粘贴；Shift 或 Ctrl 再右键仍打开菜单 */
   pasteOnRightClick: boolean
+  /** 最近连接记录（原 localStorage `snail_ssh_recent`，现已并入 settings.json） */
+  recentHosts?: RecentHostRecord[]
+}
+
+/** 一条最近连接记录。hostId 为去重键，lastUsedAt 为毫秒时间戳。 */
+export interface RecentHostRecord {
+  hostId: string
+  name: string
+  host: string
+  port: number
+  username: string
+  lastUsedAt: number
+}
+
+/**
+ * 存储健康状态：由后端 `get_storage_health` 汇报。
+ * 钥匙串不可用时凭证会明文回退到 hosts.json，必须让用户看见而不是只写日志。
+ */
+export interface StorageHealth {
+  /** 系统钥匙串可用；false 表示凭证正在明文回退 */
+  keyringOk: boolean
+  /** 钥匙串不可用的原因（如无 Secret Service） */
+  keyringError?: string
+  /** hosts.json 可正常解析；false 表示已回退到备份或空列表 */
+  hostsFileOk: boolean
+  /** hosts.json 损坏或读取失败的原因 */
+  hostsFileError?: string
+  /** 本次启动实际使用的备份文件路径（发生过损坏回退时才有） */
+  restoredFromBackup?: string
+  /** 现存备份数量（用于设置中心展示「已保留 N 份自动备份」） */
+  backupCount: number
 }

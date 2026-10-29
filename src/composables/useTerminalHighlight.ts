@@ -74,6 +74,12 @@ export interface UseTerminalHighlightOptions {
 export interface TerminalHighlight {
   setEnabled(enabled: boolean): void
   isEnabled(): boolean
+  /**
+   * 工作区可见性开关：非活动（被 v-show 隐藏）时停扫。
+   * 停扫只是不排新的 rAF，水位线 lastScannedAbsoluteLine 原地保留，
+   * 切回时置 needsViewportScan 并重新调度，被跳过的那段输出会按水位线补齐，不会丢高亮。
+   */
+  setActive(active: boolean): void
   /** 热更新规则：清空旧装饰后重扫当前视口与近期输出 */
   setRules(rules: TerminalHighlightRule[]): void
   /** 当前缓冲区中 error 级别命中的绝对行号（升序），用于上一条/下一条错误导航 */
@@ -237,6 +243,8 @@ export function useTerminalHighlight(term: Terminal, options: UseTerminalHighlig
 
   let enabled = false
   let disposed = false
+  /** 非活动会话停扫标志：隐藏的终端看不见，继续跑正则/建 marker 只是白烧 CPU 与内存 */
+  let paused = false
   let lastScannedAbsoluteLine = 0
   let needsViewportScan = false
   let rafId: number | null = null
@@ -429,6 +437,8 @@ export function useTerminalHighlight(term: Terminal, options: UseTerminalHighlig
   const scan = () => {
     rafId = null
     if (disposed || !enabled) return
+    // 停扫期间已在途的这一帧直接放弃；水位线不动，切回时从这里继续
+    if (paused) return
     const buffer = term.buffer.active
     // alt buffer（vim/less/top/htop）不做高亮，避免干扰全屏交互程序
     if (buffer.type !== 'normal') {
@@ -492,8 +502,19 @@ export function useTerminalHighlight(term: Terminal, options: UseTerminalHighlig
   }
 
   const scheduleScan = () => {
-    if (disposed || !enabled || rafId !== null) return
+    if (disposed || !enabled || paused || rafId !== null) return
     rafId = requestAnimationFrame(scan)
+  }
+
+  /** 切换工作区可见性：隐藏时停扫，显示时补扫停扫期间的输出 */
+  const setActive = (active: boolean) => {
+    if (disposed) return
+    // 已经处于目标状态就不做无谓的补扫（重复调用 setActive(true) 不该触发全量重扫）
+    if (active === !paused) return
+    paused = !active
+    if (paused) return
+    needsViewportScan = true
+    scheduleScan()
   }
 
   /** 规则热更新：清空旧装饰后立即重扫视口与近期行 */
@@ -621,6 +642,7 @@ export function useTerminalHighlight(term: Terminal, options: UseTerminalHighlig
   return {
     setEnabled,
     isEnabled: () => enabled,
+    setActive,
     setRules,
     getProblemLines,
     dispose() {

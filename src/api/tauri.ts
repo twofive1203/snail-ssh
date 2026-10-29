@@ -16,6 +16,7 @@ import type {
   SftpFileItem,
   SftpProgressPayload,
   SshKeyInfo,
+  StorageHealth,
   TrustedEndpoint,
   TunnelStatus
 } from '@/types'
@@ -195,6 +196,21 @@ export async function deleteHostApi(id: string): Promise<void> {
   localStorage.setItem(MOCK_STORAGE_KEY, JSON.stringify(filtered))
 }
 
+/**
+ * 存储健康状态（钥匙串可用性 / hosts.json 是否损坏并回退备份）。
+ * 浏览器预览返回 null；后端未注册该命令时也返回 null——调用方只能按「未知」展示，
+ * 否则旧版本后端会让每个界面都弹出一次错误提示。
+ */
+export async function getStorageHealthApi(): Promise<StorageHealth | null> {
+  if (!isTauri()) return null
+  try {
+    return await invoke<StorageHealth>('get_storage_health')
+  } catch (err) {
+    console.warn('Tauri get_storage_health failed:', err)
+    return null
+  }
+}
+
 // ==========================================
 // 应用设置（~/.snail-ssh/settings.json）
 // ==========================================
@@ -284,6 +300,10 @@ export async function getSshSessionCwdApi(sessionId: string): Promise<string> {
 }
 
 let mockCpuTick = 1
+
+// 最后一次下发的采样目标。采样目标是后端全局状态，组件卸载收尾前要先看一眼
+// 是否已有别的会话接手，避免自己把新目标抹掉。
+let currentMetricsTarget: string | null = null
 export async function getRemoteMetricsApi(sessionId: string): Promise<RemoteSystemMetrics> {
   if (isTauri()) {
     return await invoke<RemoteSystemMetrics>('get_remote_metrics', { sessionId })
@@ -308,6 +328,39 @@ export async function getRemoteMetricsApi(sessionId: string): Promise<RemoteSyst
       { mountPoint: '/data', usePercent: 34, total: '500.0 GB', used: '170.0 GB' }
     ]
   }
+}
+
+/**
+ * 告诉后端当前该为哪个会话采样指标（null = 停止采样）。
+ * 采样后由后端主动推送 ssh-metrics-<sessionId>，前端不必再轮询；
+ * 该命令可能随后端改造尚未注册，失败只影响指标刷新，不能打断界面。
+ */
+export async function setMetricsTargetApi(sessionId: string | null): Promise<void> {
+  currentMetricsTarget = sessionId
+  if (!isTauri()) return
+  try {
+    await invoke('set_metrics_target', { sessionId })
+  } catch (err) {
+    console.warn('Tauri set_metrics_target failed:', err)
+  }
+}
+
+/** 当前前端认为的采样目标（仅用于卸载时判断是否该由自己清空） */
+export function getMetricsTargetApi(): string | null {
+  return currentMetricsTarget
+}
+
+/** 订阅后端推送的远端指标；浏览器预览没有事件，由调用方用 getRemoteMetricsApi 兜底 */
+export async function onSshMetrics(
+  sessionId: string,
+  callback: (metrics: RemoteSystemMetrics) => void
+): Promise<UnlistenFn> {
+  if (isTauri()) {
+    return await listen<RemoteSystemMetrics>(`ssh-metrics-${sessionId}`, (event) => {
+      callback(event.payload)
+    })
+  }
+  return () => {}
 }
 
 export async function onSshStdout(sessionId: string, callback: (data: string) => void): Promise<UnlistenFn> {

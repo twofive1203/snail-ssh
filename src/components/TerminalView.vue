@@ -1018,6 +1018,9 @@ const createSession = (tab: TerminalTab, container: HTMLDivElement): TerminalSes
   term.open(container)
   term.options.overviewRulerWidth = highlightSettings.overviewRuler ? 6 : 0
   session.highlight.setEnabled(highlightEnabled.value)
+  // 非当前工作区的终端虽然还挂在 DOM 上（v-show 隐藏），但看不见：建会话时就先停扫，
+  // 避免后台会话每次输出都跑正则、建 marker
+  session.highlight.setActive(props.active)
 
   // 搜索结果计数（仅在开启 search decorations 时触发）
   search.onDidChangeResults((result) => {
@@ -1854,6 +1857,16 @@ watch(() => settings.historySuggestEnabled, async (enabled) => {
 // 高亮开关：立即同步到所有终端
 watch(() => highlightSettings.enabled, (enabled) => {
   for (const session of sessions.values()) session.highlight.setEnabled(enabled)
+})
+
+/**
+ * 工作区可见性 -> 停扫/恢复扫描。
+ * 切回是安全的：useTerminalHighlight 只暂停排帧，扫描水位线 lastScannedAbsoluteLine 不被改动，
+ * 恢复时置 needsViewportScan 后从水位线继续增量扫，停扫期间写入的行会被补上，不会丢高亮。
+ * 卸载时 sessions 已清空、watch 也已随组件停止，不会对已 dispose 的实例调用。
+ */
+watch(() => props.active, (active) => {
+  for (const session of sessions.values()) session.highlight.setActive(active)
 })
 
 // 终端外观设置：改动即时应用到所有已打开实例，无需重开会话

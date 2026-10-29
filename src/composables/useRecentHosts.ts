@@ -1,53 +1,58 @@
-import { ref } from 'vue'
-import type { HostItem } from '@/types'
+import { computed, watch } from 'vue'
+import type { HostItem, RecentHostRecord } from '@/types'
+import { isRecentHostRecord, setRecentHosts, settings, settingsLoaded } from '@/composables/useAppSettings'
 
 /**
- * 最近连接记录（MVP 版，存 localStorage，不落 ~/.snail-ssh/）
- * 理由：这是纯 UI 辅助信息，丢失可接受；等引入「设置中心」后再统一迁到后端。
+ * 最近连接记录。
+ *
+ * 唯一数据源是 settings.recentHosts：桌面端随 settings.json 落在 ~/.snail-ssh/，
+ * 浏览器预览由 useAppSettings 自动降级到 localStorage（这里不写特例分支）。
+ * 早先单独存 localStorage 的 snail_ssh_recent 会随「清除站点数据」一起丢，也不跟用户换机迁移，
+ * 与「所有配置都在 ~/.snail-ssh/」的承诺不符，因此改为并入设置。
  */
-export interface RecentHostEntry {
-  hostId: string
-  name: string
-  host: string
-  port: number
-  username: string
-  lastUsedAt: number
-}
 
-const STORAGE_KEY = 'snail_ssh_recent'
+/** 旧版独立存储键，只用于下面的一次性迁移 */
+const LEGACY_STORAGE_KEY = 'snail_ssh_recent'
 /** 落盘上限，读取展示时只取前 N 条 */
 const MAX_STORE = 20
 export const MAX_RECENT_DISPLAY = 5
 
-const isValidEntry = (v: any): v is RecentHostEntry =>
-  !!v && typeof v.hostId === 'string' && typeof v.name === 'string' && typeof v.host === 'string'
+const recents = computed<RecentHostRecord[]>(() => settings.recentHosts ?? [])
 
-const loadFromStorage = (): RecentHostEntry[] => {
+/**
+ * 一次性迁移：把老版本留在 localStorage 的记录搬进 settings。
+ *
+ * 为什么搬完就删旧键：迁移判据是「settings 里为空」，若旧键留着，用户清空最近连接后
+ * 下次启动又会被旧数据「复活」，等于清不掉。删除旧键即宣告迁移结束，天然只做一次。
+ * 迁移失败（localStorage 不可用 / JSON 损坏）只是丢掉一条辅助信息，绝不能影响启动。
+ */
+let migrationAttempted = false
+const migrateLegacyRecents = () => {
+  if (migrationAttempted || !settingsLoaded.value) return
+  migrationAttempted = true
   try {
-    const raw = localStorage.getItem(STORAGE_KEY)
-    if (!raw) return []
-    const parsed = JSON.parse(raw)
-    if (!Array.isArray(parsed)) return []
-    return parsed.filter(isValidEntry).slice(0, MAX_STORE)
+    // settings.json 已有记录说明用户已在新版本写过，旧数据更陈旧，直接丢弃
+    if (recents.value.length > 0) {
+      localStorage.removeItem(LEGACY_STORAGE_KEY)
+      return
+    }
+    const raw = localStorage.getItem(LEGACY_STORAGE_KEY)
+    if (!raw) return
+    const parsed: unknown = JSON.parse(raw)
+    const valid = Array.isArray(parsed) ? parsed.filter(isRecentHostRecord).slice(0, MAX_STORE) : []
+    if (valid.length > 0) setRecentHosts(valid)
+    localStorage.removeItem(LEGACY_STORAGE_KEY)
   } catch {
-    return []
+    // 本次会话不再重试，但保留旧键，下次启动还有机会（例如隐私模式下一时读不到）
   }
 }
 
-// 模块级单例：所有调用方共享同一份响应式数据
-const recents = ref<RecentHostEntry[]>(loadFromStorage())
-
-const persist = () => {
-  try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(recents.value.slice(0, MAX_STORE)))
-  } catch {
-    // 隐私模式 / 配额满时静默降级，不影响主流程
-  }
-}
+// settings.json 是异步读的，而本模块在 App setup 阶段就被调用；等加载完成再迁，避免用默认值误判「settings 为空」
+watch(settingsLoaded, loaded => { if (loaded) migrateLegacyRecents() }, { immediate: true })
 
 /** 记录一次使用（按最近使用时间倒序，去重） */
 const touchRecent = (host: HostItem) => {
-  const entry: RecentHostEntry = {
+  const entry: RecentHostRecord = {
     hostId: host.id,
     name: host.name,
     host: host.host,
@@ -55,18 +60,15 @@ const touchRecent = (host: HostItem) => {
     username: host.username,
     lastUsedAt: Date.now()
   }
-  recents.value = [entry, ...recents.value.filter(r => r.hostId !== host.id)].slice(0, MAX_STORE)
-  persist()
+  setRecentHosts([entry, ...recents.value.filter(r => r.hostId !== host.id)].slice(0, MAX_STORE))
 }
 
 const removeRecent = (hostId: string) => {
-  recents.value = recents.value.filter(r => r.hostId !== hostId)
-  persist()
+  setRecentHosts(recents.value.filter(r => r.hostId !== hostId))
 }
 
 const clearRecents = () => {
-  recents.value = []
-  persist()
+  setRecentHosts([])
 }
 
 export function useRecentHosts() {

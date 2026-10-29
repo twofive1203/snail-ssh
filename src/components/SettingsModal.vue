@@ -361,6 +361,99 @@
             </section>
           </template>
 
+          <!-- ============ 存储与安全 ============ -->
+          <template v-else-if="activeTab === 'security'">
+            <section class="space-y-2">
+              <div class="flex items-center justify-between">
+                <div>
+                  <h3 class="text-xs font-semibold text-slate-200">存储与安全</h3>
+                  <p class="text-[10px] text-slate-500">凭证保管方式与 hosts.json 的落盘健康状态</p>
+                </div>
+                <button
+                  @click="refreshStorageHealth"
+                  :disabled="healthLoading"
+                  class="flex items-center gap-1 px-2.5 py-1 rounded-lg bg-surface-card hover:bg-surface-elevated border border-surface-border text-[11px] text-slate-300 hover:text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  <RefreshCw class="w-3 h-3" :class="healthLoading ? 'animate-spin' : ''" />
+                  <span>重新检测</span>
+                </button>
+              </div>
+
+              <!-- 查不到时只说查不到：旧后端 / 浏览器预览下不能渲染成故障 -->
+              <div
+                v-if="!storageHealth"
+                class="text-[11px] text-slate-500 py-6 text-center border border-dashed border-surface-border rounded-lg leading-relaxed"
+              >
+                未获取到存储状态（浏览器预览或后端版本较旧）
+              </div>
+
+              <template v-else>
+                <!-- 钥匙串正常 -->
+                <div v-if="storageHealth.keyringOk" class="flex items-start gap-2.5 p-2.5 rounded-lg bg-surface-card/60 border border-surface-border">
+                  <span class="mt-1 w-2 h-2 rounded-full bg-emerald-500 shrink-0"></span>
+                  <div>
+                    <p class="text-[11px] text-slate-200">凭证由系统钥匙串保管</p>
+                    <p class="text-[10px] text-slate-500 leading-relaxed">
+                      主机密码与私钥口令不会写入 <span class="font-mono">hosts.json</span>，该文件里只留标识与连接信息。
+                    </p>
+                  </div>
+                </div>
+
+                <!-- 钥匙串不可用：凭证正在明文落盘，必须让用户看见 -->
+                <div v-else class="p-2.5 rounded-lg bg-amber-500/10 border border-amber-500/30 space-y-1.5">
+                  <div class="flex items-center gap-1.5">
+                    <ShieldAlert class="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                    <span class="text-[11px] font-semibold text-amber-300">系统钥匙串不可用</span>
+                  </div>
+                  <p class="text-[10px] text-amber-200/80 leading-relaxed">
+                    凭证将以明文保存在 <span class="font-mono">~/.snail-ssh/hosts.json</span> 中，任何能读取该文件的进程都能拿到密码与私钥口令。
+                  </p>
+                  <p v-if="storageHealth.keyringError" class="text-[10px] text-amber-200/70 leading-relaxed font-mono break-all">
+                    {{ storageHealth.keyringError }}
+                  </p>
+                  <p class="text-[10px] text-slate-400 leading-relaxed">
+                    修复：Windows 在「服务」里重启 <span class="font-mono">Credential Manager</span>（凭据管理器）服务；
+                    Linux 需要可用的 Secret Service 实现（如 <span class="font-mono">gnome-keyring</span>），并保证应用运行在桌面会话内。
+                    修复后点「重新检测」。
+                  </p>
+                </div>
+
+                <!-- hosts.json 损坏并已回退到备份 -->
+                <div v-if="storageHealth.restoredFromBackup" class="p-2.5 rounded-lg bg-amber-500/10 border border-amber-500/30 space-y-1.5">
+                  <div class="flex items-center gap-1.5">
+                    <DatabaseBackup class="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                    <span class="text-[11px] font-semibold text-amber-300">已从备份恢复，请检查主机列表是否完整</span>
+                  </div>
+                  <p class="text-[10px] text-amber-200/80 leading-relaxed">
+                    hosts.json 读取失败后改用了自动备份，主机数量、分组与跳板关系以备份为准，缺失条目需要重新添加。
+                  </p>
+                  <p class="text-[10px] text-slate-400 leading-relaxed font-mono break-all">
+                    {{ storageHealth.restoredFromBackup }}
+                  </p>
+                </div>
+
+                <!-- 备份也没用上，只能回退空列表 -->
+                <div v-else-if="!storageHealth.hostsFileOk" class="p-2.5 rounded-lg bg-rose-500/10 border border-rose-500/30 space-y-1.5">
+                  <div class="flex items-center gap-1.5">
+                    <ShieldAlert class="w-3.5 h-3.5 text-rose-400 shrink-0" />
+                    <span class="text-[11px] font-semibold text-rose-300">hosts.json 不可读</span>
+                  </div>
+                  <p class="text-[10px] text-rose-200/80 leading-relaxed">
+                    本次启动没有可用的备份，主机列表可能为空；原始文件会留在原处，可手工修复后再重启应用。
+                  </p>
+                  <p v-if="storageHealth.hostsFileError" class="text-[10px] text-rose-200/70 leading-relaxed font-mono break-all">
+                    {{ storageHealth.hostsFileError }}
+                  </p>
+                </div>
+
+                <div class="flex items-center justify-between px-2.5 py-2 rounded-lg bg-surface-card/60 border border-surface-border text-[11px]">
+                  <span class="text-slate-300">已保留 {{ storageHealth.backupCount }} 份自动备份</span>
+                  <span class="text-[10px] text-slate-500 font-mono">~/.snail-ssh/hosts.json</span>
+                </div>
+              </template>
+            </section>
+          </template>
+
           <!-- ============ 快捷键 ============ -->
           <template v-else>
             <section class="space-y-2">
@@ -419,7 +512,7 @@
 
 <script setup lang="ts">
 import { ref, watch, onMounted, onBeforeUnmount } from 'vue'
-import { Settings, X, Plus, Trash2, ChevronUp, ChevronDown, RotateCcw, TerminalSquare, Zap, Bookmark, Layers, Keyboard } from 'lucide-vue-next'
+import { Settings, X, Plus, Trash2, ChevronUp, ChevronDown, RotateCcw, TerminalSquare, Zap, Bookmark, Layers, Keyboard, ShieldAlert, DatabaseBackup, RefreshCw } from 'lucide-vue-next'
 import {
   settings,
   TERMINAL_THEMES,
@@ -429,6 +522,8 @@ import {
   flushSettings
 } from '@/composables/useAppSettings'
 import { confirmDialog, dialogState } from '@/composables/useDialog'
+import { getStorageHealthApi } from '@/api/tauri'
+import type { StorageHealth } from '@/types'
 
 const props = defineProps<{ open: boolean; initialTab?: string }>()
 const emit = defineEmits<{
@@ -441,6 +536,7 @@ const tabs = [
   { key: 'snippets', label: '命令片段', icon: Zap },
   { key: 'bookmarks', label: '目录书签', icon: Bookmark },
   { key: 'groups', label: '主机分组', icon: Layers },
+  { key: 'security', label: '存储与安全', icon: ShieldAlert },
   { key: 'shortcuts', label: '快捷键', icon: Keyboard }
 ] as const
 
@@ -464,6 +560,20 @@ const shortcutList = [
 ]
 
 const uid = (prefix: string) => `${prefix}-${Date.now()}-${Math.floor(Math.random() * 1000)}`
+
+// 存储健康状态：null 同时代表「浏览器预览 / 后端未注册命令 / 尚未拉取」，一律按未知展示
+const storageHealth = ref<StorageHealth | null>(null)
+const healthLoading = ref(false)
+
+const refreshStorageHealth = async () => {
+  if (healthLoading.value) return
+  healthLoading.value = true
+  try {
+    storageHealth.value = await getStorageHealthApi()
+  } finally {
+    healthLoading.value = false
+  }
+}
 
 const addSnippet = () => {
   settings.snippets.push({ id: uid('snip'), label: '', cmd: '' })
@@ -532,12 +642,17 @@ const onKeydown = (e: KeyboardEvent) => {
 
 watch(() => props.open, (val) => {
   if (val) {
-    // 侧边栏入口可指定要打开的分区
+    // 侧边栏与标题栏入口可指定要打开的分区（'security' 即标题栏钥匙串徽标）
     const target = tabs.find(t => t.key === props.initialTab)
     activeTab.value = (target?.key as TabKey) || activeTab.value
   } else {
     void flushSettings()
   }
+})
+
+// 只在真正看到该分区时拉一次，避免打开设置就无条件 invoke；刷新靠「重新检测」按钮
+watch([() => props.open, activeTab], ([open, tab]) => {
+  if (open && tab === 'security' && !storageHealth.value) void refreshStorageHealth()
 })
 
 onMounted(() => window.addEventListener('keydown', onKeydown))

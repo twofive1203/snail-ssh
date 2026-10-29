@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
 use std::sync::Arc;
@@ -30,6 +30,10 @@ const BANNER_QUIET_GAP: Duration = Duration::from_millis(60);
 const BANNER_FIRST_BYTE_TIMEOUT: Duration = Duration::from_millis(400);
 /// 首屏抓取的总上限，避免远端持续刷输出导致建连迟迟不返回
 const BANNER_MAX_WAIT: Duration = Duration::from_millis(800);
+
+/// 远程监控采样周期。与前端原先每会话 2.5s 的 setInterval 对齐；
+/// 现在只有一条常驻任务按这个周期采「当前活动会话」，不再随会话数线性增长。
+const METRICS_SAMPLE_INTERVAL: Duration = Duration::from_millis(2500);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SshConnectConfig {
@@ -150,6 +154,89 @@ struct LogSink {
 
 /// 会话日志缓冲上限：写线程跟不上时丢弃而不是阻塞终端读线程
 const LOG_CHANNEL_CAPACITY: usize = 256;
+
+/// 单个日志文件上限（每主机）。滚动后旧文件不再参与大小检查，因此每主机实际占用上限是它的两倍。
+const LOG_MAX_BYTES: u64 = 50 * 1024 * 1024;
+
+/// 过期日志的保留天数。写成常量而不是命令参数，避免前端把它放大成"清空全部日志"。
+const LOG_PRUNE_MAX_AGE_DAYS: u64 = 7;
+
+/// 日志落盘状态：writer 线程独占文件句柄与已写字节数。
+/// 计数刻意不放进 LogSink——LogSink 是读线程看得见的句柄，把滚动判断留在落盘侧
+/// 才能保证终端输出不因为一次 rename 卡顿。
+struct SessionLogWriter {
+    path: PathBuf,
+    file: fs::File,
+    written: u64,
+}
+
+impl SessionLogWriter {
+    fn new(path: PathBuf, file: fs::File) -> Self {
+        // File::create 已经截断文件，这里仍按磁盘实际长度起步：
+        // 以后若改成追加打开，计数也不会从 0 重新累积。
+        let written = file.metadata().map(|m| m.len()).unwrap_or(0);
+        Self {
+            path,
+            file,
+            written,
+        }
+    }
+
+    /// 返回 false 表示磁盘写入已失败，调用方应停止继续写。
+    fn write_chunk(&mut self, chunk: &str) -> bool {
+        if chunk.is_empty() {
+            return true;
+        }
+        if should_roll_log(self.written) && !self.roll() {
+            // 滚动失败就不再继续写：继续写会把单文件推过上限，失去 50MB 约束的意义
+            eprintln!(
+                "[snail-ssh] 会话日志滚动失败，本次记录已停止: {}",
+                self.path.display()
+            );
+            return false;
+        }
+        if self.file.write_all(chunk.as_bytes()).is_err() {
+            return false;
+        }
+        self.written += chunk.len() as u64;
+        true
+    }
+
+    fn roll(&mut self) -> bool {
+        let _ = self.file.flush();
+        let rolled = rolled_log_path(&self.path);
+        // Windows 上目标文件被其它句柄占用时 rename 会失败，先显式删掉旧备份
+        let _ = fs::remove_file(&rolled);
+        if fs::rename(&self.path, &rolled).is_err() {
+            return false;
+        }
+        match fs::File::create(&self.path) {
+            Ok(file) => {
+                self.file = file;
+                self.written = 0;
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    fn flush(&mut self) {
+        let _ = self.file.flush();
+    }
+}
+
+/// 是否该把当前文件滚动到 .1：达到阈值才动，避免每个 chunk 都去算路径。
+/// 写入前先判定，所以单文件最多比阈值多出一个 chunk，不会持续长。
+fn should_roll_log(written: u64) -> bool {
+    written >= LOG_MAX_BYTES
+}
+
+/// 滚动目标的文件名：`<原名>.1`，与 prune_session_logs 的后缀判定保持一致。
+fn rolled_log_path(path: &Path) -> PathBuf {
+    let mut rolled = path.as_os_str().to_os_string();
+    rolled.push(".1");
+    PathBuf::from(rolled)
+}
 
 /// 落盘前脱敏的敏感键（小写匹配，要求词边界）
 const SECRET_KEYS: [&str; 9] = [
@@ -390,6 +477,94 @@ fn push_log(
     }
 }
 
+/// 会话日志文件名判定：`.log` 是正在写的文件，`.log.1` 是滚动出来的上一份。
+fn is_session_log_file(path: &Path) -> bool {
+    match path.file_name().and_then(|name| name.to_str()) {
+        Some(name) => name.ends_with(".log") || name.ends_with(".log.1"),
+        None => false,
+    }
+}
+
+/// 删除 `logs/` 下修改时间超过 `max_age_days` 的会话日志，返回删除的文件数。
+/// 日志是明文且不轮转，长期不清理会静静吃满磁盘，所以启动时顺手扫一遍；
+/// 单点失败只告警不中断（清理失败不应该阻止应用启动），也不跟随符号链接以免误删目录树外文件。
+pub fn prune_session_logs(max_age_days: u64) -> Result<u64, String> {
+    let root = crate::storage::app_data_dir().join("logs");
+    if !root.is_dir() {
+        return Ok(0);
+    }
+    let cutoff = SystemTime::now()
+        .checked_sub(Duration::from_secs(max_age_days.saturating_mul(86_400)))
+        .unwrap_or(UNIX_EPOCH);
+
+    let mut removed = 0u64;
+    let host_dirs = match fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(err) => {
+            eprintln!(
+                "[snail-ssh] 读取会话日志目录失败 {}: {}",
+                root.display(),
+                err
+            );
+            return Ok(0);
+        }
+    };
+
+    for host_entry in host_dirs.flatten() {
+        // DirEntry::file_type 不跟随符号链接，链接目录在这里就被排除
+        if !host_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let host_dir = host_entry.path();
+        let files = match fs::read_dir(&host_dir) {
+            Ok(entries) => entries,
+            Err(err) => {
+                eprintln!(
+                    "[snail-ssh] 读取日志目录失败 {}: {}",
+                    host_dir.display(),
+                    err
+                );
+                continue;
+            }
+        };
+
+        for file_entry in files.flatten() {
+            // 只删普通文件：符号链接、子目录一律跳过
+            if !file_entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                continue;
+            }
+            let path = file_entry.path();
+            if !is_session_log_file(&path) {
+                continue;
+            }
+            let expired = file_entry
+                .metadata()
+                .and_then(|meta| meta.modified())
+                .map(|mtime| mtime < cutoff)
+                .unwrap_or(false);
+            if !expired {
+                continue;
+            }
+            match fs::remove_file(&path) {
+                Ok(()) => removed += 1,
+                Err(err) => eprintln!(
+                    "[snail-ssh] 删除过期会话日志失败 {}: {}",
+                    path.display(),
+                    err
+                ),
+            }
+        }
+    }
+
+    Ok(removed)
+}
+
+/// 启动时自动清理的入口：保留天数固定 7 天，前端无从传参；
+/// lib.rs 的命令只负责把它包进 run_blocking 并登记到 generate_handler。
+pub fn auto_prune_session_logs() -> Result<u64, String> {
+    prune_session_logs(LOG_PRUNE_MAX_AGE_DAYS)
+}
+
 /// 终端会话：shell 通道本体由输出泵任务独占，其余线程通过指令通道操作它。
 pub struct ActiveSession {
     /// 终端连接：shell 输出泵、工作目录探测、一次性 exec 都跑在这条连接上
@@ -420,10 +595,68 @@ struct ShellHandle {
     task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
+/// 后台采样的目标槽：只保存当前活动会话 id，None 表示不采样。
+///
+/// 单独包一层而不是裸 `Option<String>`，是为了让「切会话 → 采样目标随之切换」
+/// 这类纯逻辑能脱离真实 SSH 连接做单测。
+#[derive(Default)]
+struct MetricsTargetSlot {
+    session_id: Option<String>,
+}
+
+impl MetricsTargetSlot {
+    fn set(&mut self, session_id: Option<String>) {
+        self.session_id = session_id;
+    }
+
+    fn current(&self) -> Option<&str> {
+        self.session_id.as_deref()
+    }
+
+    /// 关闭会话时清目标：只有正在被采样的那个会话需要清，返回是否真的清了。
+    /// 不清的话后台会一直对着已断开的连接 exec，每轮都失败。
+    fn clear_if(&mut self, session_id: &str) -> bool {
+        if self.session_id.as_deref() == Some(session_id) {
+            self.session_id = None;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// 采样错误去重：会话断开后同一个错误每 2.5s 都会复现，
+/// 只在「与上次报告的错误不同」时返回 true，避免日志刷屏；采样成功后 clear 复位。
+#[derive(Default)]
+struct MetricsErrorThrottle {
+    last_reported: Option<String>,
+}
+
+impl MetricsErrorThrottle {
+    fn should_report(&mut self, error: &str) -> bool {
+        if self.last_reported.as_deref() == Some(error) {
+            return false;
+        }
+        self.last_reported = Some(error.to_string());
+        true
+    }
+
+    fn clear(&mut self) {
+        self.last_reported = None;
+    }
+}
+
 #[derive(Clone)]
 pub struct SshManager {
     sessions: Arc<Mutex<HashMap<String, Arc<ActiveSession>>>>,
     metrics_cache: Arc<Mutex<HashMap<String, RemoteMetricsSnapshot>>>,
+    /// 后台采样目标槽。用「换目标」而不是「启停任务」驱动采样，
+    /// 免去任务启停与前端时序之间的竞态。
+    metrics_target: Arc<Mutex<MetricsTargetSlot>>,
+    /// 采样任务只启动一次的守卫
+    metrics_watcher_started: Arc<AtomicBool>,
+    /// 目标变更时的立即唤醒：切到新会话不等整个周期就能出第一帧数据
+    metrics_wake: Arc<tokio::sync::Notify>,
 }
 
 impl SshManager {
@@ -431,6 +664,9 @@ impl SshManager {
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             metrics_cache: Arc::new(Mutex::new(HashMap::new())),
+            metrics_target: Arc::new(Mutex::new(MetricsTargetSlot::default())),
+            metrics_watcher_started: Arc::new(AtomicBool::new(false)),
+            metrics_wake: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -555,6 +791,8 @@ impl SshManager {
 
     pub fn close_session(&self, session_id: &str) -> Result<(), String> {
         self.metrics_cache.lock().remove(session_id);
+        // 被关的会话若正是采样目标，立刻停采样，别让后台继续撞已断开的连接
+        self.metrics_target.lock().clear_if(session_id);
         let active = self.sessions.lock().remove(session_id);
         if let Some(active) = active {
             active.is_alive.store(false, Ordering::Relaxed);
@@ -610,15 +848,17 @@ impl SshManager {
             host_label,
             format_timestamp(started)
         );
+        let writer_path = path.clone();
         std::thread::spawn(move || {
-            let mut file = file;
-            let _ = file.write_all(header.as_bytes());
+            // 路径与句柄一起交给落盘侧：滚动只在这里发生，读线程不参与
+            let mut writer = SessionLogWriter::new(writer_path, file);
+            let _ = writer.write_chunk(&header);
             while let Ok(chunk) = rx.recv() {
-                if file.write_all(chunk.as_bytes()).is_err() {
+                if !writer.write_chunk(&chunk) {
                     break;
                 }
             }
-            let _ = file.flush();
+            writer.flush();
         });
 
         *active.log_sink.lock() = Some(LogSink { path: path.clone(), tx });
@@ -723,7 +963,10 @@ impl SshManager {
         active.conn.exec(command)
     }
 
-    /// 采集远端主机实时系统指标（MobaXterm 风格底部监控条），复用终端连接瞬态 exec
+    /// 采集远端主机实时系统指标（MobaXterm 风格底部监控条），复用终端连接瞬态 exec。
+    ///
+    /// 前端正常路径已改成订阅后台采样任务广播的 `ssh-metrics-<session_id>`，
+    /// 这里保留同步入口供浏览器预览 / 测试 / 一次性拉取使用，解析与基线更新走同一个内部函数。
     pub fn get_remote_metrics(&self, session_id: &str) -> Result<RemoteSystemMetrics, String> {
         let active = self.get_active(session_id)?;
         if !active.is_alive.load(Ordering::Relaxed) {
@@ -732,12 +975,86 @@ impl SshManager {
 
         let default_host = active.config.host.clone();
         let output = active.conn.exec(REMOTE_METRICS_SCRIPT)?;
+        Ok(self.apply_metrics_output(session_id, &output, &default_host))
+    }
 
-        let prev_snap = self.metrics_cache.lock().get(session_id).cloned();
-        let (metrics, new_snap) = parse_remote_metrics(&output, prev_snap, &default_host);
-        self.metrics_cache.lock().insert(session_id.to_string(), new_snap);
+    /// 切换后台采样目标：前端切活动会话 / 开关监控条时调用，None 表示停止采样。
+    pub fn set_metrics_target(&self, session_id: Option<String>) {
+        self.metrics_target.lock().set(session_id);
+        // 换目标立即采一次：否则切回会话要先干等一个采样周期才出数据
+        self.metrics_wake.notify_one();
+    }
 
-        Ok(metrics)
+    /// 启动后台监控采样任务：每 `METRICS_SAMPLE_INTERVAL` 对目标会话采一次样并广播
+    /// `ssh-metrics-<session_id>`。幂等，重复调用只生效一次。
+    ///
+    /// 采样走 `exec_async` 而不是阻塞的 `Conn::exec`：本任务就住在 rt 运行时里，
+    /// 在异步上下文内 `block_on` 会 panic；同时也避免每条会话占一个阻塞线程，
+    /// 把线程让给 SFTP / 传输。
+    pub fn start_metrics_watcher(&self, app: AppHandle) {
+        if self.metrics_watcher_started.swap(true, Ordering::SeqCst) {
+            return;
+        }
+
+        let manager = self.clone();
+        let wake = Arc::clone(&self.metrics_wake);
+        rt::spawn(async move {
+            let mut errors = MetricsErrorThrottle::default();
+            loop {
+                // 被目标变更唤醒时立刻采一帧，否则按固定周期采样。
+                // 放在循环开头（而非末尾）是为了「刚切过去」也能马上有数据。
+                let _ = tokio::time::timeout(METRICS_SAMPLE_INTERVAL, wake.notified()).await;
+                // 只在取目标这一瞬间持锁，采样与 emit 期间都不握锁
+                let target = manager.metrics_target.lock().current().map(str::to_string);
+                let Some(session_id) = target else {
+                    // 没目标说明监控关了或切走了，复位去重状态，下次重新告警
+                    errors.clear();
+                    continue;
+                };
+
+                match manager.sample_metrics_async(&session_id).await {
+                    Ok(metrics) => {
+                        errors.clear();
+                        let _ = app.emit(&format!("ssh-metrics-{}", session_id), metrics);
+                    }
+                    Err(err) => {
+                        if errors.should_report(&err) {
+                            eprintln!("[snail-ssh] 远程监控采样失败（{}）: {}", session_id, err);
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    /// 后台单次采样：异步 exec + 更新速率基线
+    async fn sample_metrics_async(&self, session_id: &str) -> Result<RemoteSystemMetrics, String> {
+        let active = self.get_active(session_id)?;
+        if !active.is_alive.load(Ordering::Relaxed) {
+            return Err("会话已断开".into());
+        }
+
+        let default_host = active.config.host.clone();
+        let output = active
+            .conn
+            .exec_async(REMOTE_METRICS_SCRIPT, crate::conn::EXEC_TIMEOUT)
+            .await?;
+        Ok(self.apply_metrics_output(session_id, &output, &default_host))
+    }
+
+    /// 解析脚本输出并刷新该会话的速率基线。
+    /// 必须用上一次快照做差值基准（CPU 与网络速率），否则第一次之后永远是 0 或跳变。
+    fn apply_metrics_output(
+        &self,
+        session_id: &str,
+        output: &str,
+        default_host: &str,
+    ) -> RemoteSystemMetrics {
+        let mut cache = self.metrics_cache.lock();
+        let prev_snap = cache.get(session_id).cloned();
+        let (metrics, new_snap) = parse_remote_metrics(output, prev_snap, default_host);
+        cache.insert(session_id.to_string(), new_snap);
+        metrics
     }
 }
 
@@ -1282,6 +1599,51 @@ mod tests {
     }
 
     #[test]
+    fn should_roll_log_only_at_limit() {
+        assert!(!should_roll_log(0));
+        assert!(!should_roll_log(LOG_MAX_BYTES - 1));
+        // 达到阈值即滚动（写入前判定，所以单文件最多超出一个 chunk）
+        assert!(should_roll_log(LOG_MAX_BYTES));
+        assert!(should_roll_log(LOG_MAX_BYTES + 1));
+    }
+
+    #[test]
+    fn rolled_log_path_appends_numbered_suffix() {
+        let path = Path::new("/tmp/logs/host/20240101_000000_abcd.log");
+        let rolled = rolled_log_path(path);
+        assert_eq!(
+            rolled.file_name().unwrap(),
+            std::ffi::OsStr::new("20240101_000000_abcd.log.1")
+        );
+        // 滚动文件仍要被 prune_session_logs 识别，否则清理会漏掉备份
+        assert!(is_session_log_file(&rolled));
+        assert!(is_session_log_file(path));
+        assert!(!is_session_log_file(Path::new(
+            "/tmp/logs/host/20240101_000000_abcd.txt"
+        )));
+    }
+
+    #[test]
+    fn reaching_limit_rolls_current_file() {
+        let dir = std::env::temp_dir().join(format!("snail-ssh-log-roll-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("20240101_000000_abcd.log");
+        let file = fs::File::create(&path).unwrap();
+
+        let mut writer = SessionLogWriter::new(path.clone(), file);
+        // 直接推到阈值，避免测试真的写 50MB
+        writer.written = LOG_MAX_BYTES;
+        assert!(writer.write_chunk("after roll\n"));
+        assert_eq!(writer.written, "after roll\n".len() as u64);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "after roll\n");
+        assert!(rolled_log_path(&path).is_file());
+
+        drop(writer);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn parse_usage_percent_computes_ratio() {
         assert_eq!(parse_usage_percent("1024 512"), Some(50));
         assert_eq!(parse_usage_percent("8192 2048"), Some(25));
@@ -1298,6 +1660,84 @@ mod tests {
         // 无时间推进时无法计算
         assert_eq!(cpu_usage_percent(&before, &before), None);
         assert_eq!(cpu_usage_percent(&[1, 2], &[3, 4]), None);
+    }
+
+    #[test]
+    fn metrics_target_slot_holds_only_active_session() {
+        let mut slot = MetricsTargetSlot::default();
+        // 前端没设目标时后台不采样
+        assert_eq!(slot.current(), None);
+
+        slot.set(Some("ssh-a".into()));
+        assert_eq!(slot.current(), Some("ssh-a"));
+
+        // 切会话是覆盖而非排队：只采当前活动会话
+        slot.set(Some("ssh-b".into()));
+        assert_eq!(slot.current(), Some("ssh-b"));
+
+        // 关监控清空目标 => 停止采样
+        slot.set(None);
+        assert_eq!(slot.current(), None);
+    }
+
+    #[test]
+    fn metrics_target_slot_clears_only_for_matching_session() {
+        let mut slot = MetricsTargetSlot::default();
+        slot.set(Some("ssh-a".into()));
+
+        // 关其他会话不影响当前采样目标
+        assert!(!slot.clear_if("ssh-b"));
+        assert_eq!(slot.current(), Some("ssh-a"));
+
+        assert!(slot.clear_if("ssh-a"));
+        assert_eq!(slot.current(), None);
+        // 已清空后重复关闭同一会话不再算「清过」
+        assert!(!slot.clear_if("ssh-a"));
+    }
+
+    #[test]
+    fn metrics_error_is_reported_once_until_recovery() {
+        let mut throttle = MetricsErrorThrottle::default();
+        // 断开后同一错误每轮都会复现：只第一次打印
+        assert!(throttle.should_report("会话已断开"));
+        assert!(!throttle.should_report("会话已断开"));
+        assert!(!throttle.should_report("会话已断开"));
+
+        // 换了另一类错误仍应可见
+        assert!(throttle.should_report("执行命令失败"));
+
+        // 采样成功后复位，之后再次断开要重新告警
+        throttle.clear();
+        assert!(throttle.should_report("执行命令失败"));
+    }
+
+    #[test]
+    fn metrics_sample_reuses_cached_snapshot_as_baseline() {
+        let manager = SshManager::new();
+        // 首次采样没有基线，CPU 无从计算
+        let first = manager.apply_metrics_output(
+            "ssh-a",
+            "HOSTNAME:box\nCPU:cpu 100 0 100 800\n",
+            "fallback",
+        );
+        assert_eq!(first.cpu, 0);
+        assert_eq!(first.hostname, "box");
+
+        // 第二次基于上一次快照：total 1000→1400、idle 800→1000 => 50%
+        let second = manager.apply_metrics_output(
+            "ssh-a",
+            "HOSTNAME:box\nCPU:cpu 200 0 200 1000\n",
+            "fallback",
+        );
+        assert_eq!(second.cpu, 50);
+
+        // 基线按会话隔离：另一个会话拿不到 ssh-a 的快照
+        let other = manager.apply_metrics_output(
+            "ssh-b",
+            "HOSTNAME:other\nCPU:cpu 200 0 200 1000\n",
+            "fallback",
+        );
+        assert_eq!(other.cpu, 0);
     }
 
     #[test]

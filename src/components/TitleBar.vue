@@ -109,6 +109,16 @@
         <span class="hidden sm:inline">新建</span>
       </button>
 
+      <!-- 钥匙串异常提醒：徽标常驻，避免凭证明文回退只写日志没人看见 -->
+      <button
+        v-if="keyringBroken"
+        @click="$emit('open-settings', 'security')"
+        class="p-1.5 rounded-md bg-amber-500/15 border border-amber-500/40 text-amber-400 hover:bg-amber-500/25 hover:text-amber-300 transition-colors mr-2"
+        title="系统钥匙串不可用，凭证将以明文保存在 hosts.json；点击查看详情"
+      >
+        <ShieldAlert class="w-3.5 h-3.5" />
+      </button>
+
       <!-- 系统设置 -->
       <button
         @click="$emit('open-settings')"
@@ -160,7 +170,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { computed, ref, onMounted } from 'vue'
 import {
   Search,
   ArrowUpDown,
@@ -169,11 +179,12 @@ import {
   Server,
   X,
   Minus,
-  Square
+  Square,
+  ShieldAlert
 } from 'lucide-vue-next'
-import { isTauri } from '@/api/tauri'
+import { getStorageHealthApi, isTauri } from '@/api/tauri'
 import { groupById, groupColorOf } from '@/composables/useAppSettings'
-import type { HostSession } from '@/types'
+import type { HostSession, StorageHealth } from '@/types'
 
 withDefaults(
   defineProps<{
@@ -192,13 +203,17 @@ const emit = defineEmits<{
   (e: 'open-palette'): void
   (e: 'toggle-transfers'): void
   (e: 'open-new-host'): void
-  (e: 'open-settings'): void
+  (e: 'open-settings', tab?: string): void
   (e: 'select-session', sessionId: string): void
   (e: 'close-session', sessionId: string): void
   (e: 'close-window'): void
 }>()
 
 const isMaximized = ref(false)
+
+// null 视为未知（浏览器预览或后端未注册命令），只在明确 keyringOk === false 时告警
+const storageHealth = ref<StorageHealth | null>(null)
+const keyringBroken = computed(() => storageHealth.value?.keyringOk === false)
 
 const checkMaximized = async () => {
   if (isTauri()) {
@@ -245,6 +260,11 @@ const handleHeaderDblClick = (e: MouseEvent) => {
 }
 
 onMounted(async () => {
+  // 启动后只拉一次，不做轮询：钥匙串状态在进程生命周期内不会自愈，用户可在设置中心重新检测
+  void getStorageHealthApi().then((health) => {
+    storageHealth.value = health
+  })
+
   if (isTauri()) {
     await checkMaximized()
     try {

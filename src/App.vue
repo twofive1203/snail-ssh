@@ -11,7 +11,7 @@
       @open-palette="paletteOpen = true"
       @toggle-transfers="transfersOpen = !transfersOpen"
       @open-new-host="openNewHostModal"
-      @open-settings="openSettings()"
+      @open-settings="openSettings"
       @close-window="handleCloseWindow"
     />
 

@@ -294,6 +294,20 @@ async fn get_log_dir() -> Result<String, String> {
     .await
 }
 
+/// 清理超过保留期的会话日志（固定 7 天，无参数）。
+/// 参数故意不暴露给前端：日志清理是后台卫生工作，没必要让界面能指定任意保留期。
+#[tauri::command]
+async fn prune_session_logs() -> Result<u64, String> {
+    run_blocking(ssh::auto_prune_session_logs).await
+}
+
+/// 汇报存储健康状态：钥匙串是否可用、hosts.json 是否完好、是否刚从备份恢复。
+/// 纯读内存静态量 + 统计备份文件数，不涉及网络或钥匙串访问，无需 run_blocking。
+#[tauri::command]
+fn get_storage_health() -> Result<storage::StorageHealth, String> {
+    Ok(storage::get_health())
+}
+
 /// 在系统文件管理器中打开路径。仅允许应用数据目录（`~/.snail-ssh/`）下的路径，
 /// 防止前端被任意传参变成“打开任意路径”。
 fn reveal_path(path: &str) -> Result<(), String> {
@@ -340,6 +354,13 @@ async fn get_remote_metrics(
 ) -> Result<RemoteSystemMetrics, String> {
     let manager = ssh_manager.inner().clone();
     run_blocking(move || manager.get_remote_metrics(&session_id)).await
+}
+
+/// 告诉后台采样器「现在该采哪个会话」。
+/// 只改一个目标锁，不碰网络，同步命令即可；传 None 表示停止采样。
+#[tauri::command]
+fn set_metrics_target(session_id: Option<String>, ssh_manager: State<'_, SshManager>) {
+    ssh_manager.inner().set_metrics_target(session_id);
 }
 
 // ==========================================
@@ -709,6 +730,16 @@ fn submit_ssh_auth_prompt(request_id: String, responses: Option<Vec<String>>) ->
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        // single-instance 必须是第一个注册的插件：它要在其它插件和 setup 之前拦下第二个实例，
+        // 否则双开会同时写 hosts.json / settings.json。
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            // 二次启动只负责唤回；找不到主窗口就静默跳过，不能 unwrap 把已有会话带走
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_dialog::init())
         .manage(SshManager::new())
         .manage(TransferRegistry::new())
@@ -719,6 +750,17 @@ pub fn run() {
                     let _ = window.set_icon(icon.clone());
                 }
             }
+            // 启动时清理过期会话日志（固定 7 天）：日志是明文且不自动轮转，
+            // 没人清理就会一直堆到占满磁盘。放到后台线程，不拖慢窗口显示。
+            std::thread::spawn(|| {
+                if let Err(err) = ssh::auto_prune_session_logs() {
+                    eprintln!("[snail-ssh] 清理过期会话日志失败: {}", err);
+                }
+            });
+            // 远程监控改为后端单条定时任务：只采「当前活动会话」，结果经事件推给前端，
+            // 前端不再为每个会话各开一条 setInterval。幂等，重复调用无副作用。
+            app.state::<SshManager>()
+                .start_metrics_watcher(app.handle().clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -739,8 +781,11 @@ pub fn run() {
             set_session_logging,
             get_session_log_path,
             get_log_dir,
+            prune_session_logs,
+            get_storage_health,
             reveal_in_file_manager,
             get_remote_metrics,
+            set_metrics_target,
             get_command_history,
             push_command_history,
             import_command_history,

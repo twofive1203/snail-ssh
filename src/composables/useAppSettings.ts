@@ -1,5 +1,5 @@
 import { reactive, ref, watch } from 'vue'
-import type { AppSettings, BookmarkItem, HostGroupItem, SnippetItem, TerminalSettings } from '@/types'
+import type { AppSettings, BookmarkItem, HostGroupItem, RecentHostRecord, SnippetItem, TerminalSettings } from '@/types'
 import { getSettingsApi, isTauri, saveSettingsApi } from '@/api/tauri'
 
 /**
@@ -188,6 +188,20 @@ const DEFAULT_TERMINAL: TerminalSettings = {
   themeId: 'snail-dark'
 }
 
+/**
+ * 最近连接条数上限。与 useRecentHosts 的 MAX_STORE 同义，但这里必须独立声明：
+ * useRecentHosts 依赖本模块（settings 是唯一数据源），反向 import 会形成循环依赖。
+ */
+const RECENT_HOSTS_LIMIT = 20
+
+/**
+ * 一条最近连接记录的结构校验。
+ * 放在这里而不是 useRecentHosts：settings.json 可能被手工编辑，读盘归一化必须先过滤，
+ * 老数据迁移也复用同一个谓词，避免两处规则各自漂移。
+ */
+export const isRecentHostRecord = (v: any): v is RecentHostRecord =>
+  !!v && typeof v.hostId === 'string' && typeof v.name === 'string' && typeof v.host === 'string'
+
 export const defaultSettings = (): AppSettings => ({
   terminal: { ...DEFAULT_TERMINAL },
   snippets: DEFAULT_SNIPPETS.map(s => ({ ...s })),
@@ -197,7 +211,8 @@ export const defaultSettings = (): AppSettings => ({
   historySuggestEnabled: true,
   remoteMonitorEnabled: true,
   selectToCopy: true,
-  pasteOnRightClick: true
+  pasteOnRightClick: true,
+  recentHosts: []
 })
 
 /** 旧版选中即复制只写在 localStorage；settings 缺字段时继承，避免升级把用户关过的开关又打开 */
@@ -266,7 +281,21 @@ export const normalizeSettings = (raw: any): AppSettings => {
     historySuggestEnabled: typeof raw.historySuggestEnabled === 'boolean' ? raw.historySuggestEnabled : base.historySuggestEnabled,
     remoteMonitorEnabled: typeof raw.remoteMonitorEnabled === 'boolean' ? raw.remoteMonitorEnabled : base.remoteMonitorEnabled,
     selectToCopy: typeof raw.selectToCopy === 'boolean' ? raw.selectToCopy : legacySelectToCopy(),
-    pasteOnRightClick: typeof raw.pasteOnRightClick === 'boolean' ? raw.pasteOnRightClick : base.pasteOnRightClick
+    pasteOnRightClick: typeof raw.pasteOnRightClick === 'boolean' ? raw.pasteOnRightClick : base.pasteOnRightClick,
+    recentHosts: Array.isArray(raw.recentHosts)
+      ? raw.recentHosts
+          .filter(isRecentHostRecord)
+          .slice(0, RECENT_HOSTS_LIMIT)
+          .map((r: any) => ({
+            hostId: r.hostId,
+            name: r.name,
+            host: r.host,
+            // 端口/用户名/时间可能被手改或来自旧版本，补成合法值，别让侧边栏显示 NaN
+            port: Number.isFinite(Number(r.port)) ? Math.round(Number(r.port)) : 22,
+            username: typeof r.username === 'string' ? r.username : '',
+            lastUsedAt: Number.isFinite(Number(r.lastUsedAt)) ? Number(r.lastUsedAt) : 0
+          }))
+      : base.recentHosts
   }
 }
 
@@ -287,6 +316,7 @@ const applySettings = (next: AppSettings) => {
   settings.remoteMonitorEnabled = next.remoteMonitorEnabled
   settings.selectToCopy = next.selectToCopy
   settings.pasteOnRightClick = next.pasteOnRightClick
+  settings.recentHosts = next.recentHosts
   // 同步 watch 在下一个 tick 才跑，这里用微任务兜底恢复标志，避免漏掉用户紧接的修改
   void Promise.resolve().then(() => { applying = false })
 }
@@ -339,6 +369,15 @@ export const scheduleSaveSettings = () => {
     saveTimer = null
     void persistNow()
   }, SAVE_DEBOUNCE_MS)
+}
+
+/**
+ * 最近连接写回。
+ * 只改内存里的 settings，落盘交给模块底部那个 deep watch + 防抖，
+ * 避免为最近连接另开一条持久化路径（两条路径会互相覆盖对方的字段）。
+ */
+export const setRecentHosts = (list: RecentHostRecord[]) => {
+  settings.recentHosts = list
 }
 
 /** 立即落盘（关闭设置弹窗 / 恢复默认值时使用） */
