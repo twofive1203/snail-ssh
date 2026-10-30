@@ -33,12 +33,12 @@
           @open-vault="vaultOpen = true"
           @open-tunnels="tunnelsOpen = true"
           @open-settings="openSettings"
-          @open-local-terminal="openLocalWorkspace"
         />
 
-        <!-- 主机资产管理视图 -->
+        <!-- 主机资产管理视图 / 本地目录列表。两者都留在资产壳里，侧边栏不卸掉。 -->
         <main class="flex-1 flex flex-col overflow-hidden bg-surface-base relative">
           <HostManager
+            v-show="assetPage === 'hosts'"
             :hosts="hosts"
             :selected-group="selectedGroup"
             @connect-ssh="handleConnectSsh"
@@ -47,6 +47,12 @@
             @delete-host="handleDeleteHost"
             @open-new-host="openNewHostModal"
             @import-export="importOpen = true"
+          />
+          <LocalFolderManager
+            v-show="assetPage === 'local-folders'"
+            @open-folder="openCatalogFolder"
+            @open-home="openHomeFolder"
+            @toast="triggerToast"
           />
         </main>
       </div>
@@ -91,6 +97,7 @@
         @close-other-terminal-tabs="(idx: number) => handleCloseOtherLocalTabs(idx)"
         @close-tabs-after="(idx: number) => handleCloseLocalTabsAfter(idx)"
         @session-closed="handleLocalSessionClosed"
+        @show-folder-list="showLocalFolderList"
         @toast="triggerToast"
       />
 
@@ -141,6 +148,7 @@
       @close="paletteOpen = false"
       @select-host="handleConnectSsh"
       @action="handlePaletteAction"
+      @open-local-folder="openLocalFolderById"
     />
 
     <!-- 弹窗 4: 应用内确认 / 文本输入（替代原生 confirm / prompt） -->
@@ -184,6 +192,7 @@ import { ref, reactive, computed, onMounted, onBeforeUnmount } from 'vue'
 import TitleBar from '@/components/TitleBar.vue'
 import Sidebar from '@/components/Sidebar.vue'
 import HostManager from '@/components/HostManager.vue'
+import LocalFolderManager from '@/components/LocalFolderManager.vue'
 import SessionWorkspace from '@/components/SessionWorkspace.vue'
 import LocalWorkspace from '@/components/LocalWorkspace.vue'
 import TransferDrawer from '@/components/TransferDrawer.vue'
@@ -200,9 +209,10 @@ import Toast from '@/components/Toast.vue'
 import { confirmDialog, promptDialog, dialogState } from '@/composables/useDialog'
 import { useRecentHosts, MAX_RECENT_DISPLAY } from '@/composables/useRecentHosts'
 import { loadSettings, groupById, settings } from '@/composables/useAppSettings'
-import type { AuthPromptEvent, FileDragDropEvent, HostItem, HostSession, LocalWorkspace as LocalWorkspaceSession, RemoteFileRef, SftpFileItem, TransferContext, TransferTask, ToastMessage, TrustedEndpoint, WorkspaceSession } from '@/types'
+import type { AuthPromptEvent, FileDragDropEvent, HostItem, HostSession, LocalFolderItem, LocalWorkspace as LocalWorkspaceSession, RemoteFileRef, SftpFileItem, TerminalTab, TransferContext, TransferTask, ToastMessage, TrustedEndpoint, WorkspaceSession } from '@/types'
 import { isHostSession, isLocalWorkspace } from '@/types'
 import { splitShellArgs } from '@/utils/shellArgs'
+import { LOCAL_HOME_FOLDER_ID } from '@/utils/localFolder'
 import { parseHostKeyError } from '@/utils/hostKey'
 import {
   getHostsApi,
@@ -229,7 +239,14 @@ import {
 
 // 核心多会话状态
 const activeSessionId = ref<string>(isTauri() ? 'hosts' : 'session-demo-144')
+/** 资产壳里的页。不是会话，不能写进 activeSessionId，否则侧边栏会跟着卸掉。 */
+const assetPage = ref<'hosts' | 'local-folders'>('hosts')
 const selectedGroup = ref<string>('all')
+
+const showLocalFolderList = () => {
+  assetPage.value = 'local-folders'
+  activeSessionId.value = 'hosts'
+}
 
 // 数据状态
 const hosts = ref<HostItem[]>([])
@@ -360,11 +377,15 @@ const dismissToast = (id: string) => {
 }
 
 const handleSelectSession = (sessionId: string) => {
+  // 顶栏「主机资产」必须回到主机列表。只改 activeSessionId 会把用户留在目录页。
+  if (sessionId === 'hosts') assetPage.value = 'hosts'
   activeSessionId.value = sessionId
 }
 
 const currentActiveView = computed(() => {
-  if (activeSessionId.value === 'hosts') return 'hosts'
+  if (activeSessionId.value === 'hosts') {
+    return assetPage.value === 'local-folders' ? 'local-folders' : 'hosts'
+  }
   const current = sessions.value.find(s => s.id === activeSessionId.value)
   if (current && isHostSession(current) && current.workspaceMode === 'sftp') return 'sftp'
   return 'terminal'
@@ -372,7 +393,12 @@ const currentActiveView = computed(() => {
 
 const handleSidebarSwitchView = (v: string) => {
   if (v === 'hosts') {
+    assetPage.value = 'hosts'
     activeSessionId.value = 'hosts'
+    return
+  }
+  if (v === 'local-folders') {
+    showLocalFolderList()
     return
   }
   const hostsOnly = hostSessions.value
@@ -581,71 +607,128 @@ const handleCloseSession = async (sessionId: string) => {
   triggerToast(`已关闭会话 ${s.title}`, 'info')
 }
 
-const localLaunchInput = () => ({
+const localLaunchInput = (cwd: string | null) => ({
   program: settings.localShell.program.trim() || null,
   args: splitShellArgs(settings.localShell.args),
-  cwd: settings.localShell.cwd.trim() || null,
+  cwd: cwd?.trim() || null,
   cols: 80,
   rows: 24
 })
 
-const openLocalWorkspace = async () => {
-  const existing = sessions.value.find(isLocalWorkspace)
-  if (existing) {
-    activeSessionId.value = existing.id
-    return
+/** 清单里还在的目录用当前路径；删掉的目录用标签上的启动快照。主目录保留 id 始终传空 cwd。 */
+const launchCwdForTab = (tab: TerminalTab): string | null => {
+  if (tab.folderId === LOCAL_HOME_FOLDER_ID) return null
+  if (tab.folderId) {
+    const folder = settings.localFolders.find(item => item.id === tab.folderId)
+    if (folder) return folder.path
   }
-  if (!isTauri()) {
+  return tab.cwd?.trim() || null
+}
+
+const lastLocalTabIndex = (session: LocalWorkspaceSession, folderId: string) => {
+  let found = -1
+  session.terminalTabs.forEach((tab, index) => {
+    if (tab.folderId === folderId) found = index
+  })
+  return found
+}
+
+let openingLocalFolder = false
+
+const openLocalTarget = async (target: { folderId: string; title: string; cwd: string | null }, forceNew = false) => {
+  const existing = sessions.value.find(isLocalWorkspace)
+  if (!forceNew && existing) {
+    const index = lastLocalTabIndex(existing, target.folderId)
+    if (index >= 0) {
+      existing.activeTerminalIndex = index
+      activeSessionId.value = existing.id
+      return
+    }
+  }
+  if (openingLocalFolder) return
+  openingLocalFolder = true
+  try {
+    if (!isTauri()) {
+      const tab: TerminalTab = {
+        id: `local-preview-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        uiId: makeTabUiId(),
+        hostId: 'local',
+        title: target.title,
+        sub: '预览',
+        connected: true,
+        transport: 'local',
+        folderId: target.folderId,
+        cwd: target.cwd || ''
+      }
+      attachLocalTab(tab)
+      return
+    }
+
+    let created: Awaited<ReturnType<typeof createLocalSessionApi>>
+    try {
+      created = await createLocalSessionApi(localLaunchInput(target.cwd))
+    } catch (e: any) {
+      triggerToast(`打开本地终端失败: ${e?.message || e}`, 'error')
+      return
+    }
+    const tab: TerminalTab = {
+      id: created.sessionId,
+      uiId: makeTabUiId(),
+      hostId: 'local',
+      title: target.title,
+      sub: created.label,
+      connected: true,
+      transport: 'local',
+      shellKind: created.kind,
+      folderId: target.folderId,
+      cwd: target.cwd || ''
+    }
+    // 加号是在已有工作区上追加。创建期间工作区被关掉时，不能留下一个没挂上的进程。
+    if (forceNew && !sessions.value.some(isLocalWorkspace)) {
+      await closeLocalSessionApi(created.sessionId).catch(() => {})
+      return
+    }
+    try {
+      attachLocalTab(tab)
+    } catch (e) {
+      await closeLocalSessionApi(created.sessionId).catch(() => {})
+      triggerToast('本地终端没能打开', 'error')
+    }
+  } finally {
+    openingLocalFolder = false
+  }
+}
+
+const attachLocalTab = (tab: TerminalTab) => {
+  const existing = sessions.value.find(isLocalWorkspace)
+  if (!existing) {
     const session: LocalWorkspaceSession = {
       kind: 'local',
       id: LOCAL_WORKSPACE_ID,
       title: '本地终端',
-      terminalTabs: [{
-        id: 'local-preview',
-        uiId: makeTabUiId(),
-        hostId: 'local',
-        title: '本地终端',
-        sub: '预览',
-        connected: true,
-        transport: 'local'
-      }],
+      terminalTabs: [tab],
       activeTerminalIndex: 0
     }
     sessions.value.push(session)
     activeSessionId.value = session.id
     return
   }
+  existing.terminalTabs.push(tab)
+  existing.activeTerminalIndex = existing.terminalTabs.length - 1
+  activeSessionId.value = existing.id
+}
 
-  let created: Awaited<ReturnType<typeof createLocalSessionApi>>
-  try {
-    created = await createLocalSessionApi(localLaunchInput())
-  } catch (e: any) {
-    triggerToast(`打开本地终端失败: ${e?.message || e}`, 'error')
-    return
-  }
-  const session: LocalWorkspaceSession = {
-    kind: 'local',
-    id: LOCAL_WORKSPACE_ID,
-    title: '本地终端',
-    terminalTabs: [{
-      id: created.sessionId,
-      uiId: makeTabUiId(),
-      hostId: 'local',
-      title: '终端 1',
-      sub: created.label,
-      connected: true,
-      transport: 'local',
-      shellKind: created.kind
-    }],
-    activeTerminalIndex: 0
-  }
-  try {
-    sessions.value.push(session)
-    activeSessionId.value = session.id
-  } catch (e) {
-    await closeLocalSessionApi(created.sessionId).catch(() => {})
-    triggerToast('本地终端没能打开', 'error')
-  }
+const openCatalogFolder = (folder: LocalFolderItem) => {
+  void openLocalTarget({ folderId: folder.id, title: folder.label, cwd: folder.path })
+}
+
+const openHomeFolder = () => {
+  void openLocalTarget({ folderId: LOCAL_HOME_FOLDER_ID, title: '用户主目录', cwd: null })
+}
+
+const openLocalFolderById = (folderId: string) => {
+  const folder = settings.localFolders.find(item => item.id === folderId)
+  if (folder) openCatalogFolder(folder)
 }
 
 const handleCloseLocalTab = async (session: LocalWorkspaceSession, index: number) => {
@@ -672,45 +755,14 @@ const handleCloseLocalTab = async (session: LocalWorkspaceSession, index: number
 
 const handleAddLocalTab = async () => {
   const session = sessions.value.find(isLocalWorkspace)
-  if (!session) {
-    await openLocalWorkspace()
-    return
-  }
-  if (!isTauri()) {
-    session.terminalTabs.push({
-      id: `local-preview-${Date.now()}`,
-      uiId: makeTabUiId(),
-      hostId: 'local',
-      title: `终端 ${session.terminalTabs.length + 1}`,
-      sub: '预览',
-      connected: true,
-      transport: 'local'
-    })
-    session.activeTerminalIndex = session.terminalTabs.length - 1
-    return
-  }
-  let created: Awaited<ReturnType<typeof createLocalSessionApi>>
-  try {
-    created = await createLocalSessionApi(localLaunchInput())
-  } catch (e: any) {
-    triggerToast(`打开本地终端失败: ${e?.message || e}`, 'error')
-    return
-  }
-  if (!sessions.value.some(item => item.id === session.id)) {
-    await closeLocalSessionApi(created.sessionId).catch(() => {})
-    return
-  }
-  session.terminalTabs.push({
-    id: created.sessionId,
-    uiId: makeTabUiId(),
-    hostId: 'local',
-    title: `终端 ${session.terminalTabs.length + 1}`,
-    sub: created.label,
-    connected: true,
-    transport: 'local',
-    shellKind: created.kind
-  })
-  session.activeTerminalIndex = session.terminalTabs.length - 1
+  const tab = session?.terminalTabs[session.activeTerminalIndex]
+  // 没有活动标签就不猜目录。加号不是「打开主目录」的入口。
+  if (!session || !tab?.folderId) return
+  await openLocalTarget({
+    folderId: tab.folderId,
+    title: tab.title,
+    cwd: launchCwdForTab(tab)
+  }, true)
 }
 
 const handleReconnectLocalTab = async (index: number) => {
@@ -719,14 +771,16 @@ const handleReconnectLocalTab = async (index: number) => {
   if (!session || !tab || tab.reconnecting) return
   tab.reconnecting = true
   const oldId = tab.id
+  const cwd = launchCwdForTab(tab)
   try {
     if (!isTauri()) {
       tab.connected = true
       tab.closeReason = undefined
+      tab.cwd = cwd || ''
       return
     }
     if (oldId.startsWith('local-')) closeLocalSessionApi(oldId).catch(() => {})
-    const created = await createLocalSessionApi(localLaunchInput())
+    const created = await createLocalSessionApi(localLaunchInput(cwd))
     if (!session.terminalTabs.includes(tab)) {
       await closeLocalSessionApi(created.sessionId).catch(() => {})
       return
@@ -736,8 +790,12 @@ const handleReconnectLocalTab = async (index: number) => {
     tab.shellKind = created.kind
     tab.connected = true
     tab.closeReason = undefined
+    tab.cwd = cwd || ''
     triggerToast(`已重新打开 ${tab.title}`, 'success')
   } catch (e: any) {
+    // 旧进程已经关掉。保留原标签和原会话 id，但标成失败，避免看起来还连着。
+    tab.connected = false
+    tab.closeReason = String(e?.message || e)
     triggerToast(`重新打开失败: ${e?.message || e}`, 'error')
   } finally {
     tab.reconnecting = false
@@ -1331,7 +1389,7 @@ const handlePaletteAction = (act: string) => {
   if (act === 'quick-connect') openQuickConnect()
   if (act === 'toggle-transfers') transfersOpen.value = !transfersOpen.value
   if (act === 'open-settings') openSettings()
-  if (act === 'open-local-terminal') void openLocalWorkspace()
+  if (act === 'open-local-terminal') showLocalFolderList()
 }
 
 /** 打开设置中心；`tab` 可直接定位到某个分区（侧边栏入口用） */

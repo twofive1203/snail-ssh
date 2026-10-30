@@ -32,9 +32,10 @@
       </button>
 
       <button
-        @click="$emit('open-local-terminal')"
-        class="w-full flex items-center justify-between px-2.5 py-2 rounded-lg text-xs font-medium transition-all text-surface-subtle hover:text-slate-200 hover:bg-surface-card"
-        title="打开本机 PowerShell。已打开时只是聚焦，不新建第二个工作区"
+        @click="$emit('switch-view', 'local-folders')"
+        :class="activeView === 'local-folders' ? 'bg-brand-500/15 text-emerald-400 border-l-2 border-brand-500' : 'text-surface-subtle hover:text-slate-200 hover:bg-surface-card'"
+        class="w-full flex items-center justify-between px-2.5 py-2 rounded-lg text-xs font-medium transition-all"
+        title="打开本地目录列表"
       >
         <div class="flex items-center gap-2.5">
           <SquareTerminal class="w-4 h-4 text-sky-400" />
@@ -208,7 +209,7 @@ import type { HostItem } from '@/types'
 import { settings, groupById, groupColorOf } from '@/composables/useAppSettings'
 
 const props = defineProps<{
-  activeView: 'hosts' | 'terminal' | 'sftp'
+  activeView: 'hosts' | 'terminal' | 'sftp' | 'local-folders'
   selectedGroup: string
   totalHosts: number
   activeSessionsCount: number
@@ -217,13 +218,12 @@ const props = defineProps<{
 }>()
 
 defineEmits<{
-  (e: 'switch-view', view: 'hosts' | 'terminal' | 'sftp'): void
+  (e: 'switch-view', view: 'hosts' | 'terminal' | 'sftp' | 'local-folders'): void
   (e: 'filter-group', group: string): void
   (e: 'connect-host', host: HostItem): void
   (e: 'open-vault'): void
   (e: 'open-tunnels'): void
   (e: 'open-settings', tab?: string): void
-  (e: 'open-local-terminal'): void
 }>()
 
 /**

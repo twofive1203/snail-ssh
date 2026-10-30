@@ -70,7 +70,10 @@ export interface TerminalTab {
   closeReason?: string
   /** 正在重建连接（避免重复点击重连） */
   reconnecting?: boolean
+  /** SSH 为当前目录；本地终端为启动路径快照，不跟踪之后的 cd */
   cwd?: string
+  /** 本地目录清单 id。主目录动作使用保留 id，不写入清单。 */
+  folderId?: string
   /** 是否让左侧文件工作区跟随本标签页的终端目录（Tab 维度，默认关闭） */
   autoFollowTerminal?: boolean
   /** 缺省是 SSH。本地终端不走主机通道。 */
@@ -336,6 +339,13 @@ export interface BookmarkItem {
   path: string
 }
 
+/** 本机目录清单。只决定下次打开本地终端时用哪条路径，不是主机，也不进 hosts.json。 */
+export interface LocalFolderItem {
+  id: string
+  label: string
+  path: string
+}
+
 /** 主机分组：颜色用于标签页/工作区环境标识，danger 触发危险命令确认 */
 export interface HostGroupItem {
   id: string
@@ -363,13 +373,16 @@ export interface AppSettings {
   pasteOnRightClick: boolean
   /** 最近连接记录（原 localStorage `snail_ssh_recent`，现已并入 settings.json） */
   recentHosts?: RecentHostRecord[]
-  /** 本地终端。程序和目录留空表示自动探测；已打开的进程不因保存而重启。 */
+  /** 本机目录清单。缺字段时为空列表；旧的单一工作目录只在字段本身不存在时迁移一次。 */
+  localFolders: LocalFolderItem[]
+  /** 本地终端程序与参数。工作目录不再由这里决定；已打开的进程不因保存而重启。 */
   localShell: LocalShellSettings
 }
 
 export interface LocalShellSettings {
   program: string
   args: string
+  /** 旧配置字段。读入后固定为空，不再作为启动目录。 */
   cwd: string
 }
 

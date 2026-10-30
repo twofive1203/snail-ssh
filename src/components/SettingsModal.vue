@@ -169,11 +169,12 @@
               <div class="pt-2 border-t border-surface-border/60 space-y-2">
                 <h3 class="text-xs font-semibold text-slate-200">本地终端</h3>
                 <p class="text-[10px] text-slate-500 leading-relaxed">
-                  Windows 上留空时按这个顺序找 shell：PATH 里的 PowerShell 7（pwsh）、
+                  工作目录在侧边栏「本地终端」的目录列表里维护，这里不再设置单一路径。
+                  Windows 上程序留空时按这个顺序找 shell：PATH 里的 PowerShell 7（pwsh）、
                   <span class="font-mono">Program Files\PowerShell\7\pwsh.exe</span>、
                   Windows PowerShell、cmd。macOS / Linux 则是 <span class="font-mono">$SHELL</span>、bash、sh。
                   参数按空格和引号拆开，不会经过 <span class="font-mono">cmd /c</span>。
-                  保存后只影响之后新开的标签和「重新打开」，已经在跑的进程不会重启。
+                  保存后只影响之后新开的标签和「重新打开」，已经在跑的进程不会重启，改目录列表也不会换掉正在跑的进程。
                 </p>
                 <div class="space-y-1.5">
                   <label class="text-[11px] text-slate-400">程序（留空则自动探测 PowerShell 7）</label>
@@ -192,16 +193,6 @@
                     type="text"
                     spellcheck="false"
                     placeholder="例如 -NoLogo -NoProfile"
-                    class="w-full bg-surface-card border border-surface-border rounded-lg px-3 py-2 text-xs text-white focus:outline-none focus:border-brand-500 transition-colors font-mono"
-                  />
-                </div>
-                <div class="space-y-1.5">
-                  <label class="text-[11px] text-slate-400">工作目录（留空则用用户主目录）</label>
-                  <input
-                    v-model="settings.localShell.cwd"
-                    type="text"
-                    spellcheck="false"
-                    placeholder="例如 D:\work"
                     class="w-full bg-surface-card border border-surface-border rounded-lg px-3 py-2 text-xs text-white focus:outline-none focus:border-brand-500 transition-colors font-mono"
                   />
                 </div>

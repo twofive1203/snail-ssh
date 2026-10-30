@@ -1,6 +1,7 @@
 import { reactive, ref, watch } from 'vue'
 import type { AppSettings, BookmarkItem, HostGroupItem, RecentHostRecord, SnippetItem, TerminalSettings } from '@/types'
 import { getSettingsApi, isTauri, saveSettingsApi } from '@/api/tauri'
+import { localFoldersFromSettings, settingsMigratedLocalCwd } from '@/utils/localFolder'
 
 /**
  * 应用设置单例。
@@ -213,6 +214,7 @@ export const defaultSettings = (): AppSettings => ({
   selectToCopy: true,
   pasteOnRightClick: true,
   recentHosts: [],
+  localFolders: [],
   localShell: { program: '', args: '', cwd: '' }
 })
 
@@ -297,6 +299,7 @@ export const normalizeSettings = (raw: any): AppSettings => {
             lastUsedAt: Number.isFinite(Number(r.lastUsedAt)) ? Number(r.lastUsedAt) : 0
           }))
       : base.recentHosts,
+    localFolders: localFoldersFromSettings(raw),
     localShell: normalizeLocalShell(raw.localShell)
   }
 }
@@ -307,7 +310,8 @@ const normalizeLocalShell = (raw: any): AppSettings['localShell'] => {
   return {
     program: text(source.program).trim(),
     args: text(source.args),
-    cwd: text(source.cwd).trim()
+    // 启动目录改由 localFolders 决定。这里清空，避免旧 cwd 在每次保存后又变回隐式工作目录。
+    cwd: ''
   }
 }
 
@@ -329,6 +333,7 @@ const applySettings = (next: AppSettings) => {
   settings.selectToCopy = next.selectToCopy
   settings.pasteOnRightClick = next.pasteOnRightClick
   settings.recentHosts = next.recentHosts
+  settings.localFolders = next.localFolders
   settings.localShell = next.localShell
   // 同步 watch 在下一个 tick 才跑，这里用微任务兜底恢复标志，避免漏掉用户紧接的修改
   void Promise.resolve().then(() => { applying = false })
@@ -351,8 +356,11 @@ export const loadSettings = async () => {
       // 浏览器预览下 localStorage 不可用时直接用默认值
     }
   }
+  const migratedLocalCwd = settingsMigratedLocalCwd(raw)
   applySettings(normalizeSettings(raw))
   settingsLoaded.value = true
+  // 迁移必须落盘：否则磁盘上仍然没有目录字段，下次启动会把同一条 cwd 再插一次，而且 id 会变。
+  if (migratedLocalCwd) await flushSettings()
 }
 
 let saveTimer: number | null = null

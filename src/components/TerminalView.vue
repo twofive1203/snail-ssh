@@ -18,7 +18,7 @@
             :class="[tab.connected ? groupColorDot : 'bg-rose-500', tab.connected ? 'animate-pulse' : '']"
             :title="transport === 'local' ? (tab.sub || '本地终端') : currentGroup.label"
           ></span>
-          <span class="font-mono font-medium">{{ tab.title }}</span>
+          <span class="font-mono font-medium" :title="transport === 'local' ? localTabPathTitle(tab) : undefined">{{ tab.title }}</span>
           <span class="text-[10px] font-mono text-slate-500 hidden sm:inline">{{ tab.sub }}</span>
           <button
             @click.stop="$emit('close-tab', idx)"
@@ -32,7 +32,7 @@
         <button
           @click="$emit('add-tab')"
           class="p-1 rounded-md text-surface-subtle hover:text-white hover:bg-surface-card transition-colors ml-1"
-          :title="transport === 'local' ? '打开新的本地终端' : '连接新的服务器终端'"
+          :title="transport === 'local' ? '按当前标签的启动目录再开一个进程' : '连接新的服务器终端'"
         >
           <Plus class="w-4 h-4" />
         </button>
@@ -40,6 +40,16 @@
 
       <!-- 终端操作按钮组：展开文件树、查找、清屏 -->
       <div class="flex items-center gap-1 text-xs">
+        <button
+          v-if="transport === 'local'"
+          @click="$emit('show-folder-list')"
+          class="flex items-center gap-1.5 px-2 py-1 rounded bg-surface-card hover:bg-surface-elevated border border-surface-border hover:border-sky-500/40 text-sky-300 text-xs font-medium transition-all"
+          title="返回本地目录列表"
+        >
+          <FolderOpen class="w-3.5 h-3.5" />
+          <span class="hidden sm:inline">目录列表</span>
+        </button>
+
         <!-- 会话日志录制指示 -->
         <span
           v-if="currentLogging"
@@ -457,6 +467,7 @@ import { useTerminalHighlight, type TerminalHighlight } from '@/composables/useT
 import { compileHighlightRules, highlightSettings } from '@/composables/useHighlightSettings'
 import { settings, currentTerminalTheme, groupById, groupColorOf } from '@/composables/useAppSettings'
 import { detectDangerousCommand } from '@/utils/commandSafety'
+import { LOCAL_HOME_FOLDER_ID } from '@/utils/localFolder'
 import type { CommandHistoryEntry, ContextMenuItem, TerminalTab } from '@/types'
 import {
   writeSshSessionApi,
@@ -521,6 +532,7 @@ const emit = defineEmits<{
   (e: 'session-closed', tabId: string, reason: string): void
   (e: 'terminal-cwd-change', tabId: string, cwd: string): void
   (e: 'terminal-enter', tabId: string): void
+  (e: 'show-folder-list'): void
   (e: 'toast', msg: string, type: 'info' | 'success' | 'warning' | 'error'): void
 }>()
 
@@ -595,6 +607,12 @@ const suggestBarVisible = computed(() =>
 )
 
 const isLocalTransport = computed(() => props.transport === 'local')
+
+/** 本地标签的提示是启动路径。主目录没有快照路径，不能显示成空标题。 */
+const localTabPathTitle = (tab: TerminalTab) => {
+  if (tab.folderId === LOCAL_HOME_FOLDER_ID) return '用户主目录'
+  return tab.cwd || tab.title
+}
 
 const hostKeyFor = (tab: TerminalTab): string => {
   if (isLocalTransport.value) return `local:${tab.shellKind || 'shell'}`

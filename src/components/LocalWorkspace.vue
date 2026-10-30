@@ -14,6 +14,7 @@
       @close-other-tabs="idx => emit('close-other-terminal-tabs', idx)"
       @close-tabs-after="idx => emit('close-tabs-after', idx)"
       @session-closed="(tabId, reason) => emit('session-closed', tabId, reason)"
+      @show-folder-list="emit('show-folder-list')"
       @toast="(msg, type) => emit('toast', msg, type)"
     />
   </section>
@@ -37,6 +38,7 @@ const emit = defineEmits<{
   (e: 'close-other-terminal-tabs', index: number): void
   (e: 'close-tabs-after', index: number): void
   (e: 'session-closed', tabId: string, reason: string): void
+  (e: 'show-folder-list'): void
   (e: 'toast', msg: string, type: 'info' | 'success' | 'warning' | 'error'): void
 }>()
 </script>

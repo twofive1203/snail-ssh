@@ -54,6 +54,22 @@
         </div>
 
         <!-- 系统快捷命令 -->
+        <template v-if="matchedFolders.length > 0">
+          <div class="text-[10px] font-mono text-slate-500 uppercase px-2 py-1 mt-2">本地目录</div>
+          <div
+            v-for="folder in matchedFolders"
+            :key="folder.id"
+            @click="$emit('open-local-folder', folder.id); $emit('close')"
+            class="flex items-center justify-between gap-3 px-3 py-2 rounded-lg hover:bg-brand-500/10 text-xs text-slate-200 hover:text-brand-300 cursor-pointer"
+          >
+            <span class="flex items-center gap-2 min-w-0">
+              <Folder class="w-3.5 h-3.5 text-sky-400 shrink-0" />
+              <span class="truncate">{{ folder.label }}</span>
+            </span>
+            <span class="text-[10px] font-mono text-slate-500 truncate max-w-[45%]" :title="folder.path">{{ folder.path }}</span>
+          </div>
+        </template>
+
         <div class="text-[10px] font-mono text-slate-500 uppercase px-2 py-1 mt-2">系统动作</div>
         <div
           @click="$emit('action', 'new-host'); $emit('close')"
@@ -95,7 +111,7 @@
         >
           <span class="flex items-center gap-2">
             <SquareTerminal class="w-3.5 h-3.5 text-sky-400" />
-            <span>打开本地终端（PowerShell）</span>
+            <span>打开本地目录列表</span>
           </span>
         </div>
 
@@ -116,8 +132,9 @@
 
 <script setup lang="ts">
 import { ref, computed, watch, nextTick, onMounted, onBeforeUnmount } from 'vue'
-import { Search, Terminal, PlusCircle, ArrowUpDown, History, Zap, Settings, SquareTerminal } from 'lucide-vue-next'
+import { Search, Terminal, PlusCircle, ArrowUpDown, History, Zap, Settings, SquareTerminal, Folder } from 'lucide-vue-next'
 import type { HostItem } from '@/types'
+import { settings } from '@/composables/useAppSettings'
 
 const props = defineProps<{
   open: boolean
@@ -130,6 +147,7 @@ const emit = defineEmits<{
   (e: 'close'): void
   (e: 'select-host', host: HostItem): void
   (e: 'action', act: string): void
+  (e: 'open-local-folder', folderId: string): void
 }>()
 
 const query = ref('')
@@ -149,6 +167,14 @@ const localActionVisible = computed(() => {
   return ['本地', 'powershell', 'pwsh', 'local', 'shell', '终端'].some(key => q.includes(key))
 })
 
+const matchedFolders = computed(() => {
+  const q = query.value.trim().toLowerCase()
+  if (!q) return []
+  return settings.localFolders.filter(folder =>
+    folder.label.toLowerCase().includes(q) || folder.path.toLowerCase().includes(q)
+  )
+})
+
 watch(() => props.open, (val) => {
   if (val) {
     query.value = ''
@@ -163,6 +189,13 @@ const onKeydown = (e: KeyboardEvent) => {
   if (!props.open) return
   if (e.key === 'Escape') {
     e.preventDefault()
+    emit('close')
+    return
+  }
+  // 查询命中唯一目录时，回车直接打开，不必再点一行。
+  if (e.key === 'Enter' && matchedFolders.value.length === 1) {
+    e.preventDefault()
+    emit('open-local-folder', matchedFolders.value[0].id)
     emit('close')
   }
 }
