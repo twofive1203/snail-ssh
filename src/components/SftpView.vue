@@ -489,23 +489,34 @@ const isAllSelected = computed(() => {
   return selectable.length > 0 && selectable.every(f => selectedFileNames.value.has(f.name))
 })
 
+// 传输完成会刷新所有已打开的 SFTP 视图。慢的旧列目录不能盖掉后发的结果，
+// 否则刚传上的文件会从列表里消失，看起来像没触发上传。
+let listSeq = 0
+
 const loadFiles = async () => {
   // 没有会话时不发请求，避免出现"会话不存在"的报错
   if (!props.activeSessionId) {
+    listSeq++
     files.value = []
     selectedFileNames.value.clear()
+    loading.value = false
     return
   }
 
+  const seq = ++listSeq
+  const sessionId = props.activeSessionId
+  const path = currentPath.value
   loading.value = true
   try {
-    const list = await sftpReadDirApi(props.activeSessionId, currentPath.value)
+    const list = await sftpReadDirApi(sessionId, path)
+    if (seq !== listSeq) return
     files.value = list
     selectedFileNames.value.clear()
   } catch (err: any) {
+    if (seq !== listSeq) return
     emit('toast', `加载目录失败: ${err?.message || err}`, 'error')
   } finally {
-    loading.value = false
+    if (seq === listSeq) loading.value = false
   }
 }
 

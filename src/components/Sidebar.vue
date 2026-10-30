@@ -32,6 +32,17 @@
       </button>
 
       <button
+        @click="$emit('open-local-terminal')"
+        class="w-full flex items-center justify-between px-2.5 py-2 rounded-lg text-xs font-medium transition-all text-surface-subtle hover:text-slate-200 hover:bg-surface-card"
+        title="打开本机 PowerShell。已打开时只是聚焦，不新建第二个工作区"
+      >
+        <div class="flex items-center gap-2.5">
+          <SquareTerminal class="w-4 h-4 text-sky-400" />
+          <span>本地终端</span>
+        </div>
+      </button>
+
+      <button
         @click="$emit('switch-view', 'sftp')"
         :class="activeView === 'sftp' ? 'bg-brand-500/15 text-emerald-400 border-l-2 border-brand-500' : 'text-surface-subtle hover:text-slate-200 hover:bg-surface-card'"
         class="w-full flex items-center justify-between px-2.5 py-2 rounded-lg text-xs font-medium transition-all group"
@@ -212,6 +223,7 @@ defineEmits<{
   (e: 'open-vault'): void
   (e: 'open-tunnels'): void
   (e: 'open-settings', tab?: string): void
+  (e: 'open-local-terminal'): void
 }>()
 
 /**

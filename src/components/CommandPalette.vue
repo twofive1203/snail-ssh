@@ -89,6 +89,17 @@
         </div>
 
         <div
+          v-if="localActionVisible"
+          @click="$emit('action', 'open-local-terminal'); $emit('close')"
+          class="flex items-center justify-between px-3 py-2 rounded-lg hover:bg-surface-elevated text-xs text-slate-200 cursor-pointer"
+        >
+          <span class="flex items-center gap-2">
+            <SquareTerminal class="w-3.5 h-3.5 text-sky-400" />
+            <span>打开本地终端（PowerShell）</span>
+          </span>
+        </div>
+
+        <div
           @click="$emit('action', 'open-settings'); $emit('close')"
           class="flex items-center justify-between px-3 py-2 rounded-lg hover:bg-surface-elevated text-xs text-slate-200 cursor-pointer"
         >
@@ -105,7 +116,7 @@
 
 <script setup lang="ts">
 import { ref, computed, watch, nextTick, onMounted, onBeforeUnmount } from 'vue'
-import { Search, Terminal, PlusCircle, ArrowUpDown, History, Zap, Settings } from 'lucide-vue-next'
+import { Search, Terminal, PlusCircle, ArrowUpDown, History, Zap, Settings, SquareTerminal } from 'lucide-vue-next'
 import type { HostItem } from '@/types'
 
 const props = defineProps<{
@@ -130,6 +141,12 @@ const filteredHosts = computed(() => {
   const q = query.value.trim().toLowerCase()
   if (!q) return props.hosts
   return props.hosts.filter(h => h.name.toLowerCase().includes(q) || h.host.toLowerCase().includes(q))
+})
+
+const localActionVisible = computed(() => {
+  const q = query.value.trim().toLowerCase()
+  if (!q) return true
+  return ['本地', 'powershell', 'pwsh', 'local', 'shell', '终端'].some(key => q.includes(key))
 })
 
 watch(() => props.open, (val) => {

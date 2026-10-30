@@ -73,6 +73,10 @@ export interface TerminalTab {
   cwd?: string
   /** 是否让左侧文件工作区跟随本标签页的终端目录（Tab 维度，默认关闭） */
   autoFollowTerminal?: boolean
+  /** 缺省是 SSH。本地终端不走主机通道。 */
+  transport?: 'ssh' | 'local'
+  /** 本地终端实际启动的 shell 种类，历史键用 `local:<shellKind>` */
+  shellKind?: string
 }
 
 /** 命令历史条目（与后端 history.rs 的 HistoryEntry 对应） */
@@ -279,6 +283,23 @@ export interface HostSession {
   workspaceMode?: WorkspaceMode
 }
 
+/** 本机终端工作区。不是主机，没有 SFTP / 监控 / 环境色。 */
+export interface LocalWorkspace {
+  kind: 'local'
+  id: string
+  title: string
+  terminalTabs: TerminalTab[]
+  activeTerminalIndex: number
+}
+
+export type WorkspaceSession = HostSession | LocalWorkspace
+
+export const isLocalWorkspace = (session: WorkspaceSession): session is LocalWorkspace =>
+  (session as LocalWorkspace).kind === 'local'
+
+export const isHostSession = (session: WorkspaceSession): session is HostSession =>
+  !isLocalWorkspace(session)
+
 export interface ToastMessage {
   id: string
   text: string
@@ -342,6 +363,14 @@ export interface AppSettings {
   pasteOnRightClick: boolean
   /** 最近连接记录（原 localStorage `snail_ssh_recent`，现已并入 settings.json） */
   recentHosts?: RecentHostRecord[]
+  /** 本地终端。程序和目录留空表示自动探测；已打开的进程不因保存而重启。 */
+  localShell: LocalShellSettings
+}
+
+export interface LocalShellSettings {
+  program: string
+  args: string
+  cwd: string
 }
 
 /** 一条最近连接记录。hostId 为去重键，lastUsedAt 为毫秒时间戳。 */

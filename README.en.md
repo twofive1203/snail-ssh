@@ -21,6 +21,7 @@ Windows installers have been measured at about 4.6 MB (msi) and 3.1 MB (NSIS set
 - OpenSSH `ssh_config` import and export. Export does not write passwords or private key material. `Match` and `Include` are not expanded.
 - A key vault for generating or importing ed25519 and RSA keys, plus a view of `known_hosts`.
 - An interactive terminal with a real PTY, snippets, command history, keyword highlighting, and optional session logs.
+- A local shell in the same terminal. On Windows the default is PowerShell 7 via ConPTY. It is not an embedded Windows Terminal, and it does not set `WT_SESSION`.
 - An SFTP browser with inline editing, drag-and-drop upload, and resumable transfers.
 - Passwords and private keys go to the OS keychain when it is available.
 
@@ -60,6 +61,7 @@ cd src-tauri && cargo check
 - Cloud sync or accounts
 - A plugin marketplace
 - RDP, VNC, serial, Telnet, or a built-in X11 server
+- Shell profiles (WSL, Git Bash), a local file tree, or PowerShell dangerous-command prompts. Closing a local tab stops that process tree. ConPTY on Windows 10 may rewrite some control sequences, and `cmd` may not emit UTF-8.
 
 ## License
 

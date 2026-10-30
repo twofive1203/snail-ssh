@@ -285,6 +285,76 @@ export async function closeSshSessionApi(sessionId: string): Promise<void> {
   }
 }
 
+export interface LocalSessionInfo {
+  sessionId: string
+  label: string
+  kind: string
+  program: string
+}
+
+export interface CreateLocalSessionInput {
+  program?: string | null
+  args?: string[]
+  cwd?: string | null
+  cols: number
+  rows: number
+}
+
+/** 非 Tauri 环境直接拒绝，调用方不应在预览里 invoke。 */
+export async function createLocalSessionApi(input: CreateLocalSessionInput): Promise<LocalSessionInfo> {
+  if (!isTauri()) {
+    throw new Error('预览模式不会启动本机 PowerShell')
+  }
+  return await invoke<LocalSessionInfo>('create_local_session', {
+    request: {
+      program: input.program || null,
+      args: input.args ?? [],
+      cwd: input.cwd || null,
+      cols: input.cols,
+      rows: input.rows
+    }
+  })
+}
+
+export async function writeLocalSessionApi(sessionId: string, data: string): Promise<void> {
+  if (!isTauri()) return
+  await invoke('write_local_session', { sessionId, data })
+}
+
+export async function resizeLocalSessionApi(sessionId: string, cols: number, rows: number): Promise<void> {
+  if (!isTauri()) return
+  await invoke('resize_local_session', { sessionId, cols, rows })
+}
+
+export async function closeLocalSessionApi(sessionId: string): Promise<void> {
+  if (!isTauri()) return
+  await invoke('close_local_session', { sessionId })
+}
+
+export async function takeLocalSessionBannerApi(sessionId: string): Promise<string> {
+  if (!isTauri()) return ''
+  return await invoke<string>('take_local_session_banner', { sessionId })
+}
+
+export async function onLocalStdout(sessionId: string, callback: (data: string) => void): Promise<UnlistenFn> {
+  if (!isTauri()) return () => {}
+  return await listen<string>(`local-stdout-${sessionId}`, (event) => {
+    callback(event.payload)
+  })
+}
+
+export async function onLocalClosed(sessionId: string, callback: (reason: string) => void): Promise<UnlistenFn> {
+  if (!isTauri()) return () => {}
+  return await listen<string>(`local-closed-${sessionId}`, (event) => {
+    callback(event.payload)
+  })
+}
+
+export async function setLocalSessionLoggingApi(sessionId: string, enabled: boolean, label: string): Promise<string | null> {
+  if (!isTauri()) return null
+  return await invoke<string | null>('set_local_session_logging', { sessionId, enabled, label })
+}
+
 // 模拟终端路径字典 (非 Tauri 降级使用)
 const mockTerminalCwdMap = new Map<string, string>()
 

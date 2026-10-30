@@ -449,7 +449,7 @@ fn mask_private_key_blocks(text: &str) -> String {
 }
 
 /// 把 password/token/secret 之类的值替换为 `***`
-fn redact(text: &str) -> String {
+pub(crate) fn redact(text: &str) -> String {
     let masked = mask_private_key_blocks(text);
     let mut out = String::with_capacity(masked.len());
     let mut rest = masked.as_str();
@@ -476,7 +476,7 @@ fn current_log_tx(sink: &Arc<Mutex<Option<LogSink>>>) -> Option<SyncSender<Strin
 }
 
 /// 读线程落盘入口：二进制输出跳过，缓冲满/断开时丢弃，绝不阻塞终端。
-fn push_log(
+pub(crate) fn push_log(
     tx: &SyncSender<String>,
     text: &str,
     backpressure_warned: &mut bool,
@@ -587,6 +587,69 @@ pub fn prune_session_logs(max_age_days: u64) -> Result<u64, String> {
 /// lib.rs 的命令只负责把它包进 run_blocking 并登记到 generate_handler。
 pub fn auto_prune_session_logs() -> Result<u64, String> {
     prune_session_logs(LOG_PRUNE_MAX_AGE_DAYS)
+}
+
+/// 会话日志句柄。drop 掉 `tx` 的最后一个克隆后 writer 线程退出；
+/// `shutdown` 会再等它刷盘，本地终端关闭要这条保证，SSH 关闭仍只丢 sender。
+pub(crate) struct SessionLogHandle {
+    pub path: PathBuf,
+    pub tx: SyncSender<String>,
+    done: Option<std::sync::mpsc::Receiver<()>>,
+}
+
+impl SessionLogHandle {
+    pub(crate) fn shutdown(self) {
+        let SessionLogHandle { tx, done, .. } = self;
+        drop(tx);
+        if let Some(done) = done {
+            let _ = done.recv_timeout(Duration::from_millis(800));
+        }
+    }
+}
+
+/// 在 `logs/<目录>/` 下开一份脱敏日志。目录名会做文件名清洗，标题行保留原文。
+pub(crate) fn start_session_log(
+    dir_segment: &str,
+    header_label: &str,
+    file_tag: &str,
+) -> Result<SessionLogHandle, String> {
+    let dir = crate::storage::app_data_dir()
+        .join("logs")
+        .join(sanitize_host(dir_segment));
+    fs::create_dir_all(&dir).map_err(|e| format!("创建日志目录失败: {}", e))?;
+    crate::fsperm::restrict_dir(&crate::storage::app_data_dir().join("logs"));
+    crate::fsperm::restrict_dir(&dir);
+
+    let started = now_secs();
+    let path = dir.join(format!("{}_{}.log", format_timestamp(started), file_tag));
+    let file = fs::File::create(&path).map_err(|e| format!("创建日志文件失败: {}", e))?;
+    crate::fsperm::restrict_file(&path);
+
+    let (tx, rx) = sync_channel::<String>(LOG_CHANNEL_CAPACITY);
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let header = format!(
+        "# SnailSSH session log (credentials redacted): {} started {} UTC\n",
+        header_label,
+        format_timestamp(started)
+    );
+    let writer_path = path.clone();
+    std::thread::spawn(move || {
+        let mut writer = SessionLogWriter::new(writer_path, file);
+        let _ = writer.write_chunk(&header);
+        while let Ok(chunk) = rx.recv() {
+            if !writer.write_chunk(&chunk) {
+                break;
+            }
+        }
+        writer.flush();
+        let _ = done_tx.send(());
+    });
+
+    Ok(SessionLogHandle {
+        path,
+        tx,
+        done: Some(done_rx),
+    })
 }
 
 /// 终端会话：shell 通道本体由输出泵任务独占，其余线程通过指令通道操作它。
@@ -856,40 +919,15 @@ impl SshManager {
             return Ok(Some(existing.path.to_string_lossy().to_string()));
         }
 
-        let dir = crate::storage::app_data_dir()
-            .join("logs")
-            .join(sanitize_host(host_label));
-        fs::create_dir_all(&dir).map_err(|e| format!("创建日志目录失败: {}", e))?;
-        crate::fsperm::restrict_dir(&crate::storage::app_data_dir().join("logs"));
-        crate::fsperm::restrict_dir(&dir);
-
         let short_id: String = session_id.trim_start_matches("ssh-").chars().take(8).collect();
-        let started = now_secs();
-        let path = dir.join(format!("{}_{}.log", format_timestamp(started), short_id));
-        let file = fs::File::create(&path).map_err(|e| format!("创建日志文件失败: {}", e))?;
-        crate::fsperm::restrict_file(&path);
-
-        let (tx, rx) = sync_channel::<String>(LOG_CHANNEL_CAPACITY);
-        let header = format!(
-            "# SnailSSH session log (credentials redacted): {} started {} UTC\n",
-            host_label,
-            format_timestamp(started)
-        );
-        let writer_path = path.clone();
-        std::thread::spawn(move || {
-            // 路径与句柄一起交给落盘侧：滚动只在这里发生，读线程不参与
-            let mut writer = SessionLogWriter::new(writer_path, file);
-            let _ = writer.write_chunk(&header);
-            while let Ok(chunk) = rx.recv() {
-                if !writer.write_chunk(&chunk) {
-                    break;
-                }
-            }
-            writer.flush();
+        let handle = start_session_log(host_label, host_label, &short_id)?;
+        let path = handle.path.to_string_lossy().to_string();
+        // SSH 关闭仍只 drop sender，不等写线程；done 通道随 handle 丢掉
+        *active.log_sink.lock() = Some(LogSink {
+            path: handle.path.clone(),
+            tx: handle.tx.clone(),
         });
-
-        *active.log_sink.lock() = Some(LogSink { path: path.clone(), tx });
-        Ok(Some(path.to_string_lossy().to_string()))
+        Ok(Some(path))
     }
 
     /// 查询当前日志路径（未开启返回 None）

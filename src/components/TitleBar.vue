@@ -39,14 +39,20 @@
         class="group flex items-center gap-2 px-2.5 py-1 rounded-md text-xs font-mono cursor-pointer transition-all shrink-0 max-w-[190px]"
       >
         <!-- 环境色点：与终端标签、文件工作区保持一致 -->
+        <SquareTerminal
+          v-if="isLocalWorkspace(s)"
+          class="w-3.5 h-3.5 text-sky-400 shrink-0"
+          title="本地终端"
+        />
         <span
+          v-else
           class="w-2 h-2 rounded-full shrink-0"
-          :class="[groupColorOf(groupById(s.host.group).color).dot, activeSessionId === s.id ? 'animate-pulse' : '']"
-          :title="groupById(s.host.group).label"
+          :class="[groupColorOf(groupById(hostGroupId(s)).color).dot, activeSessionId === s.id ? 'animate-pulse' : '']"
+          :title="groupById(hostGroupId(s)).label"
         ></span>
         <span class="truncate">{{ s.title }}</span>
         <span
-          v-if="s.workspaceMode === 'sftp'"
+          v-if="isHostSession(s) && s.workspaceMode === 'sftp'"
           class="text-[9px] px-1 py-0.2 rounded bg-cyan-500/15 text-cyan-300 border border-cyan-500/30 shrink-0 font-sans"
         >
           SFTP
@@ -177,6 +183,7 @@ import {
   Plus,
   Settings,
   Server,
+  SquareTerminal,
   X,
   Minus,
   Square,
@@ -184,13 +191,13 @@ import {
 } from 'lucide-vue-next'
 import { getStorageHealthApi, isTauri } from '@/api/tauri'
 import { groupById, groupColorOf } from '@/composables/useAppSettings'
-import type { HostSession, StorageHealth } from '@/types'
+import { isHostSession, isLocalWorkspace, type StorageHealth, type WorkspaceSession } from '@/types'
 
 withDefaults(
   defineProps<{
     activeTransfersCount: number
     transferSpeed: string
-    sessions?: HostSession[]
+    sessions?: WorkspaceSession[]
     activeSessionId?: string
   }>(),
   {
@@ -198,6 +205,8 @@ withDefaults(
     activeSessionId: 'hosts'
   }
 )
+
+const hostGroupId = (session: WorkspaceSession) => isHostSession(session) ? session.host.group : ''
 
 const emit = defineEmits<{
   (e: 'open-palette'): void

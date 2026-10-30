@@ -24,7 +24,7 @@
           :active-view="currentActiveView"
           :selected-group="selectedGroup"
           :total-hosts="hosts.length"
-          :active-sessions-count="sessions.length"
+          :active-sessions-count="sshSessionCount"
           :group-counts="groupCounts"
           :recent-hosts="recentHostItems"
           @switch-view="handleSidebarSwitchView"
@@ -33,6 +33,7 @@
           @open-vault="vaultOpen = true"
           @open-tunnels="tunnelsOpen = true"
           @open-settings="openSettings"
+          @open-local-terminal="openLocalWorkspace"
         />
 
         <!-- 主机资产管理视图 -->
@@ -52,7 +53,7 @@
 
       <!-- 视图 B: 主机会话协同工作区 (左侧树形文件 + 右侧交互终端 / 全屏 SFTP) -->
       <SessionWorkspace
-        v-for="s in sessions"
+        v-for="s in hostSessions"
         :key="s.id"
         v-show="s.id === activeSessionId"
         :session="s"
@@ -74,6 +75,22 @@
         @download-files="(refs: RemoteFileRef[]) => handleDownloadFiles(s, refs)"
         @upload-trigger="(dir: string) => handleUploadTrigger(s, dir)"
         @select-host="handleConnectSsh"
+        @toast="triggerToast"
+      />
+
+      <LocalWorkspace
+        v-if="localWorkspace"
+        v-show="localWorkspace.id === activeSessionId"
+        :session="localWorkspace"
+        :is-active="localWorkspace.id === activeSessionId"
+        @switch-terminal-tab="(idx: number) => { if (localWorkspace) localWorkspace.activeTerminalIndex = idx }"
+        @close-terminal-tab="(idx: number) => localWorkspace && handleCloseLocalTab(localWorkspace, idx)"
+        @add-terminal-tab="handleAddLocalTab"
+        @reconnect-terminal-tab="(idx: number) => handleReconnectLocalTab(idx)"
+        @rename-terminal-tab="(idx: number) => localWorkspace && handleRenameLocalTab(localWorkspace, idx)"
+        @close-other-terminal-tabs="(idx: number) => handleCloseOtherLocalTabs(idx)"
+        @close-tabs-after="(idx: number) => handleCloseLocalTabsAfter(idx)"
+        @session-closed="handleLocalSessionClosed"
         @toast="triggerToast"
       />
 
@@ -168,6 +185,7 @@ import TitleBar from '@/components/TitleBar.vue'
 import Sidebar from '@/components/Sidebar.vue'
 import HostManager from '@/components/HostManager.vue'
 import SessionWorkspace from '@/components/SessionWorkspace.vue'
+import LocalWorkspace from '@/components/LocalWorkspace.vue'
 import TransferDrawer from '@/components/TransferDrawer.vue'
 import CommandPalette from '@/components/CommandPalette.vue'
 import HostModal from '@/components/HostModal.vue'
@@ -182,7 +200,9 @@ import Toast from '@/components/Toast.vue'
 import { confirmDialog, promptDialog, dialogState } from '@/composables/useDialog'
 import { useRecentHosts, MAX_RECENT_DISPLAY } from '@/composables/useRecentHosts'
 import { loadSettings, groupById, settings } from '@/composables/useAppSettings'
-import type { AuthPromptEvent, FileDragDropEvent, HostItem, HostSession, RemoteFileRef, SftpFileItem, TransferContext, TransferTask, ToastMessage, TrustedEndpoint } from '@/types'
+import type { AuthPromptEvent, FileDragDropEvent, HostItem, HostSession, LocalWorkspace as LocalWorkspaceSession, RemoteFileRef, SftpFileItem, TransferContext, TransferTask, ToastMessage, TrustedEndpoint, WorkspaceSession } from '@/types'
+import { isHostSession, isLocalWorkspace } from '@/types'
+import { splitShellArgs } from '@/utils/shellArgs'
 import { parseHostKeyError } from '@/utils/hostKey'
 import {
   getHostsApi,
@@ -193,6 +213,8 @@ import {
   onForwardStatus,
   submitSshAuthPromptApi,
   closeSshSessionApi,
+  createLocalSessionApi,
+  closeLocalSessionApi,
   probeHostInfoApi,
   sftpUploadPathApi,
   sftpDownloadPathApi,
@@ -254,7 +276,11 @@ const demoSession: HostSession = {
   remoteMonitorOpen: true
 }
 
-const sessions = ref<HostSession[]>(isTauri() ? [] : [demoSession])
+const sessions = ref<WorkspaceSession[]>(isTauri() ? [] : [demoSession])
+const hostSessions = computed(() => sessions.value.filter(isHostSession))
+const localWorkspace = computed(() => sessions.value.find(isLocalWorkspace) ?? null)
+const sshSessionCount = computed(() => hostSessions.value.length)
+const LOCAL_WORKSPACE_ID = 'local'
 
 /** 终端标签的稳定 UI 标识：重连换后端会话 id 时 xterm 实例与回显历史不丢 */
 const makeTabUiId = () => `ui-tab-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
@@ -340,31 +366,32 @@ const handleSelectSession = (sessionId: string) => {
 const currentActiveView = computed(() => {
   if (activeSessionId.value === 'hosts') return 'hosts'
   const current = sessions.value.find(s => s.id === activeSessionId.value)
-  return current?.workspaceMode === 'sftp' ? 'sftp' : 'terminal'
+  if (current && isHostSession(current) && current.workspaceMode === 'sftp') return 'sftp'
+  return 'terminal'
 })
 
 const handleSidebarSwitchView = (v: string) => {
   if (v === 'hosts') {
     activeSessionId.value = 'hosts'
-  } else if (v === 'terminal') {
-    if (sessions.value.length === 0) {
-      triggerToast('暂无进行中的会话，请先连接一台服务器', 'info')
-      return
-    }
-    const current = sessions.value.find(s => s.id === activeSessionId.value) || sessions.value[0]
-    current.workspaceMode = 'split'
-    activeSessionId.value = current.id
-  } else if (v === 'sftp') {
-    if (sessions.value.length === 0) {
-      triggerToast('暂无进行中的会话，请先连接一台服务器或点击卡片 SFTP', 'info')
-      return
-    }
-    const current = sessions.value.find(s => s.id === activeSessionId.value) || sessions.value[0]
-    current.workspaceMode = 'sftp'
-    activeSessionId.value = current.id
-  } else if (sessions.value.length > 0) {
-    activeSessionId.value = sessions.value[0].id
+    return
   }
+  const hostsOnly = hostSessions.value
+  if (v === 'terminal' || v === 'sftp') {
+    if (hostsOnly.length === 0) {
+      triggerToast(
+        v === 'sftp'
+          ? '暂无进行中的会话，请先连接一台服务器或点击卡片 SFTP'
+          : '暂无进行中的会话，请先连接一台服务器',
+        'info'
+      )
+      return
+    }
+    const current = hostsOnly.find(s => s.id === activeSessionId.value) || hostsOnly[0]
+    current.workspaceMode = v === 'sftp' ? 'sftp' : 'split'
+    activeSessionId.value = current.id
+    return
+  }
+  if (hostsOnly.length > 0) activeSessionId.value = hostsOnly[0].id
 }
 
 // 加载服务器数据
@@ -444,7 +471,7 @@ const refreshHostMetrics = async (host: HostItem, sessionId: string) => {
 // 连接主机：支持指定初始工作区模式（'split' 为终端协同分栏，'sftp' 为独立全屏 SFTP）
 const handleConnectHost = async (host: HostItem, mode: 'split' | 'sftp' = 'split') => {
   // 如果已存在该主机会话，直接激活并切换到指定模式
-  const existing = sessions.value.find(s => s.hostId === host.id)
+  const existing = hostSessions.value.find(s => s.hostId === host.id)
   if (existing) {
     existing.workspaceMode = mode
     activeSessionId.value = existing.id
@@ -525,26 +552,236 @@ const handleQuickConnect = async (host: HostItem) => {
 }
 
 // 关闭整个主机会话
-const handleCloseSession = (sessionId: string) => {
+const handleCloseSession = async (sessionId: string) => {
   const idx = sessions.value.findIndex(s => s.id === sessionId)
   if (idx < 0) return
   const s = sessions.value[idx]
 
-  if (isTauri()) {
+  if (isLocalWorkspace(s)) {
+    if (isTauri()) {
+      await Promise.all(s.terminalTabs.map(t =>
+        t.id.startsWith('local-') ? closeLocalSessionApi(t.id).catch(() => {}) : Promise.resolve()
+      ))
+    }
+  } else if (isTauri()) {
     s.terminalTabs.forEach(t => {
       if (t.id.startsWith('ssh-')) closeSshSessionApi(t.id).catch(() => {})
     })
   }
 
-  sessions.value.splice(idx, 1)
+  const currentIdx = sessions.value.findIndex(item => item.id === sessionId)
+  if (currentIdx >= 0) sessions.value.splice(currentIdx, 1)
   if (activeSessionId.value === sessionId) {
     if (sessions.value.length > 0) {
-      activeSessionId.value = sessions.value[Math.max(0, idx - 1)].id
+      activeSessionId.value = sessions.value[Math.max(0, currentIdx - 1)].id
     } else {
       activeSessionId.value = 'hosts'
     }
   }
   triggerToast(`已关闭会话 ${s.title}`, 'info')
+}
+
+const localLaunchInput = () => ({
+  program: settings.localShell.program.trim() || null,
+  args: splitShellArgs(settings.localShell.args),
+  cwd: settings.localShell.cwd.trim() || null,
+  cols: 80,
+  rows: 24
+})
+
+const openLocalWorkspace = async () => {
+  const existing = sessions.value.find(isLocalWorkspace)
+  if (existing) {
+    activeSessionId.value = existing.id
+    return
+  }
+  if (!isTauri()) {
+    const session: LocalWorkspaceSession = {
+      kind: 'local',
+      id: LOCAL_WORKSPACE_ID,
+      title: '本地终端',
+      terminalTabs: [{
+        id: 'local-preview',
+        uiId: makeTabUiId(),
+        hostId: 'local',
+        title: '本地终端',
+        sub: '预览',
+        connected: true,
+        transport: 'local'
+      }],
+      activeTerminalIndex: 0
+    }
+    sessions.value.push(session)
+    activeSessionId.value = session.id
+    return
+  }
+
+  let created: Awaited<ReturnType<typeof createLocalSessionApi>>
+  try {
+    created = await createLocalSessionApi(localLaunchInput())
+  } catch (e: any) {
+    triggerToast(`打开本地终端失败: ${e?.message || e}`, 'error')
+    return
+  }
+  const session: LocalWorkspaceSession = {
+    kind: 'local',
+    id: LOCAL_WORKSPACE_ID,
+    title: '本地终端',
+    terminalTabs: [{
+      id: created.sessionId,
+      uiId: makeTabUiId(),
+      hostId: 'local',
+      title: '终端 1',
+      sub: created.label,
+      connected: true,
+      transport: 'local',
+      shellKind: created.kind
+    }],
+    activeTerminalIndex: 0
+  }
+  try {
+    sessions.value.push(session)
+    activeSessionId.value = session.id
+  } catch (e) {
+    await closeLocalSessionApi(created.sessionId).catch(() => {})
+    triggerToast('本地终端没能打开', 'error')
+  }
+}
+
+const handleCloseLocalTab = async (session: LocalWorkspaceSession, index: number) => {
+  const tab = session.terminalTabs[index]
+  if (!tab) return
+  if (isTauri() && tab.id.startsWith('local-')) {
+    await closeLocalSessionApi(tab.id).catch(() => {})
+  }
+  const current = sessions.value.find(item => item.id === session.id)
+  if (!current || !isLocalWorkspace(current)) return
+  current.terminalTabs.splice(index, 1)
+  if (current.terminalTabs.length === 0) {
+    const idx = sessions.value.findIndex(item => item.id === current.id)
+    if (idx >= 0) sessions.value.splice(idx, 1)
+    if (activeSessionId.value === current.id) {
+      activeSessionId.value = sessions.value[Math.max(0, idx - 1)]?.id || 'hosts'
+    }
+    return
+  }
+  if (current.activeTerminalIndex >= current.terminalTabs.length) {
+    current.activeTerminalIndex = current.terminalTabs.length - 1
+  }
+}
+
+const handleAddLocalTab = async () => {
+  const session = sessions.value.find(isLocalWorkspace)
+  if (!session) {
+    await openLocalWorkspace()
+    return
+  }
+  if (!isTauri()) {
+    session.terminalTabs.push({
+      id: `local-preview-${Date.now()}`,
+      uiId: makeTabUiId(),
+      hostId: 'local',
+      title: `终端 ${session.terminalTabs.length + 1}`,
+      sub: '预览',
+      connected: true,
+      transport: 'local'
+    })
+    session.activeTerminalIndex = session.terminalTabs.length - 1
+    return
+  }
+  let created: Awaited<ReturnType<typeof createLocalSessionApi>>
+  try {
+    created = await createLocalSessionApi(localLaunchInput())
+  } catch (e: any) {
+    triggerToast(`打开本地终端失败: ${e?.message || e}`, 'error')
+    return
+  }
+  if (!sessions.value.some(item => item.id === session.id)) {
+    await closeLocalSessionApi(created.sessionId).catch(() => {})
+    return
+  }
+  session.terminalTabs.push({
+    id: created.sessionId,
+    uiId: makeTabUiId(),
+    hostId: 'local',
+    title: `终端 ${session.terminalTabs.length + 1}`,
+    sub: created.label,
+    connected: true,
+    transport: 'local',
+    shellKind: created.kind
+  })
+  session.activeTerminalIndex = session.terminalTabs.length - 1
+}
+
+const handleReconnectLocalTab = async (index: number) => {
+  const session = sessions.value.find(isLocalWorkspace)
+  const tab = session?.terminalTabs[index]
+  if (!session || !tab || tab.reconnecting) return
+  tab.reconnecting = true
+  const oldId = tab.id
+  try {
+    if (!isTauri()) {
+      tab.connected = true
+      tab.closeReason = undefined
+      return
+    }
+    if (oldId.startsWith('local-')) closeLocalSessionApi(oldId).catch(() => {})
+    const created = await createLocalSessionApi(localLaunchInput())
+    if (!session.terminalTabs.includes(tab)) {
+      await closeLocalSessionApi(created.sessionId).catch(() => {})
+      return
+    }
+    tab.id = created.sessionId
+    tab.sub = created.label
+    tab.shellKind = created.kind
+    tab.connected = true
+    tab.closeReason = undefined
+    triggerToast(`已重新打开 ${tab.title}`, 'success')
+  } catch (e: any) {
+    triggerToast(`重新打开失败: ${e?.message || e}`, 'error')
+  } finally {
+    tab.reconnecting = false
+  }
+}
+
+const handleRenameLocalTab = async (session: LocalWorkspaceSession, index: number) => {
+  const tab = session.terminalTabs[index]
+  if (!tab) return
+  const name = await promptDialog({
+    title: '重命名终端',
+    message: '为终端设置显示名称',
+    input: { label: '名称', value: tab.title, placeholder: '例如：构建、日志', required: true },
+    confirmText: '保存'
+  })
+  if (!name) return
+  tab.title = name.trim()
+}
+
+const handleCloseOtherLocalTabs = async (index: number) => {
+  const session = sessions.value.find(isLocalWorkspace)
+  if (!session) return
+  for (let i = session.terminalTabs.length - 1; i >= 0; i--) {
+    if (i !== index) await handleCloseLocalTab(session, i)
+  }
+  const current = sessions.value.find(isLocalWorkspace)
+  if (current) current.activeTerminalIndex = 0
+}
+
+const handleCloseLocalTabsAfter = async (index: number) => {
+  const session = sessions.value.find(isLocalWorkspace)
+  if (!session) return
+  for (let i = session.terminalTabs.length - 1; i > index; i--) {
+    await handleCloseLocalTab(session, i)
+  }
+}
+
+const handleLocalSessionClosed = (tabId: string, reason: string) => {
+  const session = sessions.value.find(isLocalWorkspace)
+  const tab = session?.terminalTabs.find(item => item.id === tabId)
+  if (!tab || tab.reconnecting) return
+  tab.connected = false
+  tab.closeReason = reason
+  triggerToast(`本地终端已退出: ${reason}`, 'warning')
 }
 
 // 远端断开
@@ -754,6 +991,12 @@ const handleCloseWindow = async () => {
   }
 
   if (!isTauri()) return
+  const local = sessions.value.find(isLocalWorkspace)
+  if (local) {
+    await Promise.all(local.terminalTabs.map(tab =>
+      tab.id.startsWith('local-') ? closeLocalSessionApi(tab.id).catch(() => {}) : Promise.resolve()
+    ))
+  }
   try {
     const { getCurrentWindow } = await import('@tauri-apps/api/window')
     await getCurrentWindow().close()
@@ -785,6 +1028,23 @@ const isSameTransfer = (a: TransferTask, b: TransferTask): boolean => {
     && norm(a.context.localPath) === norm(b.context.localPath)
     && norm(a.context.remotePath) === norm(b.context.remotePath)
 }
+
+/** 传输卡片上的主机名。拖拽只有 sessionId，按会话、SFTP 会话或终端标签反查。 */
+const transferHostLabel = (sessionId: string): string => {
+  const session = sessions.value.find(s => {
+    if (isLocalWorkspace(s)) return s.terminalTabs.some(t => t.id === sessionId)
+    return s.id === sessionId
+      || s.sftpSessionId === sessionId
+      || s.terminalTabs.some(t => t.id === sessionId)
+  })
+  if (!session) return '未知主机'
+  if (isHostSession(session)) return session.host.name || session.title || session.host.host
+  return session.title || '本地终端'
+}
+
+/** 主机放在文件名前面：抽屉宽度不够时先截掉文件名，两台机器的同名文件仍能分开。 */
+const transferTaskName = (action: '上传' | '下载', fileName: string, sessionId: string) =>
+  `${action}: ${transferHostLabel(sessionId)} / ${fileName}`
 
 const createTransferTask = (
   name: string,
@@ -872,7 +1132,7 @@ const runMockTransfer = (task: TransferTask) => {
 const handleDownloadFile = async (session: HostSession, file: SftpFileItem, remotePath: string) => {
   const sessionId = session.sftpSessionId || session.id
   if (!isTauri()) {
-    runMockTransfer(createTransferTask(`下载: ${file.name}`, 'download', file.size))
+    runMockTransfer(createTransferTask(transferTaskName('下载', file.name, sessionId), 'download', file.size))
     return
   }
 
@@ -885,7 +1145,7 @@ const handleDownloadFile = async (session: HostSession, file: SftpFileItem, remo
     fullRemote = remotePath === '/' ? `/${file.name}` : `${remotePath.replace(/\/+$/, '')}/${file.name}`
   }
 
-  const task = createTransferTask(`下载: ${file.name}`, 'download', file.size, {
+  const task = createTransferTask(transferTaskName('下载', file.name, sessionId), 'download', file.size, {
     sessionId,
     localPath,
     remotePath: fullRemote,
@@ -901,7 +1161,7 @@ const handleDownloadFiles = async (session: HostSession, refs: RemoteFileRef[]) 
   if (refs.length === 0) return
   const sessionId = session.sftpSessionId || session.id
   if (!isTauri()) {
-    refs.forEach(r => runMockTransfer(createTransferTask(`下载: ${r.file.name}`, 'download', r.file.size)))
+    refs.forEach(r => runMockTransfer(createTransferTask(transferTaskName('下载', r.file.name, sessionId), 'download', r.file.size)))
     return
   }
 
@@ -910,7 +1170,7 @@ const handleDownloadFiles = async (session: HostSession, refs: RemoteFileRef[]) 
 
   for (const ref of refs) {
     const localPath = `${targetDir.replace(/[/\\]+$/, '')}/${ref.file.name}`
-    const task = createTransferTask(`下载: ${ref.file.name}`, 'download', ref.file.size, {
+    const task = createTransferTask(transferTaskName('下载', ref.file.name, sessionId), 'download', ref.file.size, {
       sessionId,
       localPath,
       remotePath: ref.remotePath,
@@ -928,7 +1188,7 @@ const enqueueUploadPaths = async (localPaths: string[], sessionId: string, remot
     const name = localPath.split(/[/\\]/).filter(Boolean).pop() || 'file'
     return {
       localPath,
-      task: createTransferTask(`上传: ${name}`, 'upload', '准备中...', {
+      task: createTransferTask(transferTaskName('上传', name, sessionId), 'upload', '准备中...', {
         sessionId,
         localPath,
         remotePath: remoteDir,
@@ -944,7 +1204,7 @@ const enqueueUploadPaths = async (localPaths: string[], sessionId: string, remot
 const handleUploadTrigger = async (session: HostSession, remoteDir: string) => {
   const sessionId = session.sftpSessionId || session.id
   if (!isTauri()) {
-    runMockTransfer(createTransferTask('上传: mock_package.tar.gz', 'upload', '24.5 MB'))
+    runMockTransfer(createTransferTask(transferTaskName('上传', 'mock_package.tar.gz', sessionId), 'upload', '24.5 MB'))
     return
   }
 
@@ -1071,6 +1331,7 @@ const handlePaletteAction = (act: string) => {
   if (act === 'quick-connect') openQuickConnect()
   if (act === 'toggle-transfers') transfersOpen.value = !transfersOpen.value
   if (act === 'open-settings') openSettings()
+  if (act === 'open-local-terminal') void openLocalWorkspace()
 }
 
 /** 打开设置中心；`tab` 可直接定位到某个分区（侧边栏入口用） */
@@ -1152,6 +1413,7 @@ onBeforeUnmount(() => {
   for (const s of sessions.value) {
     for (const tab of s.terminalTabs) {
       if (tab.id.startsWith('ssh-')) closeSshSessionApi(tab.id).catch(() => {})
+      if (tab.id.startsWith('local-')) closeLocalSessionApi(tab.id).catch(() => {})
     }
   }
 })

@@ -212,7 +212,8 @@ export const defaultSettings = (): AppSettings => ({
   remoteMonitorEnabled: true,
   selectToCopy: true,
   pasteOnRightClick: true,
-  recentHosts: []
+  recentHosts: [],
+  localShell: { program: '', args: '', cwd: '' }
 })
 
 /** 旧版选中即复制只写在 localStorage；settings 缺字段时继承，避免升级把用户关过的开关又打开 */
@@ -295,7 +296,18 @@ export const normalizeSettings = (raw: any): AppSettings => {
             username: typeof r.username === 'string' ? r.username : '',
             lastUsedAt: Number.isFinite(Number(r.lastUsedAt)) ? Number(r.lastUsedAt) : 0
           }))
-      : base.recentHosts
+      : base.recentHosts,
+    localShell: normalizeLocalShell(raw.localShell)
+  }
+}
+
+const normalizeLocalShell = (raw: any): AppSettings['localShell'] => {
+  const source = raw && typeof raw === 'object' ? raw : {}
+  const text = (value: unknown) => typeof value === 'string' ? value : ''
+  return {
+    program: text(source.program).trim(),
+    args: text(source.args),
+    cwd: text(source.cwd).trim()
   }
 }
 
@@ -317,6 +329,7 @@ const applySettings = (next: AppSettings) => {
   settings.selectToCopy = next.selectToCopy
   settings.pasteOnRightClick = next.pasteOnRightClick
   settings.recentHosts = next.recentHosts
+  settings.localShell = next.localShell
   // 同步 watch 在下一个 tick 才跑，这里用微任务兜底恢复标志，避免漏掉用户紧接的修改
   void Promise.resolve().then(() => { applying = false })
 }

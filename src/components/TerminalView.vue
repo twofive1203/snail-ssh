@@ -16,7 +16,7 @@
           <span
             class="w-2 h-2 rounded-full shrink-0"
             :class="[tab.connected ? groupColorDot : 'bg-rose-500', tab.connected ? 'animate-pulse' : '']"
-            :title="currentGroup.label"
+            :title="transport === 'local' ? (tab.sub || '本地终端') : currentGroup.label"
           ></span>
           <span class="font-mono font-medium">{{ tab.title }}</span>
           <span class="text-[10px] font-mono text-slate-500 hidden sm:inline">{{ tab.sub }}</span>
@@ -32,7 +32,7 @@
         <button
           @click="$emit('add-tab')"
           class="p-1 rounded-md text-surface-subtle hover:text-white hover:bg-surface-card transition-colors ml-1"
-          title="连接新的服务器终端"
+          :title="transport === 'local' ? '打开新的本地终端' : '连接新的服务器终端'"
         >
           <Plus class="w-4 h-4" />
         </button>
@@ -51,7 +51,7 @@
         </span>
 
         <button
-          v-if="sidebarCollapsed"
+          v-if="sidebarCollapsed && transport !== 'local'"
           @click="$emit('toggle-sidebar')"
           class="flex items-center gap-1.5 px-2 py-1 rounded bg-brand-500/10 text-emerald-400 border border-brand-500/30 hover:bg-brand-500/20 text-xs font-medium transition-all"
           title="展开左侧文件工作区"
@@ -62,6 +62,7 @@
 
         <!-- 切换到全屏 SFTP 视图 -->
         <button
+          v-if="transport !== 'local'"
           @click="$emit('jump-to-sftp')"
           class="flex items-center gap-1.5 px-2 py-1 rounded bg-surface-card hover:bg-surface-elevated border border-surface-border hover:border-cyan-500/40 text-cyan-400 text-xs font-medium transition-all"
           title="切换至独立全屏 SFTP 传输视图"
@@ -158,7 +159,7 @@
 
     <!-- 常用指令代码片段工具栏 -->
     <div class="h-8 bg-surface-card/40 border-b border-surface-border/60 px-3 flex items-center justify-between text-xs shrink-0 select-none">
-      <div class="flex items-center gap-2 overflow-x-auto no-scrollbar py-1">
+      <div v-if="transport !== 'local'" class="flex items-center gap-2 overflow-x-auto no-scrollbar py-1">
         <span class="text-[10px] font-mono text-slate-500 uppercase flex items-center gap-1">
           <Zap class="w-3 h-3 text-amber-400" />
           <span>常用指令:</span>
@@ -176,6 +177,11 @@
         <span v-if="settings.snippets.length === 0" class="text-[10px] text-slate-500 font-mono">
           暂无片段，可在设置中心添加
         </span>
+      </div>
+      <div v-else class="flex items-center gap-2 min-w-0 text-[11px] font-mono text-slate-400">
+        <SquareTerminal class="w-3.5 h-3.5 text-sky-400 shrink-0" />
+        <span class="text-slate-300">本地终端</span>
+        <span class="text-slate-500 truncate">{{ currentTab?.sub || '自动探测' }}</span>
       </div>
       <div class="flex items-center gap-3 text-[11px] font-mono text-slate-500">
         <span>UTF-8</span>
@@ -263,18 +269,18 @@
       >
         <RefreshCw class="w-4 h-4 text-rose-400 shrink-0" />
         <div class="min-w-0">
-          <p class="text-xs text-slate-200 font-medium leading-tight">连接已断开</p>
+          <p class="text-xs text-slate-200 font-medium leading-tight">{{ transport === 'local' ? '终端已退出' : '连接已断开' }}</p>
           <p class="text-[10px] font-mono text-slate-500 truncate max-w-[240px] leading-tight">
-            {{ disconnectedTab.closeReason || '远端会话已结束' }}
+            {{ disconnectedTab.closeReason || (transport === 'local' ? '本地进程已结束' : '远端会话已结束') }}
           </p>
         </div>
         <button
           @click="$emit('reconnect-tab', activeTabIndex)"
           :disabled="disconnectedTab.reconnecting"
           class="px-2 py-1 rounded text-[11px] font-medium bg-brand-500/15 text-emerald-300 border border-brand-500/40 hover:bg-brand-500/25 transition-colors disabled:opacity-50 disabled:cursor-not-allowed shrink-0"
-          title="保留当前回显，重新建立 SSH 会话"
+          :title="transport === 'local' ? '保留当前回显，重新打开本地终端' : '保留当前回显，重新建立 SSH 会话'"
         >
-          {{ disconnectedTab.reconnecting ? '重连中...' : '重新连接' }}
+          {{ disconnectedTab.reconnecting ? (transport === 'local' ? '正在打开...' : '重连中...') : (transport === 'local' ? '重新打开' : '重新连接') }}
         </button>
         <button
           @click="$emit('close-tab', activeTabIndex)"
@@ -290,8 +296,8 @@
         class="w-full h-full flex flex-col items-center justify-center gap-3 text-center"
       >
         <TerminalIcon class="w-10 h-10 text-slate-600" />
-        <p class="text-sm text-slate-400">当前没有活动的终端会话</p>
-        <p class="text-xs text-slate-500 font-mono">请在「服务器资产」中选择主机并点击「连接 SSH」，或用 Ctrl+K 快速直连</p>
+        <p class="text-sm text-slate-400">{{ transport === 'local' ? '当前没有本地终端' : '当前没有活动的终端会话' }}</p>
+        <p class="text-xs text-slate-500 font-mono">{{ transport === 'local' ? '点上方加号再开一个本地终端' : '请在「服务器资产」中选择主机并点击「连接 SSH」，或用 Ctrl+K 快速直连' }}</p>
         <p class="text-[11px] text-slate-600 font-mono">小技巧：Ctrl+Enter 唤出命令输入框，Ctrl+, 打开设置中心</p>
       </div>
 
@@ -455,6 +461,12 @@ import type { CommandHistoryEntry, ContextMenuItem, TerminalTab } from '@/types'
 import {
   writeSshSessionApi,
   resizeSshSessionApi,
+  writeLocalSessionApi,
+  resizeLocalSessionApi,
+  onLocalStdout,
+  onLocalClosed,
+  takeLocalSessionBannerApi,
+  setLocalSessionLoggingApi,
   getSshSessionCwdApi,
   setMockTerminalCwd,
   onSshStdout,
@@ -481,12 +493,15 @@ const props = withDefaults(
     hostKey?: string
     /** 所属分组 id：用于标签环境色与危险命令二次确认 */
     groupId?: string
+    /** ssh 走原来的远端通道；local 走本机 PTY */
+    transport?: 'ssh' | 'local'
   }>(),
   {
     sidebarCollapsed: false,
     active: false,
     hostKey: '',
-    groupId: ''
+    groupId: '',
+    transport: 'ssh'
   }
 )
 
@@ -579,7 +594,23 @@ const suggestBarVisible = computed(() =>
   suggestTabId.value === currentTabId.value && suggestCandidates.value.length > 0
 )
 
-const hostKeyFor = (tab: TerminalTab): string => props.hostKey || tab.hostId
+const isLocalTransport = computed(() => props.transport === 'local')
+
+const hostKeyFor = (tab: TerminalTab): string => {
+  if (isLocalTransport.value) return `local:${tab.shellKind || 'shell'}`
+  return props.hostKey || tab.hostId
+}
+
+const writeTransport = (tabId: string, data: string) =>
+  isLocalTransport.value ? writeLocalSessionApi(tabId, data) : writeSshSessionApi(tabId, data)
+
+const resizeTransport = (tabId: string, cols: number, rows: number) =>
+  isLocalTransport.value ? resizeLocalSessionApi(tabId, cols, rows) : resizeSshSessionApi(tabId, cols, rows)
+
+const setLoggingTransport = (tabId: string, enabled: boolean, label: string) =>
+  isLocalTransport.value
+    ? setLocalSessionLoggingApi(tabId, enabled, label)
+    : setSessionLoggingApi(tabId, enabled, label)
 
 /** 候选条仅在可见时接管 ↑/↓ / Esc；Enter 只在已选中时补全，Tab 始终透传 */
 const hasSuggestions = (tabId: string) => suggestTabId.value === tabId && suggestCandidates.value.length > 0
@@ -604,6 +635,7 @@ const SUBCOMMAND_WORDS: Record<string, string[]> = {
 }
 
 const staticCandidates = (input: string): string[] => {
+  if (isLocalTransport.value) return []
   const matched = input.match(/^(\w+)\s+(\S*)$/)
   if (!matched) return []
   const words = SUBCOMMAND_WORDS[matched[1]]
@@ -778,10 +810,16 @@ const historyIndex = ref(-1)
 const commandHistory = ref<CommandHistoryEntry[]>([])
 
 const draftLineCount = computed(() => commandDraft.value.split('\n').length)
-const dangerousDraft = computed(() => detectDangerousCommand(commandDraft.value))
+const dangerousDraft = computed(() =>
+  isLocalTransport.value ? null : detectDangerousCommand(commandDraft.value)
+)
 const currentGroup = computed(() => groupById(props.groupId))
-const groupColorDot = computed(() => groupColorOf(currentGroup.value.color).dot)
-const groupColorHex = computed(() => groupColorOf(currentGroup.value.color).hex)
+const groupColorDot = computed(() =>
+  isLocalTransport.value ? 'bg-sky-400' : groupColorOf(currentGroup.value.color).dot
+)
+const groupColorHex = computed(() =>
+  isLocalTransport.value ? '#38bdf8' : groupColorOf(currentGroup.value.color).hex
+)
 
 /** 输入框自动增高（最多 160px，超过后内部滚动） */
 const autoGrowDraft = () => {
@@ -867,7 +905,7 @@ const sendCommandDraft = async () => {
   if (!tab || !text.trim()) return
   if (rejectIfDisconnected(tab)) return
 
-  const danger = detectDangerousCommand(text)
+  const danger = isLocalTransport.value ? null : detectDangerousCommand(text)
   if (danger && currentGroup.value.danger) {
     const ok = await confirmDialog({
       title: '高风险环境：确认发送危险命令',
@@ -928,13 +966,13 @@ const setTabLogPath = (tabId: string, path: string | null) => {
 const logHostLabel = (tab: TerminalTab) => props.hostKey || tab.sub || tab.title
 
 const enableSessionLog = async (tab: TerminalTab): Promise<string | null> => {
-  const path = await setSessionLoggingApi(tab.id, true, logHostLabel(tab))
+  const path = await setLoggingTransport(tab.id, true, logHostLabel(tab))
   setTabLogPath(tab.id, path)
   return path
 }
 
 const stopSessionLog = async (tab: TerminalTab): Promise<string | null> => {
-  const path = await setSessionLoggingApi(tab.id, false, logHostLabel(tab))
+  const path = await setLoggingTransport(tab.id, false, logHostLabel(tab))
   setTabLogPath(tab.id, null)
   return path
 }
@@ -1070,6 +1108,7 @@ const createSession = (tab: TerminalTab, container: HTMLDivElement): TerminalSes
 
   // 监听 OSC 7 (标准终端当前目录转义序列)
   term.parser.registerOscHandler(7, (data) => {
+    if (props.transport === 'local') return true
     const p = parseOsc7Path(data)
     if (p) {
       tab.cwd = p
@@ -1080,6 +1119,7 @@ const createSession = (tab: TerminalTab, container: HTMLDivElement): TerminalSes
 
   // 监听 OSC 1337 (iTerm2 / Shell Integration 扩展目录格式)
   term.parser.registerOscHandler(1337, (data) => {
+    if (props.transport === 'local') return true
     const p = parseOsc1337Path(data)
     if (p) {
       tab.cwd = p
@@ -1158,13 +1198,17 @@ const createSession = (tab: TerminalTab, container: HTMLDivElement): TerminalSes
     if (tab.id !== currentTabId.value) return
     termSize.value = { cols, rows }
     if (isTauri()) {
-      resizeSshSessionApi(tab.id, cols, rows).catch(() => {})
+      resizeTransport(tab.id, cols, rows).catch(() => {})
     }
   })
 
-  // 真实会话不打印假欢迎信息，避免误导连接状态；仅浏览器预览时输出演示横幅
+  // 真实会话不打印假欢迎信息。浏览器里的本地终端只说明不会启动进程，不模拟 shell。
   if (!isTauri()) {
-    printMockBanner(term)
+    if (props.transport === 'local') {
+      term.write('\r\n\x1b[33m预览模式不会启动本机 PowerShell\x1b[0m\r\n')
+    } else {
+      printMockBanner(term)
+    }
   }
 
   return session
@@ -1219,7 +1263,52 @@ const announceLastLoginIfMissing = async (tab: TerminalTab, session: TerminalSes
   }
 }
 
+const bindLocalSessionEvents = async (tab: TerminalTab, session: TerminalSession) => {
+  if (!isTauri()) {
+    const hostKey = hostKeyFor(tab)
+    if (!historyCache.has(hostKey)) await refreshHistory(hostKey)
+    return
+  }
+  const boundId = tab.id
+  const pendingChunks: string[] = []
+  let live = false
+  const unlistenStdout = await onLocalStdout(boundId, (chunk) => {
+    if (live) {
+      session.term.write(chunk)
+      return
+    }
+    pendingChunks.push(chunk)
+  })
+  const unlistenClosed = await onLocalClosed(boundId, (reason) => {
+    session.term.write(`\r\n\x1b[33m[会话结束] ${reason}\x1b[0m\r\n`)
+    setTabLogPath(boundId, null)
+    emit('session-closed', boundId, reason)
+  })
+  session.unlisten.push(unlistenStdout, unlistenClosed)
+
+  let banner = ''
+  try {
+    banner = await takeLocalSessionBannerApi(tab.id)
+  } catch (e) {
+    console.warn('取回本地终端首屏失败:', e)
+  }
+  if (banner) session.term.write(banner)
+  live = true
+  for (const chunk of pendingChunks) session.term.write(chunk)
+  pendingChunks.length = 0
+
+  const hostKey = hostKeyFor(tab)
+  if (!historyCache.has(hostKey)) await refreshHistory(hostKey)
+  if (readLogAuto() && !isTabLogging(tab.id)) {
+    enableSessionLog(tab).catch(e => console.warn('自动开启会话日志失败:', e))
+  }
+}
+
 const bindSessionEvents = async (tab: TerminalTab, session: TerminalSession) => {
+  if (props.transport === 'local') {
+    await bindLocalSessionEvents(tab, session)
+    return
+  }
   if (isTauri()) {
     // 绑定时的后端会话 id：重连后 tab.id 会换，旧会话迟到的 closed 事件
     // 不能再用 tab.id，否则会把刚重连好的标签误标为断开
@@ -1292,11 +1381,15 @@ const syncSessions = async () => {
     // 旧会话的日志文件已经封存，不能把旧路径当成新会话的 REC 状态；
     // 若用户开启过自动记录，下面的 bindSessionEvents 会为新会话重新开一个文件
     if (loggingPaths.value[oldKey]) setTabLogPath(oldKey, null)
-    session.term.write('\r\n\x1b[32m[已重新连接] 新的 SSH 会话已建立\x1b[0m\r\n')
+    session.term.write(
+      props.transport === 'local'
+        ? '\r\n\x1b[32m[已重新打开] 新的本地终端已启动\x1b[0m\r\n'
+        : '\r\n\x1b[32m[已重新连接] 新的 SSH 会话已建立\x1b[0m\r\n'
+    )
     await bindSessionEvents(tab, session)
     // 新会话的 PTY 尺寸可能不等于当前终端：主动同步一次，否则宽字符会折行错位
     if (isTauri()) {
-      resizeSshSessionApi(tab.id, session.term.cols, session.term.rows).catch(() => {})
+      resizeTransport(tab.id, session.term.cols, session.term.rows).catch(() => {})
     }
     if (tab.id === currentTabId.value) session.term.focus()
   }
@@ -1348,9 +1441,9 @@ const clearTerminal = (tabId: string) => {
   const session = sessions.get(tabId)
   if (!session) return
   if (isTauri()) {
-    // 交给远端 Shell 执行清屏，保留当前提示符
-    writeSshSessionApi(tabId, '\x0c').catch(() => {})
-  } else {
+    // 交给 shell 执行清屏，保留当前提示符。Ctrl+L 本身仍透传，不在这里拦截。
+    writeTransport(tabId, '\x0c').catch(() => {})
+  } else if (props.transport !== 'local') {
     session.term.clear()
   }
 }
@@ -1493,7 +1586,10 @@ watch([searchQuery, searchCaseSensitive, searchWholeWord, searchRegex], () => {
 /** 断开的会话已经没人接数据：入口处先拦一道，提示用户重新连接 */
 const rejectIfDisconnected = (tab: TerminalTab | undefined): boolean => {
   if (!tab || tab.connected) return false
-  emitToast('连接已断开，请先点「重新连接」', 'warning')
+  emitToast(
+    isLocalTransport.value ? '终端已退出，请先点「重新打开」' : '连接已断开，请先点「重新连接」',
+    'warning'
+  )
   return true
 }
 
@@ -1502,11 +1598,14 @@ const writeToSession = (tabId: string, data: string) => {
   const session = sessions.get(tabId)
   if (!session) return
   if (isTauri()) {
-    writeSshSessionApi(tabId, data).catch((err: any) => {
+    writeTransport(tabId, data).catch((err: any) => {
       if (session.writeFailed) return
       session.writeFailed = true
       session.term.write(`\r\n\x1b[31m[写入失败] ${err?.message || err}\x1b[0m\r\n`)
     })
+  } else if (props.transport === 'local') {
+    // 预览模式不模拟本机 shell，避免再维护一套假 PowerShell
+    return
   } else {
     const tab = props.tabs.find(t => t.id === tabId)
     if (tab) handleMockTerminalInput(tab, session, data)
@@ -1632,7 +1731,8 @@ const tabMenuItems = computed<ContextMenuItem[]>(() => {
   const tab = props.tabs[index]
   if (!tab) return []
   const isLast = index === props.tabs.length - 1
-  return [
+  const local = props.transport === 'local'
+  const items: ContextMenuItem[] = [
     { key: 'duplicate', label: '复制会话', icon: CopyPlus, hint: '新标签页' },
     { divider: true },
     { key: 'copy-ip', label: '复制 IP 地址', icon: Globe },
@@ -1640,7 +1740,7 @@ const tabMenuItems = computed<ContextMenuItem[]>(() => {
     { key: 'copy-ssh', label: '复制 SSH 命令', icon: Terminal, hint: 'ssh -p' },
     { divider: true },
     { key: 'rename', label: '重命名标签', icon: PenLine },
-    { key: 'reconnect', label: '重新连接', icon: RefreshCw, disabled: tab.connected },
+    { key: 'reconnect', label: local ? '重新打开' : '重新连接', icon: RefreshCw, disabled: tab.connected },
     { divider: true },
     { key: 'toggle-log', label: isTabLogging(tab.id) ? '停止记录会话日志' : '开始记录会话日志', icon: isTabLogging(tab.id) ? CircleStop : CircleDot },
     { key: 'open-log-dir', label: '打开日志目录', icon: FolderOpen },
@@ -1651,6 +1751,16 @@ const tabMenuItems = computed<ContextMenuItem[]>(() => {
     { key: 'close-others', label: '关闭其他标签', icon: XCircle, disabled: props.tabs.length < 2 },
     { key: 'close-after', label: '关闭右侧标签', icon: ChevronsRight, disabled: isLast }
   ]
+  if (!local) return items
+  const hidden = new Set(['copy-ip', 'copy-login', 'copy-ssh', 'sftp'])
+  const visible: ContextMenuItem[] = []
+  for (const item of items) {
+    if (item.key && hidden.has(item.key)) continue
+    if (item.divider && (visible.length === 0 || visible[visible.length - 1]?.divider)) continue
+    visible.push(item)
+  }
+  while (visible.length > 0 && visible[visible.length - 1]?.divider) visible.pop()
+  return visible
 })
 
 const handleTabMenuSelect = (item: ContextMenuItem) => {
@@ -1680,7 +1790,7 @@ const sendSnippetCommand = (cmd: string) => {
   if (!session || !tab) return
   if (rejectIfDisconnected(tab)) return
   if (isTauri()) {
-    writeSshSessionApi(tab.id, cmd).catch((err: any) => {
+    writeTransport(tab.id, cmd).catch((err: any) => {
       session.term.write(`\r\n\x1b[31m[写入失败] ${err?.message || err}\x1b[0m\r\n`)
     })
   } else {
@@ -1718,6 +1828,7 @@ const parseOsc1337Path = (data: string): string | null => {
 const getCurrentCwd = async (): Promise<string> => {
   const tab = currentTab.value
   if (!tab) return '/'
+  if (props.transport === 'local') return tab.cwd || ''
   if (isTauri()) {
     try {
       const remoteCwd = await getSshSessionCwdApi(tab.id)

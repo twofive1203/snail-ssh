@@ -3,6 +3,7 @@ mod conn;
 mod forward;
 mod fsperm;
 mod history;
+mod local_shell;
 mod model;
 mod net;
 mod rt;
@@ -189,6 +190,75 @@ async fn resize_ssh_session(
 ) -> Result<(), String> {
     let manager = ssh_manager.inner().clone();
     run_blocking(move || manager.resize_session(&session_id, cols, rows)).await
+}
+
+#[tauri::command]
+async fn create_local_session(
+    request: local_shell::CreateLocalSessionRequest,
+    shells: State<'_, local_shell::LocalShellManager>,
+    app_handle: AppHandle,
+) -> Result<local_shell::CreateLocalSessionResponse, String> {
+    let manager = shells.inner().clone();
+    run_blocking(move || manager.create_session(request, app_handle)).await
+}
+
+#[tauri::command]
+async fn write_local_session(
+    session_id: String,
+    data: String,
+    shells: State<'_, local_shell::LocalShellManager>,
+) -> Result<(), String> {
+    let manager = shells.inner().clone();
+    run_blocking(move || manager.write_session(&session_id, &data)).await
+}
+
+#[tauri::command]
+async fn resize_local_session(
+    session_id: String,
+    cols: u32,
+    rows: u32,
+    shells: State<'_, local_shell::LocalShellManager>,
+) -> Result<(), String> {
+    let manager = shells.inner().clone();
+    run_blocking(move || manager.resize_session(&session_id, cols, rows)).await
+}
+
+#[tauri::command]
+async fn close_local_session(
+    session_id: String,
+    shells: State<'_, local_shell::LocalShellManager>,
+) -> Result<(), String> {
+    let manager = shells.inner().clone();
+    run_blocking(move || manager.close_session(&session_id)).await
+}
+
+#[tauri::command]
+async fn take_local_session_banner(
+    session_id: String,
+    shells: State<'_, local_shell::LocalShellManager>,
+) -> Result<String, String> {
+    let manager = shells.inner().clone();
+    run_blocking(move || manager.take_banner(&session_id)).await
+}
+
+#[tauri::command]
+async fn set_local_session_logging(
+    session_id: String,
+    enabled: bool,
+    label: String,
+    shells: State<'_, local_shell::LocalShellManager>,
+) -> Result<Option<String>, String> {
+    let manager = shells.inner().clone();
+    run_blocking(move || manager.set_logging(&session_id, enabled, &label)).await
+}
+
+#[tauri::command]
+async fn get_local_session_log_path(
+    session_id: String,
+    shells: State<'_, local_shell::LocalShellManager>,
+) -> Result<Option<String>, String> {
+    let manager = shells.inner().clone();
+    run_blocking(move || manager.log_path(&session_id)).await
 }
 
 #[tauri::command]
@@ -743,6 +813,7 @@ pub fn run() {
         }))
         .plugin(tauri_plugin_dialog::init())
         .manage(SshManager::new())
+        .manage(local_shell::LocalShellManager::new())
         .manage(TransferRegistry::new())
         .manage(TunnelManager::new())
         .setup(|app| {
@@ -774,6 +845,13 @@ pub fn run() {
             write_ssh_session,
             resize_ssh_session,
             close_ssh_session,
+            create_local_session,
+            write_local_session,
+            resize_local_session,
+            close_local_session,
+            take_local_session_banner,
+            set_local_session_logging,
+            get_local_session_log_path,
             test_ssh_connection,
             probe_host_info,
             get_ssh_session_cwd,
