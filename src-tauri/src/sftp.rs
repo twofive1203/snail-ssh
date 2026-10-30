@@ -535,8 +535,11 @@ fn pause_or_cancel(
 }
 
 /// 上传单个文件（供单文件与目录上传复用）：支持取消/暂停与断点续传。
-/// 续传起点按"远端已存在且比本地源短"计算；`reporter` 的 total 为完整文件大小，
-/// 续传时 `advance(offset)` 让进度从已有位置起算。
+///
+/// `resume = false`（首次上传、重新发起）时一律从 0 开始并截断重建：远端同名文件的长度
+/// 不能证明它就是本次源文件的未完成前缀，按长度续传会拼出「旧前缀 + 新后缀」的坑文件
+/// （zip 这类带尾部索引的格式会直接解压失败）。只有暂停继续 / 失败重试才允许续传。
+/// `reporter` 的 total 为完整文件大小，续传时 `advance(offset)` 让进度从已有位置起算。
 fn transfer_upload_one(
     sftp: &Sftp,
     local: &Path,
@@ -544,6 +547,7 @@ fn transfer_upload_one(
     reporter: &mut ProgressReporter,
     signal: &TransferSignal,
     app: &AppHandle,
+    resume: bool,
 ) -> Result<(), String> {
     let mut local_file = File::open(local).map_err(|e| format!("打开本地文件失败: {}", e))?;
     let source_len = local_file.metadata().map(|m| m.len()).unwrap_or(0);
@@ -551,7 +555,11 @@ fn transfer_upload_one(
         .stat(remote)
         .ok()
         .and_then(|stat| stat.size);
-    let offset = resume_offset(remote_len, source_len);
+    let offset = if resume {
+        resume_offset(remote_len, source_len)
+    } else {
+        0
+    };
 
     // 红线：续传路径绝不能带 OpenFlags::TRUNC，否则会把已传部分清空；
     // offset == 0 时用 create()（语义等于截断重建），正确处理远端更长/需重传的情况。
@@ -693,6 +701,7 @@ pub fn sftp_upload_file(
     local_path: &str,
     remote_path: &str,
     task_id: &str,
+    resume: bool,
     signal: Arc<TransferSignal>,
     app_handle: AppHandle,
 ) -> Result<(), String> {
@@ -708,6 +717,7 @@ pub fn sftp_upload_file(
         &mut reporter,
         &signal,
         &app_handle,
+        resume,
     )?;
     reporter.report(&app_handle, "completed", true);
     Ok(())
@@ -896,11 +906,13 @@ struct UploadEntry {
 
 /// 统一上传入口：按本地元数据自动分派单文件 / 目录，前端无需判断类型。
 /// `remote_dir` 为目标父目录，文件或目录都以自身的 basename 落进去。
+/// `resume` 语义见 `transfer_upload_one`：首次上传必须整段重写。
 pub fn sftp_upload_path(
     session_arc: Arc<Conn>,
     local_path: &str,
     remote_dir: &str,
     task_id: &str,
+    resume: bool,
     signal: Arc<TransferSignal>,
     app_handle: AppHandle,
 ) -> Result<(), String> {
@@ -911,6 +923,7 @@ pub fn sftp_upload_path(
             local_path,
             remote_dir,
             task_id,
+            resume,
             signal,
             app_handle,
         );
@@ -924,6 +937,7 @@ pub fn sftp_upload_path(
         local_path,
         &remote_path.to_string_lossy(),
         task_id,
+        resume,
         signal,
         app_handle,
     )
@@ -935,6 +949,7 @@ pub fn sftp_upload_dir(
     local_path: &str,
     remote_dir: &str,
     task_id: &str,
+    resume: bool,
     signal: Arc<TransferSignal>,
     app_handle: AppHandle,
 ) -> Result<(), String> {
@@ -980,6 +995,7 @@ pub fn sftp_upload_dir(
             &mut reporter,
             &signal,
             &app_handle,
+            resume,
         )?;
     }
 

@@ -67,7 +67,7 @@ where
         let signal = registry.register(&task_id, &session_id);
         let result = job(session, signal);
         // 成功/失败/取消都要清理，否则注册表会随任务数增长
-        registry.finish(&task_id);
+        registry.finish(&task_id, &session_id);
         // 通道被对端关掉时丢弃这条 SFTP 连接，否则用户点重试仍会打在同一条死连接上
         if let Err(err) = &result {
             if sftp::is_session_closed_error(err) {
@@ -569,13 +569,14 @@ async fn sftp_upload_file(
     local_path: String,
     remote_path: String,
     task_id: String,
+    resume: bool,
     ssh_manager: State<'_, SshManager>,
     app_handle: AppHandle,
     transfer_registry: State<'_, TransferRegistry>,
 ) -> Result<(), String> {
     let tid = task_id.clone();
     run_transfer(session_id, task_id, ssh_manager, transfer_registry, move |session, signal| {
-        sftp::sftp_upload_file(session, &local_path, &remote_path, &tid, signal, app_handle)
+        sftp::sftp_upload_file(session, &local_path, &remote_path, &tid, resume, signal, app_handle)
     })
     .await
 }
@@ -586,13 +587,14 @@ async fn sftp_upload_path(
     local_path: String,
     remote_dir: String,
     task_id: String,
+    resume: bool,
     ssh_manager: State<'_, SshManager>,
     app_handle: AppHandle,
     transfer_registry: State<'_, TransferRegistry>,
 ) -> Result<(), String> {
     let tid = task_id.clone();
     run_transfer(session_id, task_id, ssh_manager, transfer_registry, move |session, signal| {
-        sftp::sftp_upload_path(session, &local_path, &remote_dir, &tid, signal, app_handle)
+        sftp::sftp_upload_path(session, &local_path, &remote_dir, &tid, resume, signal, app_handle)
     })
     .await
 }

@@ -1104,6 +1104,18 @@ const transferHostLabel = (sessionId: string): string => {
 const transferTaskName = (action: '上传' | '下载', fileName: string, sessionId: string) =>
   `${action}: ${transferHostLabel(sessionId)} / ${fileName}`
 
+/** 任务 ID 必须全局唯一：进度事件名 `sftp-progress-<taskId>` 与后端控制信号都按它索引。
+ *  批量拖拽会在同一毫秒建出多个任务，仅用时间戳 + 小范围随机数会撞车，
+ *  一旦撞车另一台主机的任务会收到别人的进度（表现为瞬间完成、内容却不对）。 */
+let transferTaskSeq = 0
+const makeTransferTaskId = (): string => {
+  const uuid = globalThis.crypto?.randomUUID?.()
+  if (uuid) return `task-${uuid}`
+  // 老 webview 没有 randomUUID 时退化为时间戳 + 进程内自增序号，仍保证不重复
+  transferTaskSeq += 1
+  return `task-${Date.now()}-${transferTaskSeq}`
+}
+
 const createTransferTask = (
   name: string,
   type: 'upload' | 'download',
@@ -1111,7 +1123,7 @@ const createTransferTask = (
   context?: TransferContext
 ): TransferTask => {
   const task = reactive<TransferTask>({
-    id: 'task-' + Date.now() + '-' + Math.floor(Math.random() * 1000),
+    id: makeTransferTaskId(),
     name,
     type,
     progress: 0,
@@ -1240,7 +1252,9 @@ const handleDownloadFiles = async (session: HostSession, refs: RemoteFileRef[]) 
   }
 }
 
-/** 批量入队上传：先一次性建好所有任务卡片，再顺序执行（同一 SFTP 会话不并发混用） */
+/** 批量入队上传：先一次性建好所有任务卡片，再顺序执行（同一 SFTP 会话不并发混用）。
+ *  新建任务一律 `resume = false`：远端同名文件可能来自上一次未完成的传输或别人放的，
+ *  按长度续传会拼接出内容错误但长度“正确”的文件。 */
 const enqueueUploadPaths = async (localPaths: string[], sessionId: string, remoteDir: string) => {
   const jobs = localPaths.map(localPath => {
     const name = localPath.split(/[/\\]/).filter(Boolean).pop() || 'file'
@@ -1255,7 +1269,7 @@ const enqueueUploadPaths = async (localPaths: string[], sessionId: string, remot
     }
   })
   for (const job of jobs) {
-    await runTransfer(job.task, (taskId) => sftpUploadPathApi(sessionId, job.localPath, remoteDir, taskId))
+    await runTransfer(job.task, (taskId) => sftpUploadPathApi(sessionId, job.localPath, remoteDir, taskId, false))
   }
 }
 
@@ -1364,7 +1378,7 @@ const handleCancelTask = async (task: TransferTask) => {
   }
 }
 
-/** 失败/取消后重试：原样重放 context，后端按已传 offset 断点续传 */
+/** 失败/取消后重试：原样重放 context，只有这条路径允许按已传 offset 续传 */
 const handleRetryTask = async (task: TransferTask) => {
   const ctx = task.context
   if (!ctx) {
@@ -1372,7 +1386,7 @@ const handleRetryTask = async (task: TransferTask) => {
     return
   }
   await runTransfer(task, (taskId) => ctx.upload
-    ? sftpUploadPathApi(ctx.sessionId, ctx.localPath, ctx.remotePath, taskId)
+    ? sftpUploadPathApi(ctx.sessionId, ctx.localPath, ctx.remotePath, taskId, true)
     : sftpDownloadPathApi(ctx.sessionId, ctx.remotePath, ctx.localPath, taskId))
 }
 

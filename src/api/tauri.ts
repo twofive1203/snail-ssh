@@ -774,16 +774,17 @@ export async function sftpStatApi(sessionId: string, path: string): Promise<Sftp
   return null
 }
 
-export async function sftpUploadFileApi(sessionId: string, localPath: string, remotePath: string, taskId: string): Promise<void> {
+export async function sftpUploadFileApi(sessionId: string, localPath: string, remotePath: string, taskId: string, resume = false): Promise<void> {
   if (isTauri()) {
-    await invoke('sftp_upload_file', { sessionId, localPath, remotePath, taskId })
+    await invoke('sftp_upload_file', { sessionId, localPath, remotePath, taskId, resume })
   }
 }
 
-/** 统一上传入口：文件/目录都由后端按元数据分派，`remoteDir` 为目标父目录 */
-export async function sftpUploadPathApi(sessionId: string, localPath: string, remoteDir: string, taskId: string): Promise<void> {
+/** 统一上传入口：文件/目录都由后端按元数据分派，`remoteDir` 为目标父目录。
+ *  `resume` 为 false 时后端整段重写（首次上传），true 时才按远端已传字节续传（暂停继续/失败重试）。 */
+export async function sftpUploadPathApi(sessionId: string, localPath: string, remoteDir: string, taskId: string, resume = false): Promise<void> {
   if (isTauri()) {
-    await invoke('sftp_upload_path', { sessionId, localPath, remoteDir, taskId })
+    await invoke('sftp_upload_path', { sessionId, localPath, remoteDir, taskId, resume })
   }
 }
 

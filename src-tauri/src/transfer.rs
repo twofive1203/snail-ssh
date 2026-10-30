@@ -68,11 +68,21 @@ impl TransferSignal {
 }
 
 struct TransferEntry {
+    task_id: String,
     signal: Arc<TransferSignal>,
     session_id: String,
 }
 
-/// 任务控制注册表：按 task_id 索引控制信号，并记录所属会话以便会话关闭时统一取消。
+/// 注册表键：会话 + 任务。
+///
+/// 不能只用 task_id：批量拖拽会在同一毫秒内建出多个任务，一旦 id 撞车，
+/// 两台主机的上传就会共用同一个控制信号和同一个 `sftp-progress-<taskId>` 事件名，
+/// 表现为「另一台机器瞬间传完、内容却不对」。加上会话前缀后，跨会话永不互相干扰。
+fn registry_key(session_id: &str, task_id: &str) -> String {
+    format!("{}\u{1}{}", session_id, task_id)
+}
+
+/// 任务控制注册表：按「会话 + task_id」索引控制信号，并记录所属会话以便会话关闭时统一取消。
 #[derive(Default, Clone)]
 pub struct TransferRegistry {
     inner: Arc<Mutex<HashMap<String, TransferEntry>>>,
@@ -83,19 +93,20 @@ impl TransferRegistry {
         Self::default()
     }
 
-    /// 注册任务；若已存在（重试场景）则复用同一信号并清空暂停/进度状态。
+    /// 注册任务；同一「会话 + task_id」已存在（重试场景）时复用同一信号并清空暂停/进度状态。
     pub fn register(&self, task_id: &str, session_id: &str) -> Arc<TransferSignal> {
+        let key = registry_key(session_id, task_id);
         let mut map = self.inner.lock();
-        if let Some(entry) = map.get_mut(task_id) {
-            entry.session_id = session_id.to_string();
+        if let Some(entry) = map.get_mut(&key) {
             entry.signal.resume();
             entry.signal.set_transferred(0);
             return Arc::clone(&entry.signal);
         }
         let signal = Arc::new(TransferSignal::default());
         map.insert(
-            task_id.to_string(),
+            key,
             TransferEntry {
+                task_id: task_id.to_string(),
                 signal: Arc::clone(&signal),
                 session_id: session_id.to_string(),
             },
@@ -103,16 +114,21 @@ impl TransferRegistry {
         signal
     }
 
+    /// 按 task_id 取控制信号（存在多个同名任务时返回任意一个）。
+    /// 生产路径的 pause/cancel 走 `control`（它需要覆盖所有同名任务），
+    /// 这里保留给单测与后续调试查询。
+    #[allow(dead_code)]
     pub fn get(&self, task_id: &str) -> Option<Arc<TransferSignal>> {
         self.inner
             .lock()
-            .get(task_id)
+            .values()
+            .find(|entry| entry.task_id == task_id)
             .map(|entry| Arc::clone(&entry.signal))
     }
 
     /// 传输结束（成功/失败/取消）后清理，避免 Map 随任务数增长
-    pub fn finish(&self, task_id: &str) {
-        self.inner.lock().remove(task_id);
+    pub fn finish(&self, task_id: &str, session_id: &str) {
+        self.inner.lock().remove(&registry_key(session_id, task_id));
     }
 
     /// 会话关闭时取消其名下所有传输，唤醒暂停中的线程避免永久 sleep
@@ -129,16 +145,25 @@ impl TransferRegistry {
         }
     }
 
-    /// 对已注册任务执行 pause / resume / cancel；任务不存在时报明确错误，不静默成功
+    /// 对已注册任务执行 pause / resume / cancel；任务不存在时报明确错误，不静默成功。
+    /// 控制命令只带 task_id（前端暂停/取消按钮没有会话上下文），因此作用于所有同名任务。
     pub fn control(&self, task_id: &str, action: &str) -> Result<(), String> {
-        let signal = self
-            .get(task_id)
-            .ok_or_else(|| format!("传输任务不存在或已结束: {}", task_id))?;
-        match action {
-            "pause" => signal.pause(),
-            "resume" => signal.resume(),
-            "cancel" => signal.cancel(),
-            other => return Err(format!("不支持的传输控制动作: {}", other)),
+        if !matches!(action, "pause" | "resume" | "cancel") {
+            return Err(format!("不支持的传输控制动作: {}", action));
+        }
+        let map = self.inner.lock();
+        let mut matched = 0usize;
+        for entry in map.values().filter(|entry| entry.task_id == task_id) {
+            matched += 1;
+            match action {
+                "pause" => entry.signal.pause(),
+                "resume" => entry.signal.resume(),
+                "cancel" => entry.signal.cancel(),
+                _ => {}
+            }
+        }
+        if matched == 0 {
+            return Err(format!("传输任务不存在或已结束: {}", task_id));
         }
         Ok(())
     }
@@ -168,7 +193,26 @@ mod tests {
         assert!(!signal.is_paused());
         assert!(!signal.is_cancelled());
 
-        registry.finish("t1");
+        registry.finish("t1", "sess-a");
+        assert!(registry.get("t1").is_none());
+    }
+
+    #[test]
+    fn same_task_id_in_different_sessions_is_isolated() {
+        let registry = TransferRegistry::new();
+        let a = registry.register("t1", "sess-a");
+        let b = registry.register("t1", "sess-b");
+        // 跨会话撞 id 时不能复用同一个信号（否则进度事件互相串台）
+        assert!(!Arc::ptr_eq(&a, &b));
+
+        a.pause();
+        assert!(a.is_paused());
+        assert!(!b.is_paused());
+
+        // 一个会话结束只清理自己那条记录
+        registry.finish("t1", "sess-a");
+        assert!(!Arc::ptr_eq(&registry.get("t1").unwrap(), &a));
+        registry.finish("t1", "sess-b");
         assert!(registry.get("t1").is_none());
     }
 
@@ -210,6 +254,16 @@ mod tests {
 
         assert!(registry.control("missing", "pause").is_err());
         assert!(registry.control("t1", "explode").is_err());
+    }
+
+    #[test]
+    fn control_actions_reach_every_session_with_that_task_id() {
+        let registry = TransferRegistry::new();
+        let a = registry.register("t1", "sess-a");
+        let b = registry.register("t1", "sess-b");
+        assert!(registry.control("t1", "cancel").is_ok());
+        assert!(a.is_cancelled());
+        assert!(b.is_cancelled());
     }
 
     #[test]

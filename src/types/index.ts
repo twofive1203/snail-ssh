@@ -136,7 +136,8 @@ export interface SftpProgressPayload {
   total: number
 }
 
-/** 重试所需上下文：原样重放即可从已传字节续传 */
+/** 重试所需上下文：原样重放即可从已传字节续传。
+ *  只有“重试”这条路径会带 resume 续传；重新拖拽/重新选择文件属于新任务，整段重写。 */
 export interface TransferContext {
   sessionId: string
   localPath: string
