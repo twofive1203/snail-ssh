@@ -1,5 +1,6 @@
-# Trust check only: frontend typecheck/build and Rust check.
-# This does not produce or sign a desktop installer, and it does not test macOS or Windows packaging.
+# Trust check only: frontend typecheck/build, Rust check + unit tests, and a
+# Windows-only compile check for #[cfg(windows)] code.
+# This does not produce or sign a desktop installer, and it does not test macOS packaging.
 name: CI
 
 on:
@@ -8,9 +9,15 @@ on:
   pull_request:
     branches: [master]
 
+# 同一分支的连续推送只保留最新一次，旧运行自动取消
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   frontend:
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -25,9 +32,13 @@ jobs:
 
   rust:
     runs-on: ubuntu-24.04
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
       - name: Install Tauri compile dependencies
         run: |
           sudo apt-get update
@@ -43,4 +54,27 @@ jobs:
             librsvg2-dev
       - name: cargo check
         working-directory: src-tauri
-        run: cargo check
+        run: cargo check --all-targets
+      # 73 个单测在这里跑（live_* 两个连真实主机的测试已 #[ignore]）。
+      # 之所以只在 Linux 侧跑测试：Tauri 只给 [[bin]] 注入 Windows 应用清单，
+      # 测试二进制缺清单，在 Windows 上启动即报 0xC0000139 STATUS_ENTRYPOINT_NOT_FOUND
+      # （tauri-apps/tauri#13419），所以 Windows 侧只做类型检查，不跑测试。
+      - name: cargo test
+        working-directory: src-tauri
+        run: cargo test --all-targets
+
+  # local_shell.rs 里的 #[cfg(windows)] 分支（ConPTY、Job Object、winapi 依赖）
+  # 在 Linux 上会被整块跳过，ubuntu 的 cargo check 覆盖不到；不补这一份，
+  # Windows-only 的编译错误会一直拖到打 tag 出包时才暴露。
+  rust-windows:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+      - name: cargo check
+        working-directory: src-tauri
+        run: cargo check --all-targets

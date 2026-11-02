@@ -1,7 +1,8 @@
 # Build desktop installers when a version tag is pushed, and attach them to a
 # draft GitHub Release for that tag. Packages are not code-signed.
 # The installer version still comes from src-tauri/tauri.conf.json; the tag only
-# decides when to build and which Release receives the files.
+# decides when to build and which Release receives the files. 正因如此，
+# check-version 会先硬校验 tag 与各处版本号一致，不一致就整条流水线失败。
 name: Release
 
 on:
@@ -9,8 +10,48 @@ on:
     tags:
       - "v*"
 
+# 同时推多个 tag 时不互相抢 runner；正在跑的发布不取消，避免留下半截上传的资产
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
+  # tag 与版本号不一致会出现「Release 叫 v1.1.0、安装包文件名却是 1.0.0」，
+  # 所以先卡一道；这一小步只跑二十来秒，比出包后才发现便宜得多。
+  check-version:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: 校验 tag 与各处版本号一致
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          json_version() {
+            python3 -c "import json,sys;print(json.load(open(sys.argv[1], encoding='utf-8'))['version'])" "$1"
+          }
+          # 用 awk 而不是 sed|head，避免 pipefail 下 SIGPIPE 误报失败
+          conf=$(json_version src-tauri/tauri.conf.json)
+          pkg=$(json_version package.json)
+          cargo_toml=$(awk -F'"' '/^version = "/{print $2; exit}' src-tauri/Cargo.toml)
+          cargo_lock=$(awk -F'"' '/^name = "snail-ssh"$/{getline; print $2; exit}' src-tauri/Cargo.lock)
+          printf 'tag=%s  tauri.conf.json=%s  package.json=%s  Cargo.toml=%s  Cargo.lock=%s\n' \
+            "$tag" "$conf" "$pkg" "$cargo_toml" "$cargo_lock"
+          for pair in "tauri.conf.json=$conf" "package.json=$pkg" "Cargo.toml=$cargo_toml" "Cargo.lock=$cargo_lock"; do
+            name="${pair%%=*}"
+            value="${pair#*=}"
+            if [ -z "$value" ]; then
+              echo "::error::没能从 ${name} 读出版本号（值为空），版本校验无法进行"
+              exit 1
+            fi
+            if [ "$tag" != "$value" ]; then
+              echo "::error::tag v${tag} 与 ${name} 的 ${value} 不一致，安装包文件名会与 tag 不符"
+              exit 1
+            fi
+          done
+
   release:
+    needs: check-version
     permissions:
       contents: write
     strategy:
@@ -26,6 +67,7 @@ jobs:
           - platform: windows-latest
             args: ""
     runs-on: ${{ matrix.platform }}
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
