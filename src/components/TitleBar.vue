@@ -18,8 +18,10 @@
 
     <div class="h-4 w-[1px] bg-slate-700/60 shrink-0"></div>
 
-    <!-- 2. 中间：固定入口 + 可滚动会话标签。滚动区不当窗口拖拽区，避免和横向滚动抢鼠标。 -->
-    <div class="flex items-center flex-1 min-w-0 h-full">
+    <!-- 2. 中间：固定入口 + 可滚动会话标签。
+         drag-region 用裸属性（非 deep）：只有直接点到容器留白/标签间隙才拖窗口，
+         点到会话标签本身仍是切换会话，滚轮横滚也不受影响。 -->
+    <div class="flex items-center flex-1 min-w-0 h-full" data-tauri-drag-region>
       <button
         @click="$emit('select-session', 'hosts')"
         :class="activeSessionId === 'hosts' ? 'bg-[#1a202c] text-emerald-400 font-semibold border border-brand-500/30 shadow-sm' : 'text-slate-400 hover:text-white hover:bg-surface-card/60 border border-transparent'"
@@ -45,10 +47,11 @@
 
         <div
           ref="sessionTabScroller"
+          data-tauri-drag-region
           class="h-full overflow-x-auto overflow-y-hidden no-scrollbar px-1.5"
           @scroll.passive="updateSessionTabOverflow"
         >
-          <div ref="sessionTabRow" class="flex items-center gap-1.5 h-full w-max">
+          <div ref="sessionTabRow" data-tauri-drag-region class="flex items-center gap-1.5 h-full w-max">
             <div
               v-for="s in sessions"
               :key="s.id"
