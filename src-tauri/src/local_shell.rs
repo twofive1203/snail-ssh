@@ -692,7 +692,7 @@ fn prepare_launch(request: &CreateLocalSessionRequest, probe: &LaunchProbe) -> R
     let (program, label, kind) = match program_raw {
         Some(raw) => {
             let program = resolve_user_program(raw, probe)?;
-            let (label, kind) = classify(&program);
+            let (label, kind) = classify(&program, probe.platform);
             (program, label, kind)
         }
         None => resolve_auto(probe)?,
@@ -735,18 +735,18 @@ fn resolve_auto(probe: &LaunchProbe) -> Result<(PathBuf, String, String), String
 
 fn resolve_windows(probe: &LaunchProbe) -> Result<(PathBuf, String, String), String> {
     if let Some(path) = (probe.lookup)("pwsh") {
-        return Ok(classify_owned(path));
+        return Ok(classify_owned(path, probe.platform));
     }
     for candidate in &probe.conventional_pwsh {
         if (probe.is_exec)(candidate) {
-            return Ok(classify_owned(candidate.clone()));
+            return Ok(classify_owned(candidate.clone(), probe.platform));
         }
     }
     if let Some(path) = (probe.lookup)("powershell") {
-        return Ok(classify_owned(path));
+        return Ok(classify_owned(path, probe.platform));
     }
     if let Some(path) = (probe.lookup)("cmd") {
-        return Ok(classify_owned(path));
+        return Ok(classify_owned(path, probe.platform));
     }
     Err("找不到可用的本地 shell（已尝试 pwsh、PowerShell 7 安装目录、powershell.exe、cmd.exe）".into())
 }
@@ -755,19 +755,19 @@ fn resolve_unix(probe: &LaunchProbe) -> Result<(PathBuf, String, String), String
     if let Some(shell) = probe.shell_env.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         let path = PathBuf::from(shell);
         if (probe.is_exec)(&path) {
-            return Ok(classify_owned(path));
+            return Ok(classify_owned(path, probe.platform));
         }
         if is_path_like(shell) {
             // 绝对路径不可执行就继续往下，不把坏的 $SHELL 当成最终结果
         } else if let Some(found) = (probe.lookup)(shell) {
-            return Ok(classify_owned(found));
+            return Ok(classify_owned(found, probe.platform));
         }
     }
     if let Some(path) = (probe.lookup)("bash") {
-        return Ok(classify_owned(path));
+        return Ok(classify_owned(path, probe.platform));
     }
     if let Some(path) = (probe.lookup)("sh") {
-        return Ok(classify_owned(path));
+        return Ok(classify_owned(path, probe.platform));
     }
     Err("找不到可用的本地 shell（已尝试 $SHELL、bash、sh）".into())
 }
@@ -787,17 +787,32 @@ fn resolve_cwd(raw: Option<&str>, probe: &LaunchProbe) -> Result<PathBuf, String
     Err("工作目录不存在".into())
 }
 
-fn classify_owned(path: PathBuf) -> (PathBuf, String, String) {
-    let (label, kind) = classify(&path);
+fn classify_owned(path: PathBuf, platform: Platform) -> (PathBuf, String, String) {
+    let (label, kind) = classify(&path, platform);
     (path, label, kind)
 }
 
-fn classify(path: &Path) -> (String, String) {
-    let stem = path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("shell")
-        .to_ascii_lowercase();
+/// 取路径里的「程序名」。必须按目标平台自己的路径规则切分，不能依赖宿主机器的 `Path`
+/// 语义：在 Linux 上 `Path::file_stem(r"C:\Tools\pwsh.exe")` 拿到的是整条
+/// `c:\tools\pwsh`，于是 Windows 解析出的 kind/label 会退化成整段路径（已在 Linux 上实测）。
+/// 这里只做字符串处理，保证同一个 (路径, 平台) 在任何宿主上得到同一结果。
+fn program_stem(path: &Path, platform: Platform) -> String {
+    let raw = path.to_string_lossy().into_owned();
+    let name = match platform {
+        Platform::Windows => raw.rsplit(['\\', '/']).find(|part| !part.is_empty()),
+        Platform::Unix => raw.rsplit('/').find(|part| !part.is_empty()),
+    }
+    .unwrap_or(raw.as_str());
+    // 与 Path::file_stem 对齐：只有点不在首位时才去掉最后一个扩展名
+    let stem = match name.rfind('.') {
+        Some(idx) if idx > 0 => &name[..idx],
+        _ => name,
+    };
+    stem.to_ascii_lowercase()
+}
+
+fn classify(path: &Path, platform: Platform) -> (String, String) {
+    let stem = program_stem(path, platform);
     match stem.as_str() {
         "pwsh" => ("PowerShell 7".into(), "pwsh".into()),
         "powershell" => ("Windows PowerShell".into(), "powershell".into()),
@@ -1219,6 +1234,25 @@ mod tests {
         pred()
     }
 
+    /// Linux / macOS 上的 pwsh（PSReadLine）启动后会先发 `ESC[6n` 询问光标位置，并阻塞
+    /// 等待终端应答；真实终端（xterm.js）会回 `ESC[row;colR`，这里的假终端也必须替它回，
+    /// 否则命令永远不会执行（Linux 上实测：不回应时 pwsh 只输出 4 字节后卡死）。
+    /// Windows 上这个询问由 ConPTY 代答，客户端收不到，所以这里是空实现。
+    fn answer_cursor_query(mgr: &LocalShellManager, session_id: &str, seen: &str, answered: &mut usize) {
+        #[cfg(not(windows))]
+        {
+            let asked = seen.matches("\u{1b}[6n").count();
+            while *answered < asked {
+                let _ = mgr.write_session(session_id, "\u{1b}[1;1R");
+                *answered += 1;
+            }
+        }
+        #[cfg(windows)]
+        {
+            let _ = (mgr, session_id, seen, answered);
+        }
+    }
+
     #[test]
     fn shell_exit_before_take_keeps_output_and_one_close() {
         let Some(program) = shell_for_exit_test() else {
@@ -1299,17 +1333,35 @@ mod tests {
             .expect("spawn pwsh");
         let _guard = CloseGuard { mgr: &mgr, id: created.session_id.clone() };
         let quoted = program.display().to_string().replace('\'', "''");
+        // -WindowStyle 只在 Windows 版 PowerShell 上支持，Linux 上会直接抛
+        // “not supported on this edition of PowerShell”，命令整段不执行。
+        let window_style = if cfg!(windows) { " -WindowStyle Hidden" } else { "" };
         // 标记拆开再拼，避免命令回显里的字面量提前满足断言。
         let script = format!(
-            "$p = Start-Process -FilePath '{quoted}' -ArgumentList '-NoLogo','-NoProfile','-Command','Start-Sleep 180' -PassThru -WindowStyle Hidden; Write-Output ('CHILD' + '=' + $p.Id); Write-Output ('SNAIL_' + 'MARKER_' + '中文')\r"
+            "$p = Start-Process -FilePath '{quoted}' -ArgumentList '-NoLogo','-NoProfile','-Command','Start-Sleep 180' -PassThru{window_style}; Write-Output ('CHILD' + '=' + $p.Id); Write-Output ('SNAIL_' + 'MARKER_' + '中文')\r"
         );
-        mgr.write_session(&created.session_id, &script).unwrap();
         let stdout_event = format!("local-stdout-{}", created.session_id);
         let mut seen = mgr.take_banner(&created.session_id).unwrap_or_default();
+        let mut answered_cursor_queries = 0usize;
+        // 必须等 shell 真正就绪再写脚本：Linux 上提前写入的行只会被 tty 回显，
+        // PSReadLine 就位后不会当作用户输入执行（已实测：提前写永远等不到标记）。
+        // 就绪信号就是它发出的首帧 ESC[6n，回答它的同时也在喂 PSReadLine。
+        // Windows 上 ConPTY 会缓冲提前写入的内容，本来就能执行，保持原样。
+        #[cfg(not(windows))]
+        {
+            let ready = wait_until(Duration::from_secs(12), || {
+                seen.push_str(&sink.joined(&stdout_event));
+                answer_cursor_query(&mgr, &created.session_id, &seen, &mut answered_cursor_queries);
+                seen.contains("\u{1b}[6n")
+            });
+            assert!(ready, "pwsh 未就绪, output={seen}");
+        }
+        mgr.write_session(&created.session_id, &script).unwrap();
         let mut child = None;
         assert!(
             wait_until(Duration::from_secs(12), || {
                 seen.push_str(&sink.joined(&stdout_event));
+                answer_cursor_query(&mgr, &created.session_id, &seen, &mut answered_cursor_queries);
                 child = parse_child_pid(&seen);
                 seen.contains("SNAIL_MARKER_中文") && child.is_some()
             }),
